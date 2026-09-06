@@ -90,6 +90,35 @@ pub fn responses_payload(request: &LlmRequest) -> serde_json::Value {
     body
 }
 
+/// Multimodal Responses-API payload: the user turn becomes `input_text` and
+/// `input_image` parts (data URLs), matching the Responses content schema.
+pub fn responses_payload_multimodal(
+    request: &LlmRequest,
+    images: &[(std::path::PathBuf, String)],
+) -> serde_json::Value {
+    use base64::Engine;
+    let mut parts =
+        vec![serde_json::json!({"type": "input_text", "text": request.user})];
+    for (path, _ocr) in images {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        parts.push(serde_json::json!({
+            "type": "input_image",
+            "image_url": format!("data:image/jpeg;base64,{b64}")
+        }));
+    }
+    serde_json::json!({
+        "model": request.model,
+        "instructions": request.system,
+        "input": [
+            {"role": "user", "content": parts}
+        ],
+        "max_output_tokens": request.max_output_tokens,
+    })
+}
+
 /// Extracts the assistant message text from a Responses API payload.
 /// Returns None when no message output exists (e.g. empty output array).
 pub fn responses_output_text(payload: &serde_json::Value) -> Option<String> {

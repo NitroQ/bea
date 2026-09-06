@@ -3360,6 +3360,122 @@ pub fn build_provider_request(provider: &ProviderConfig, request: &LlmRequest) -
     }
 }
 
+/// Builds a provider body for text+images. The kind-switch mirrors
+/// `build_provider_request`: OpenAiOAuth gets a Responses-API payload with
+/// `input_text`/`input_image` parts; every other kind gets the standard
+/// chat-completions shape with `image_url` data-URL parts. When `images` is
+/// empty, the OCR transcriptions (already embedded in `user_text` by the
+/// caller) travel as a plain string — the OCR fallback needs no special body.
+pub fn build_multimodal_body(
+    provider: &ProviderConfig,
+    system: &str,
+    user_text: &str,
+    images: &[(PathBuf, String)], // (frame path, ocr_text) pairs
+    max_tokens: u32,
+) -> serde_json::Value {
+    if images.is_empty() {
+        if provider.kind == ProviderKind::OpenAiOAuth {
+            let request = LlmRequest {
+                model: provider.model.clone(),
+                system: system.to_string(),
+                user: user_text.to_string(),
+                json_schema: String::new(),
+                max_output_tokens: max_tokens,
+            };
+            return codex_oauth::responses_payload(&request);
+        }
+        return serde_json::json!({
+            "model": provider.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_text}
+            ],
+            "max_tokens": max_tokens,
+        });
+    }
+    if provider.kind == ProviderKind::OpenAiOAuth {
+        let request = LlmRequest {
+            model: provider.model.clone(),
+            system: system.to_string(),
+            user: user_text.to_string(),
+            json_schema: String::new(),
+            max_output_tokens: max_tokens,
+        };
+        return codex_oauth::responses_payload_multimodal(&request, images);
+    }
+    use base64::Engine;
+    let mut parts = vec![serde_json::json!({"type": "text", "text": user_text})];
+    for (path, _ocr) in images {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        parts.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": {"url": format!("data:image/jpeg;base64,{b64}")}
+        }));
+    }
+    serde_json::json!({
+        "model": provider.model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": parts}
+        ],
+        "max_tokens": max_tokens,
+    })
+}
+
+/// Sends a multimodal (text+frame images) chat completion and returns free
+/// text. Images are base64 data URLs; the API key rides the Authorization
+/// header. For OpenAiOAuth the Responses-API endpoint is used and the reply is
+/// unwrapped via `codex_oauth::responses_output_text`.
+pub async fn call_provider_messages(
+    provider: &ProviderConfig,
+    system: &str,
+    user_text: &str,
+    images: &[(PathBuf, String)],
+    max_output_tokens: u32,
+    api_key: Option<&str>,
+) -> Result<String, BeaError> {
+    let base = provider.base_url.trim_end_matches('/');
+    let url = match provider.kind {
+        ProviderKind::OpenRouter
+        | ProviderKind::OpenAiCompatible
+        | ProviderKind::ClaudeCompatible => format!("{base}/chat/completions"),
+        ProviderKind::Local => format!("{base}/v1/chat/completions"),
+        ProviderKind::OpenAiOAuth => format!("{base}/responses"),
+    };
+    let body = build_multimodal_body(provider, system, user_text, images, max_output_tokens);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|e| BeaError::ProviderRequest(e.to_string()))?;
+    let mut builder = client.post(url).json(&body);
+    if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
+        builder = builder.bearer_auth(key);
+    }
+    let response = builder
+        .send()
+        .await
+        .map_err(|e| BeaError::ProviderRequest(e.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(BeaError::ProviderRequest(format!("HTTP {status}")));
+    }
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| BeaError::ProviderRequest(e.to_string()))?;
+    if provider.kind == ProviderKind::OpenAiOAuth {
+        return Ok(codex_oauth::responses_output_text(&payload).unwrap_or_default());
+    }
+    Ok(payload
+        .pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string())
+}
+
 pub fn parse_provider_minutes(response: &serde_json::Value) -> Result<Minutes, BeaError> {
     let message = response
         .get("choices")
@@ -4024,6 +4140,52 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
+    #[test]
+    fn multimodal_body_embeds_image_parts_and_ocr_fallback_text() {
+        let provider = ProviderConfig {
+            id: "primary".into(),
+            kind: ProviderKind::OpenRouter,
+            base_url: "https://openrouter.ai/api/v1".into(),
+            model: "openai/gpt-4o-mini".into(),
+            credential_ref: None,
+            enabled: true,
+        };
+        let dir = tempdir().unwrap();
+        let frame = dir.path().join("frame1.jpg");
+        std::fs::write(&frame, b"\xff\xd8\xffjpeg-bytes").unwrap();
+        let images = vec![(frame.clone(), "slide showing Q3 budget".to_string())];
+        let body = build_multimodal_body(
+            &provider,
+            "system prompt",
+            "user question",
+            &images,
+            1_000,
+        );
+        // Vision path: user content is an array with a text part and an image_url part.
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert!(content[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/jpeg;base64,"));
+        // Responses-API path for OpenAiOAuth builds input_image parts instead.
+        let oauth = ProviderConfig {
+            kind: ProviderKind::OpenAiOAuth,
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            ..provider.clone()
+        };
+        let responses_body =
+            build_multimodal_body(&oauth, "system prompt", "user question", &images, 1_000);
+        let input = responses_body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "input_text");
+        assert_eq!(input[1]["type"], "input_image");
+        // OCR fallback path: no images sent; the caller embeds the OCR text in
+        // the user text, which travels as a plain string.
+        let user_text = "=== VISUAL CONTEXT (OCR) ===\nslide showing Q3 budget\n\nuser question";
+        let fallback = build_multimodal_body(&provider, "system", user_text, &[], 1_000);
+        assert!(fallback["messages"][1]["content"].as_str().unwrap().contains("slide showing Q3 budget"));
+    }
     #[test]
     fn minutes_serializes_agenda_and_exports_it() {
         let minutes = Minutes {
