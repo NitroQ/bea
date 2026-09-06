@@ -456,6 +456,7 @@ select { appearance: none; }
 .chat-message.system { align-self: center; background: transparent; color: #94a3b3; font-size: 12px; }
 .frame-include { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 8px; padding: 2px 8px; background: var(--surface); }
 .frame-include input { border: none; background: transparent; width: 170px; font-size: 12px; }
+.proxy-notice { color: #94a3b3; font-size: 12px; }
 .chat-message.bea .chat-frame-chip { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 999px; font-size: 11px; background: rgba(120, 120, 255, 0.15); }
 
 .chat-busy { color: #94a3b3; font-style: italic; }

@@ -551,6 +551,73 @@ fn ocr_context_block(frames: &[ExtractedFrame]) -> String {
     }
 }
 
+#[derive(serde::Serialize)]
+struct PlaybackProxy {
+    path: String,
+    kind: String,
+}
+
+/// Ensures the meeting has a video the WebView can actually decode. mkv/avi
+/// (and any other container/codec Chromium rejects) are transcoded once into
+/// `derived/<meeting_id>/playback.webm` with VP9/Vorbis; the result is cached
+/// so later playbacks reuse it. mp4/webm sources pass through unchanged.
+#[tauri::command]
+fn ensure_playable_proxy_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    media_path: String,
+) -> Result<PlaybackProxy, String> {
+    let root = state
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let source = std::path::PathBuf::from(&media_path);
+    if !source.is_file() {
+        return Err("media file not found".into());
+    }
+    let extension = source
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(extension.as_str(), "mkv" | "avi") {
+        // Chromium decodes mp4/h264, mov/h264 (usually), and webm natively —
+        // no proxy needed.
+        return Ok(PlaybackProxy {
+            path: media_path,
+            kind: "video".into(),
+        });
+    }
+    let playback = root
+        .join("derived")
+        .join(&meeting_id)
+        .join("playback.webm");
+    if !playback.exists() {
+        let ffmpeg = locate_ffmpeg(&root);
+        std::fs::create_dir_all(playback.parent().unwrap_or(&root)).map_err(command_error)?;
+        let args = vec![
+            "-y".to_string(),
+            "-i".to_string(),
+            source.to_string_lossy().into_owned(),
+            "-c:v".to_string(),
+            "libvpx-vp9".to_string(),
+            "-crf".to_string(),
+            "34".to_string(),
+            "-b:v".to_string(),
+            "0".to_string(),
+            "-c:a".to_string(),
+            "libvorbis".to_string(),
+            playback.to_string_lossy().into_owned(),
+        ];
+        bea_core::run_ffmpeg(&ffmpeg, &args).map_err(command_error)?;
+    }
+    Ok(PlaybackProxy {
+        path: playback.to_string_lossy().into_owned(),
+        kind: "video".into(),
+    })
+}
+
 /// Extracts the requested frames and returns them plus the OCR context block
 /// for the non-vision path. Shared by chat and minutes generation.
 fn gather_visual_context(
@@ -2854,6 +2921,7 @@ fn main() {
             update_transcript_segment_command,
             list_media_command,
             extract_frames_command,
+            ensure_playable_proxy_command,
             waveform_peaks_command,
             repair_runtime_command,
             test_provider_connection_command,
