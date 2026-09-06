@@ -356,6 +356,11 @@ select { appearance: none; }
 .modal-heading h2 { margin: 11px 0 5px; font-size: 21px; letter-spacing: -.035em; font-weight: 600; }
 .modal-heading p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .modal-actions { display: flex; justify-content: end; gap: 8px; margin-top: 5px; }
+/* Speaker editor rows: label + input + save share one line without overlap. */
+.speaker-editor-rows { display: grid; gap: 9px; }
+.speaker-editor-row { display: grid; grid-template-columns: 108px minmax(0, 1fr) auto; align-items: center; gap: 9px; }
+.speaker-editor-row .conversation-speaker { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 9px; }
+.speaker-editor-row input { min-height: 32px; width: 100%; }
 .settings-shell { min-height: 100vh; padding: 35px 50px; background: var(--bg); }
 .settings-header { display: flex; align-items: start; justify-content: space-between; gap: 30px; max-width: 1020px; margin: 0 auto; padding-bottom: 29px; border-bottom: 1px solid var(--line); }
 .settings-header > div { flex: 1; }
@@ -472,7 +477,9 @@ select { appearance: none; }
 .custom-format-overlay { position: fixed; inset: 0; background: #0b1118cc; display: grid; place-items: center; z-index: 40; }
 .custom-format-modal { width: min(640px, 92vw); max-height: 88vh; overflow: auto; padding: 20px; border-radius: var(--radius); background: var(--surface-2); border: 1px solid var(--line); display: grid; gap: 14px; }
 .custom-format-editor { width: 100%; font-family: ui-monospace, monospace; padding: 11px; line-height: 1.5; }
-.clarify-wizard { position: fixed; inset: 0; z-index: 40; overflow: auto; background: #0b1118ee; display: grid; place-items: center; padding: 24px; }
+.clarify-wizard { position: fixed; inset: 0; z-index: 40; overflow: auto; background: #0b1118ee; display: grid; place-items: start center; padding: 32px 24px; }
+.clarify-wizard > * { grid-column: 1; }
+.clarify-card { width: min(680px, 94vw); margin: 0 auto; display: grid; gap: 12px; padding: 24px; border-radius: var(--radius); background: var(--surface-2); border: 1px solid var(--line); box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5); }
 .clarify-heading { max-width: 640px; display: grid; gap: 6px; margin-bottom: 8px; }
 .clarify-question { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-2); padding: 14px 16px; display: grid; gap: 8px; max-width: 640px; margin: 0 auto 12px; }
 .clarify-question legend { color: var(--text); font-weight: 600; font-size: 13px; padding: 0 6px; }
@@ -496,7 +503,7 @@ select { appearance: none; }
 .speaker-select { min-height: 26px; width: 118px; padding: 0 24px 0 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); color: var(--muted); font-size: 11px; appearance: none; }
 .conversation-tools { position: relative; }
 .conversation-tools::after { content: '⌄'; position: absolute; right: 130px; top: 3px; color: var(--quiet); font-size: 10px; pointer-events: none; }
-.overlap-button { display: inline-flex; align-items: center; gap: 4px; min-height: 26px; padding: 0 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); color: var(--muted); font-size: 11px; }
+.overlap-button { display: inline-flex; align-items: center; gap: 4px; min-height: 26px; padding: 0 11px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); color: var(--muted); font-size: 12px; text-transform: none; }
 .overlap-button:hover { color: var(--text); border-color: var(--teal); }
 .overlap-picker { display: grid; gap: 6px; margin-top: 8px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-2); }
 .overlap-option { display: flex; align-items: center; gap: 7px; color: var(--text); font-size: 12px; }

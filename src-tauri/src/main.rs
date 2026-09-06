@@ -1150,7 +1150,6 @@ fn preview_provider_context_command(
 async fn generate_minutes_command(
     state: State<'_, AppState>,
     meeting_id: String,
-    include_frames: Option<Vec<u64>>,
 ) -> Result<Minutes, String> {
     let database = open_database(&state.database_path).map_err(command_error)?;
     let meeting = list_meetings(&database)
@@ -1189,37 +1188,49 @@ async fn generate_minutes_command(
                 let mut meeting_context =
                     bea_core::build_meeting_context(&speaker_names, custom_format.as_deref());
                 meeting_context.push_str(&format!("\n=== USER CLARIFICATIONS & CONTEXT (treat as authoritative) ===\n{user_notes}\n"));
-                // Visual context: vision-capable models get the frame images
-                // inline; text-only models get the OCR text of the same frames
-                // appended to the prompt.
+                // Visual context: when the meeting has a video, the AI pulls
+                // frames itself — evenly spaced across the video (vision
+                // models see the images; text-only models get their OCR text).
+                // No manual timestamp input.
                 let mut vision_images: Vec<(std::path::PathBuf, String)> = Vec::new();
-                if let Some(timestamps) = include_frames.as_ref().filter(|list| !list.is_empty()) {
-                    let root = state
-                        .database_path
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."))
-                        .to_path_buf();
-                    let (frames, ocr_block) = gather_visual_context(
-                        &root,
-                        &database,
-                        &meeting_id,
-                        timestamps,
-                    )?;
-                    if meeting_vision_capable(
-                        &database,
-                        &meeting_id,
-                        &provider.kind,
-                        &provider.model,
-                    ) && !frames.is_empty()
-                    {
-                        vision_images = frames
-                            .iter()
-                            .map(|frame| (std::path::PathBuf::from(&frame.path), String::new()))
+                {
+                    let has_video = list_media_command_inner(&database, &meeting_id)?
+                        .iter()
+                        .any(|media| matches!(media.kind, MediaKind::Video));
+                    if has_video {
+                        let duration = meeting.duration_seconds.max(1);
+                        let count = duration.clamp(3, 8);
+                        let step = duration / count;
+                        let timestamps: Vec<u64> = (0..count)
+                            .map(|index| index * step + step / 2)
                             .collect();
-                    } else if !ocr_block.trim().is_empty() {
-                        meeting_context.push_str(&format!(
-                            "=== VISUAL CONTEXT (OCR of requested frames) ===\n{ocr_block}\n"
-                        ));
+                        let root = state
+                            .database_path
+                            .parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .to_path_buf();
+                        let (frames, ocr_block) = gather_visual_context(
+                            &root,
+                            &database,
+                            &meeting_id,
+                            &timestamps,
+                        )?;
+                        if meeting_vision_capable(
+                            &database,
+                            &meeting_id,
+                            &provider.kind,
+                            &provider.model,
+                        ) && !frames.is_empty()
+                        {
+                            vision_images = frames
+                                .iter()
+                                .map(|frame| (std::path::PathBuf::from(&frame.path), String::new()))
+                                .collect();
+                        } else if !ocr_block.trim().is_empty() {
+                            meeting_context.push_str(&format!(
+                                "=== VISUAL CONTEXT (OCR of video frames, auto-selected) ===\n{ocr_block}\n"
+                            ));
+                        }
                     }
                 }
                 let pack = bea_core::pack_context_mode(&events, 12_000, ContextMode::Balanced);
@@ -1440,7 +1451,6 @@ async fn chat_command(
     state: State<'_, AppState>,
     meeting_id: String,
     question: String,
-    include_frames: Option<Vec<u64>>,
 ) -> Result<serde_json::Value, String> {
     if question.trim().is_empty() {
         return Err("a question is required".into());
@@ -1505,42 +1515,55 @@ async fn chat_command(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    // Visual context: extract the requested frames either as images (vision
-    // models) or as OCR text (fallback). Frames dedupe via the disk cache, and
-    // the per-request cap keeps token costs bounded.
+    // Visual context: when the meeting has a video, the AI pulls frames itself
+    // to strengthen its answer — either as images (vision models) or as OCR
+    // text (fallback). Frames dedupe via the disk cache. No manual timestamps.
     let mut vision_images: Vec<(std::path::PathBuf, String)> = Vec::new();
     let mut ocr_block = String::new();
     let mut mode = String::new();
     let mut frames_used = 0usize;
-    if let Some(timestamps) = include_frames.filter(|list| !list.is_empty()) {
-        let root = state
-            .database_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_path_buf();
-        let (frames, block) =
-            gather_visual_context(&root, &database, &meeting_id, &timestamps)?;
-        let vision_capable = meeting_vision_capable(
-            &database,
-            &meeting_id,
-            &provider.kind,
-            &provider.model,
-        );
-        // Only claim frames/mode when the request actually carries visual
-        // content: vision mode counts the images attached; the OCR fallback
-        // only counts when OCR produced a non-empty block (a missing
-        // tesseract binary must not show a "frames used" chip).
-        if vision_capable && !frames.is_empty() {
-            frames_used = frames.len();
-            mode = "vision".into();
-            vision_images = frames
-                .iter()
-                .map(|frame| (std::path::PathBuf::from(&frame.path), String::new()))
-                .collect();
-        } else if !block.trim().is_empty() {
-            frames_used = frames.len();
-            mode = "ocr".into();
-            ocr_block = block;
+    {
+        let has_video = list_media_command_inner(&database, &meeting_id)?
+            .iter()
+            .any(|media| matches!(media.kind, MediaKind::Video));
+        if has_video {
+            let duration = transcript
+                .last()
+                .map(|segment| segment.end_seconds)
+                .unwrap_or(0)
+                .max(1);
+            let count = duration.clamp(3, 8);
+            let step = duration / count;
+            let timestamps: Vec<u64> = (0..count).map(|index| index * step + step / 2).collect();
+            let root = state
+                .database_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf();
+            let (frames, block) =
+                gather_visual_context(&root, &database, &meeting_id, &timestamps)?;
+            let vision_capable = meeting_vision_capable(
+                &database,
+                &meeting_id,
+                &provider.kind,
+                &provider.model,
+            );
+            // Only claim frames/mode when the request actually carries visual
+            // content: vision mode counts the images attached; the OCR fallback
+            // only counts when OCR produced a non-empty block (a missing
+            // tesseract binary must not show a "frames used" chip).
+            if vision_capable && !frames.is_empty() {
+                frames_used = frames.len();
+                mode = "vision".into();
+                vision_images = frames
+                    .iter()
+                    .map(|frame| (std::path::PathBuf::from(&frame.path), String::new()))
+                    .collect();
+            } else if !block.trim().is_empty() {
+                frames_used = frames.len();
+                mode = "ocr".into();
+                ocr_block = block;
+            }
         }
     }
     let system = format!(
@@ -1583,6 +1606,125 @@ async fn chat_command(
         "frames_used": frames_used,
         "mode": mode,
     }))
+}
+
+#[derive(serde::Serialize, Clone)]
+struct CorrectionPair {
+    find: String,
+    replace: String,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct CorrectionPlan {
+    replacements: Vec<CorrectionPair>,
+    note: String,
+}
+
+/// Resolves a natural-language correction instruction ("replace all "enyu"
+/// with "NU"") into concrete find/replace pairs using the transcript as
+/// grounding, so the AI can see the actual spellings before proposing edits.
+/// The pairs are then applied verbatim by apply_mass_correction_command —
+/// the model never edits the transcript directly.
+#[tauri::command]
+async fn resolve_correction_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    instruction: String,
+) -> Result<CorrectionPlan, String> {
+    if instruction.trim().is_empty() {
+        return Err("a correction instruction is required".into());
+    }
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let provider = load_provider(&database, "primary")
+        .map_err(command_error)?
+        .filter(|provider| provider.enabled);
+    let provider = provider
+        .ok_or_else(|| "a verified provider is required for corrections".to_string())?;
+    let api_key = if provider.kind == bea_core::ProviderKind::OpenAiOAuth {
+        fresh_codex_access_token().await?
+    } else {
+        keyring_secret(&provider).ok_or_else(|| "provider API key is missing".to_string())?
+    };
+    let transcript = list_transcript(&database, &meeting_id).map_err(command_error)?;
+    if transcript.is_empty() {
+        return Err("there is no transcript to correct yet".into());
+    }
+    let speaker_names = bea_core::list_speaker_names(&database, &meeting_id).unwrap_or_default();
+    let meeting_context = bea_core::build_meeting_context(&speaker_names, None);
+    // Ground the model in the real text: unique words that actually appear,
+    // plus a truncated sample of segments, so it proposes replacements that
+    // match the transcript verbatim instead of guessing spellings.
+    let word_counts: std::collections::HashMap<String, usize> = {
+        let mut counts = std::collections::HashMap::new();
+        for segment in &transcript {
+            for word in segment.text.split_whitespace() {
+                let cleaned: String = word
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '\'')
+                    .collect::<String>()
+                    .to_lowercase();
+                if cleaned.len() >= 3 {
+                    *counts.entry(cleaned).or_insert(0) += 1;
+                }
+            }
+        }
+        counts
+    };
+    let mut known_words: Vec<&String> = word_counts.keys().collect();
+    known_words.sort();
+    let word_list = known_words
+        .iter()
+        .map(|word| word.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sample = transcript
+        .iter()
+        .take(200)
+        .map(|segment| segment.text.trim())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let system = format!(
+        "You convert a user's natural-language transcript-correction request into exact find/replace operations.\n{meeting_context}\nRules:\n- Ground every `find` string in the transcript vocabulary below (case-insensitive matching happens downstream; preserve the casing as it appears in the sample).\n- `find` must be a minimal unique string; never whole sentences unless the user asked to reword them.\n- One pair per distinct replacement. If the request is ambiguous, add the most likely interpretation and explain briefly in `note`.\n- If the request cannot be mapped to find/replace operations (e.g. it asks to delete content or is not a correction), return an empty `replacements` array and explain in `note`.\nReply with STRICT JSON only: {{\"replacements\":[{{\"find\":\"...\",\"replace\":\"...\"}}],\"note\":\"...\"}}\n\n=== TRANSCRIPT VOCABULARY (words that appear, with casing preserved) ===\n{word_list}\n\n=== TRANSCRIPT SAMPLE (first 200 segments) ===\n{sample}"
+    );
+    let request = bea_core::LlmRequest {
+        model: effective_meeting_model(&database, &meeting_id, &provider.model),
+        system,
+        user: instruction.trim().to_string(),
+        json_schema: String::new(),
+        max_output_tokens: 900,
+    };
+    let raw = bea_core::call_provider_text(&provider, &request, Some(&api_key))
+        .await
+        .map_err(command_error)?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("correction plan was not valid JSON: {error}"))?;
+    let mut replacements = Vec::new();
+    if let Some(items) = parsed.get("replacements").and_then(|value| value.as_array()) {
+        for item in items {
+            let Some(find) = item.get("find").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(replace) = item.get("replace").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if find.trim().is_empty() || find == replace {
+                continue;
+            }
+            replacements.push(CorrectionPair {
+                find: find.to_string(),
+                replace: replace.to_string(),
+            });
+        }
+    }
+    let note = parsed
+        .get("note")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok(CorrectionPlan {
+        replacements,
+        note,
+    })
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -3238,6 +3380,7 @@ fn main() {
             set_meeting_vision_flag_command,
             set_meeting_model_command,
             get_meeting_model_command,
+            resolve_correction_command,
             inspect_model_package_command,
             install_model_command,
             download_model_command,
