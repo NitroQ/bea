@@ -1,0 +1,28 @@
+export type MeetingStatus = 'draft' | 'recording' | 'paused' | 'processing' | 'ready' | 'failed';
+export type TranscriptLanguage = 'auto' | 'en' | 'fil' | 'taglish';
+export type AsrEngineId = 'qwen-standard' | 'whisper-compatibility' | 'nemotron-multilingual';
+export type Meeting = { id: string; title: string; status: MeetingStatus; duration_seconds: number; language: TranscriptLanguage; created_at: string; asr_engine_id?: AsrEngineId; last_opened_at?: string };
+export type Evidence = { start_seconds: number; end_seconds: number; quote: string };
+export type LedgerEvent = { kind: string; summary: string; owner?: string | null; due?: string | null; confidence: number; evidence: Evidence[] };
+export type Minutes = { title: string; summary: string; decisions: LedgerEvent[]; action_items: LedgerEvent[]; unresolved: LedgerEvent[] };
+export type TranscriptSegment = { id: string; meeting_id: string; start_seconds: number; end_seconds: number; text: string; language_detected?: string | null; language_confidence?: number | null; speaker?: number | null };
+export const SILENCE_TEXT = '[silence]';
+export const isSilenceSegment = (segment: TranscriptSegment) => segment.text.trim() === SILENCE_TEXT;
+export type RuntimeAvailability = { asr_model_available: boolean; ffmpeg_available: boolean; ffprobe_available: boolean; ocr_available: boolean; provider_configured: boolean; can_transcribe_locally: boolean };
+export type ModelManifest = { id: string; name: string; version: string; size_bytes: number; sha256: string; runtime: string; languages: string[]; installed: boolean };
+export type ProviderKind = 'OpenRouter' | 'OpenAiCompatible' | 'ClaudeCompatible';
+export type ProviderConfig = { id: string; kind: ProviderKind; base_url: string; model: string; credential_ref?: string | null; enabled: boolean };
+export type ToolStatus = 'ready' | 'missing' | 'checking' | 'repairing' | 'error';
+export type SetupTool = { id: 'ffmpeg' | 'tesseract'; name: string; description: string; status: ToolStatus; detail: string };
+export type AsrEngineDescriptor = { id: AsrEngineId; name: string; description: string; languages: string; size: string; status: ToolStatus; recommended?: boolean; detail: string };
+export type ProviderVerification = { verified: boolean; checkedAt?: string; message?: string };
+export type SetupStatus = { tools: SetupTool[]; engines: AsrEngineDescriptor[]; selectedEngine: AsrEngineId; provider: ProviderVerification; complete: boolean };
+
+export const statusLabel: Record<MeetingStatus, string> = { draft: 'Draft', recording: 'Recording', paused: 'Paused', processing: 'Processing', ready: 'Ready', failed: 'Needs attention' };
+export type SpeakerName = { speaker_index: number; name: string };
+export const speakerLabel = (index: number | null, names: SpeakerName[], extra: number[] = []) => {
+  const primary = index === null ? 'Speaker —' : names.find((n) => n.speaker_index === index)?.name ?? `Speaker ${index + 1}`;
+  if (!extra.length) return primary;
+  const others = extra.filter((i) => i !== index).map((i) => names.find((n) => n.speaker_index === i)?.name ?? `Speaker ${i + 1}`);
+  return [primary, ...others].join(' + ');
+};

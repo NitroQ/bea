@@ -24,3 +24,4 @@ CREATE INDEX IF NOT EXISTS idx_visual_evidence_meeting_time ON visual_evidence(m
 CREATE INDEX IF NOT EXISTS idx_action_items_meeting_status ON action_items(meeting_id, status);
 
 CREATE TABLE IF NOT EXISTS speaker_names (meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, speaker_index INTEGER NOT NULL, name TEXT NOT NULL, UNIQUE(meeting_id, speaker_index));
+CREATE TABLE IF NOT EXISTS segment_speakers (segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, speaker_index INTEGER NOT NULL, UNIQUE(segment_id, speaker_index));

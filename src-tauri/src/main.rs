@@ -612,6 +612,60 @@ async fn generate_minutes_command(
 }
 
 #[tauri::command]
+fn set_speaker_name_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    speaker_index: u32,
+    name: String,
+) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    bea_core::set_speaker_name(&database, &meeting_id, speaker_index, &name).map_err(command_error)
+}
+
+#[tauri::command]
+fn list_speaker_names_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<(u32, String)>, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let mut names: Vec<(u32, String)> = bea_core::list_speaker_names(&database, &meeting_id)
+        .map_err(command_error)?
+        .into_iter()
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+#[tauri::command]
+fn assign_segment_speaker_command(
+    state: State<'_, AppState>,
+    segment_id: String,
+    speaker_index: u32,
+) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    bea_core::update_segment_speaker(&database, &segment_id, Some(speaker_index)).map_err(command_error)
+}
+
+#[tauri::command]
+fn set_segment_speakers_command(
+    state: State<'_, AppState>,
+    segment_id: String,
+    speaker_indexes: Vec<u32>,
+) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    bea_core::set_segment_speakers(&database, &segment_id, &speaker_indexes).map_err(command_error)
+}
+
+#[tauri::command]
+fn list_segment_speakers_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<std::collections::HashMap<String, Vec<u32>>, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    bea_core::list_segment_speakers(&database, &meeting_id).map_err(command_error)
+}
+
+#[tauri::command]
 fn import_vtt_command(
     state: State<'_, AppState>,
     meeting_id: String,
@@ -1861,6 +1915,11 @@ fn main() {
             generate_minutes_command,
             import_media_command,
             import_vtt_command,
+            set_speaker_name_command,
+            list_speaker_names_command,
+            assign_segment_speaker_command,
+            set_segment_speakers_command,
+            list_segment_speakers_command,
             process_imported_media_command,
             export_minutes_command,
             inspect_runtime_command,
