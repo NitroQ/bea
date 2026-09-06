@@ -16,6 +16,14 @@ export function parseSlashCommand(input: string): SlashParse {
   return { action: `unknown:/${head}`, arg: rest.join(' ') };
 }
 
+export const SLASH_COMMANDS = [
+  { name: '/clarify', description: 'Add a clarification minutes should honor' },
+  { name: '/context', description: 'Add background context the transcript lacks' },
+  { name: '/correction', description: 'Fix a name/term across the transcript' },
+  { name: '/custom', description: 'Open the custom minutes-format editor' },
+  { name: '/vision', description: 'Ask about video frames: /vision 320, 480' },
+];
+
 export const SLASH_HELP = [
   '/clarify <note> — add a clarification Bea should honor in minutes and answers',
   '/context <fact> — add background context the meeting transcript lacks',

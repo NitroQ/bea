@@ -46,8 +46,8 @@ enum RecorderCommand {
 const MEETING_SECRETARY_SYSTEM_PROMPT: &str = r#"You are an expert meeting secretary. From the transcript events below, produce strict JSON meeting minutes in English.
 Rules:
 - summary: a 2-4 sentence executive summary of the whole meeting.
-- decisions / action_items / unresolved: exactly one entry per distinct point; merge duplicates.
-- agenda: the meeting's topics in the order they were discussed, each as a short noun-phrase heading (e.g. "Q3 budget review"); attach start_seconds/end_seconds from the transcript when the topic's discussion span is identifiable. If no agenda structure is discernible, return an empty array.
+- decisions / action_items / unresolved: exactly one entry per distinct point; merge duplicates. Each entry's summary must be a self-contained, third-person, present-tense statement of the outcome or task (e.g. "The passing grade is set to 2.0 effective AY 2026-2027", "Revise the 2-day loss list before Friday") — never a question, never a verbatim or near-verbatim transcript line, and never in the speaker's voice. Include the owner and deadline in the summary when the transcript names them.
+- agenda: the meeting's topics in the order they were discussed, each as a short noun-phrase heading (e.g. "Q3 budget review"); attach start_seconds/end_seconds from the transcript when the topic's discussion span is identifiable. Infer topics from how the conversation shifts even when no written agenda exists — every meeting that discussed distinct subjects has an agenda. Return an empty array only when the whole meeting is a single informal topic.
 - Every item's summary must be ONE concise, capitalized, grammatical headline sentence in English (example: "Admission limits remain at the discretion of the Dean"). NEVER copy raw transcript speech as a summary.
 - Every item's evidence: list the EXACT original quotes with the start_seconds/end_seconds taken from the matching input event. Do not paraphrase quotes or invent timestamps.
 - Exclude procedural noise (motions to approve past minutes, roll call, greetings, filler) from action items and decisions.
@@ -1230,7 +1230,7 @@ async fn generate_minutes_command(
                     json_schema: r#"{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"agenda":{"type":"array","items":{"type":"object","properties":{"heading":{"type":"string"},"start_seconds":{"type":"number"},"end_seconds":{"type":"number"}},"required":["heading"]}},"visual_observations":{"type":"array","items":{"type":"string"}},"decisions":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"action_items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"unresolved":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}}},"required":["title","summary","decisions","action_items","unresolved"]}"#.into(),
                     max_output_tokens: 4_000,
                 };
-                if let Ok(remote_minutes) = if vision_images.is_empty() {
+                let remote_result = if vision_images.is_empty() {
                     call_provider(&provider, &request, Some(&api_key)).await
                 } else {
                     // Vision path: send the frame images inline and parse the
@@ -1245,24 +1245,36 @@ async fn generate_minutes_command(
                     )
                     .await
                     .and_then(|text| bea_core::parse_minutes_json(&text))
-                }
-                {
-                    let output_tokens = estimate_tokens(
-                        &serde_json::to_string(&remote_minutes).unwrap_or_default(),
-                    ) as u64;
-                    record_usage(
-                        &database,
-                        &UsageRecord {
-                            provider_id: provider.id,
-                            model: provider.model,
-                            input_tokens: pack.estimated_input_tokens as u64,
-                            output_tokens,
-                            estimated_cost: None,
-                            operation: "minutes".into(),
-                        },
-                    )
-                    .map_err(command_error)?;
-                    minutes = remote_minutes;
+                };
+                match remote_result {
+                    Ok(remote_minutes) => {
+                        let output_tokens = estimate_tokens(
+                            &serde_json::to_string(&remote_minutes).unwrap_or_default(),
+                        ) as u64;
+                        record_usage(
+                            &database,
+                            &UsageRecord {
+                                provider_id: provider.id,
+                                model: provider.model,
+                                input_tokens: pack.estimated_input_tokens as u64,
+                                output_tokens,
+                                estimated_cost: None,
+                                operation: "minutes".into(),
+                            },
+                        )
+                        .map_err(command_error)?;
+                        minutes = remote_minutes;
+                    }
+                    Err(provider_error) => {
+                        // A configured provider that fails must not silently
+                        // degrade to heuristic minutes (empty agenda, verbatim
+                        // transcript lines posing as summaries) — surface the
+                        // failure so the user can fix the provider instead of
+                        // mistaking fallback output for real AI minutes.
+                        return Err(format!(
+                            "AI minutes failed: {provider_error}. Fix the provider in Settings, or disable it to use local heuristic minutes."
+                        ));
+                    }
                 }
             }
         }

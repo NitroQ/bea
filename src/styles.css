@@ -445,7 +445,14 @@ select { appearance: none; }
   .settings-danger { display: grid; gap: 14px; }
 }
 
-.chat-panel { display: flex; flex-direction: column; height: 100%; min-height: 0; gap: 12px; }
+.chat-panel { display: flex; flex-direction: column; min-height: 0; gap: 12px; height: calc(100vh - 150px); overflow: hidden; }
+.chat-log { min-height: 220px; }
+.chat-command-row { position: relative; display: flex; gap: 8px; align-items: center; }
+.chat-command-menu { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 30; display: grid; min-width: 320px; padding: 6px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-2); box-shadow: 0 10px 26px #00000055; }
+.chat-command-menu button { display: flex; align-items: baseline; gap: 10px; min-height: 32px; padding: 6px 9px; border: 0; border-radius: 6px; background: transparent; color: var(--text); text-align: left; font-size: 12px; }
+.chat-command-menu button:hover { background: var(--surface-3); }
+.chat-command-menu code { color: var(--teal); font-size: 12px; }
+.chat-command-menu span { color: var(--muted); font-size: 11px; }
 .chat-log { flex: 1; min-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
 .chat-empty { color: var(--text); opacity: .8; font-size: 13px; }
 .chat-empty ul { margin: 8px 0 0 18px; display: grid; gap: 4px; }
@@ -482,3 +489,27 @@ select { appearance: none; }
 
 /* ChatGPT (Codex) OAuth sign-in block */
 .oauth-block { display: grid; gap: 12px; }
+
+/* --- Speaker assign + overlap tools on transcript blocks --- */
+.conversation-header { align-items: center; flex-wrap: wrap; row-gap: 6px; }
+.conversation-tools { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
+.speaker-select { min-height: 26px; width: 118px; padding: 0 24px 0 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); color: var(--muted); font-size: 11px; appearance: none; }
+.conversation-tools { position: relative; }
+.conversation-tools::after { content: '⌄'; position: absolute; right: 130px; top: 3px; color: var(--quiet); font-size: 10px; pointer-events: none; }
+.overlap-button { display: inline-flex; align-items: center; gap: 4px; min-height: 26px; padding: 0 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); color: var(--muted); font-size: 11px; }
+.overlap-button:hover { color: var(--text); border-color: var(--teal); }
+.overlap-picker { display: grid; gap: 6px; margin-top: 8px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-2); }
+.overlap-option { display: flex; align-items: center; gap: 7px; color: var(--text); font-size: 12px; }
+
+/* --- Export row spacing --- */
+.export-row { display: flex; gap: 8px; margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--line-soft); }
+
+/* --- Chat panel breathing room --- */
+.chat-panel { padding-bottom: 6px; }
+.chat-input-row { padding-bottom: 4px; }
+
+/* --- Clarify wizard footer spacing --- */
+.clarify-actions { margin-top: 18px; gap: 12px; }
+
+/* --- Breadcrumb chevron alignment --- */
+.workspace-breadcrumb svg { margin-top: 0; transform: translateY(0.5px); }
