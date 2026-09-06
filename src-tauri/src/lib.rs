@@ -3304,9 +3304,14 @@ pub fn build_provider_request(provider: &ProviderConfig, request: &LlmRequest) -
             {"role": "system", "content": request.system},
             {"role": "user", "content": request.user}
         ],
-        "response_format": {"type": "json_schema", "json_schema": {"name": "bea_minutes", "strict": true, "schema": serde_json::from_str::<serde_json::Value>(&request.json_schema).unwrap_or_else(|_| serde_json::json!({"type": "object"}))}},
         "max_tokens": request.max_output_tokens,
     });
+    // JSON mode is minutes-only. Chat/Q&A requests send an empty `json_schema`
+    // string, which must NOT set `response_format` (many providers reject
+    // schemas there, and chat replies are free text).
+    if !request.json_schema.trim().is_empty() {
+        body["response_format"] = serde_json::json!({"type": "json_schema", "json_schema": {"name": "bea_minutes", "strict": true, "schema": serde_json::from_str::<serde_json::Value>(&request.json_schema).unwrap_or_else(|_| serde_json::json!({"type": "object"}))}});
+    }
     // Reasoning models (e.g. qwen3 on OpenRouter) burn the whole output budget
     // on `message.reasoning` and return `content: null`, which makes minutes
     // generation silently fall back to the local extractor. Disable thinking
@@ -3431,6 +3436,42 @@ pub async fn call_provider(
         .await
         .map_err(|error| BeaError::ProviderRequest(error.to_string()))?;
     parse_provider_minutes(&payload)
+}
+
+/// Like `call_provider` but returns the assistant's free-text reply instead of
+/// parsing minutes JSON. Used by the meeting chat.
+pub async fn call_provider_text(
+    provider: &ProviderConfig,
+    request: &LlmRequest,
+    api_key: Option<&str>,
+) -> Result<String, BeaError> {
+    let prepared = build_provider_request(provider, request);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|error| BeaError::ProviderRequest(error.to_string()))?;
+    let mut request_builder = client.post(prepared.url).json(&prepared.body);
+    if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
+        request_builder = request_builder.bearer_auth(key);
+    }
+    let response = request_builder
+        .send()
+        .await
+        .map_err(|error| BeaError::ProviderRequest(error.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(BeaError::ProviderRequest(format!("HTTP {status}")));
+    }
+    let payload = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| BeaError::ProviderRequest(error.to_string()))?;
+    Ok(payload
+        .pointer("/choices/0/message/content")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string())
 }
 
 pub fn record_usage(conn: &Connection, usage: &UsageRecord) -> Result<(), BeaError> {
