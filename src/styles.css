@@ -467,3 +467,13 @@ select { appearance: none; }
 .clarify-option { display: flex; align-items: center; gap: 8px; color: #cbd5df; font-size: 13px; }
 .clarify-free { width: 100%; }
 .clarify-actions { display: flex; gap: 10px; justify-content: center; margin-top: 10px; }
+
+/* Local server presets (LM Studio / Ollama / llama.cpp) */
+.local-presets { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.preset { display: grid; gap: 3px; padding: 9px 11px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--text); font-size: 11px; cursor: pointer; text-align: left; }
+.preset small { color: var(--quiet); font-size: 9px; }
+.preset.selected { border-color: var(--teal); }
+.preset:hover { border-color: var(--muted); }
+
+/* ChatGPT (Codex) OAuth sign-in block */
+.oauth-block { display: grid; gap: 12px; }
