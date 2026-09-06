@@ -42,6 +42,15 @@ enum RecorderCommand {
     Stop(mpsc::SyncSender<Result<Vec<CompletedAudioChunk>, String>>),
 }
 
+const MEETING_SECRETARY_SYSTEM_PROMPT: &str = r#"You are an expert meeting secretary. From the transcript events below, produce strict JSON meeting minutes in English.
+Rules:
+- summary: a 2-4 sentence executive summary of the whole meeting.
+- decisions / action_items / unresolved: exactly one entry per distinct point; merge duplicates.
+- Every item's summary must be ONE concise, capitalized, grammatical headline sentence in English (example: "Admission limits remain at the discretion of the Dean"). NEVER copy raw transcript speech as a summary.
+- Every item's evidence: list the EXACT original quotes with the start_seconds/end_seconds taken from the matching input event. Do not paraphrase quotes or invent timestamps.
+- Exclude procedural noise (motions to approve past minutes, roll call, greetings, filler) from action items and decisions.
+- If a Participants legend or custom format is provided in the system prompt, use real participant names instead of "Speaker N" and follow the custom format's structure while still returning the same JSON schema."#;
+
 fn language_from_code(code: &str) -> TranscriptLanguage {
     match code {
         "en" => TranscriptLanguage::English,
@@ -53,6 +62,31 @@ fn language_from_code(code: &str) -> TranscriptLanguage {
 
 fn command_error(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+fn list_context_events_payload(
+    database: &rusqlite::Connection,
+    meeting_id: &str,
+) -> Result<String, String> {
+    let mut statement = database
+        .prepare("SELECT kind,payload FROM context_events WHERE meeting_id=?1 AND kind IN ('clarify','context') ORDER BY created_at, rowid")
+        .map_err(command_error)?;
+    let rows = statement
+        .query_map(rusqlite::params![meeting_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(command_error)?;
+    let collected = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(command_error)?;
+    if collected.is_empty() {
+        return Ok("(none)".into());
+    }
+    Ok(collected
+        .iter()
+        .map(|(kind, payload)| format!("- [{kind}] {payload}"))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 fn locate_tesseract(root: &std::path::Path) -> PathBuf {
@@ -577,10 +611,15 @@ async fn generate_minutes_command(
     if let Some(provider) = load_provider(&database, "primary").map_err(command_error)? {
         if provider.enabled {
             if let Some(api_key) = keyring_secret(&provider) {
+let speaker_names = bea_core::list_speaker_names(&database, &meeting_id).unwrap_or_default();
+            let custom_format = bea_core::get_app_setting(&database, &format!("custom_minutes_format:{meeting_id}")).map_err(command_error)?;
+            let user_notes = list_context_events_payload(&database, &meeting_id)?;
+            let mut meeting_context = bea_core::build_meeting_context(&speaker_names, custom_format.as_deref());
+            meeting_context.push_str(&format!("\n=== USER CLARIFICATIONS & CONTEXT (treat as authoritative) ===\n{user_notes}\n"));
                 let pack = bea_core::pack_context_mode(&events, 12_000, ContextMode::Balanced);
                 let request = LlmRequest {
                     model: provider.model.clone(),
-                    system: "You are an expert meeting secretary. From the transcript events below, produce strict JSON meeting minutes in English.\nRules:\n- summary: a 2-4 sentence executive summary of the whole meeting.\n- decisions / action_items / unresolved: exactly one entry per distinct point; merge duplicates.\n- Every item's summary must be ONE concise, capitalized, grammatical headline sentence in English (example: \"Admission limits remain at the discretion of the Dean\"). NEVER copy raw transcript speech as a summary.\n- Every item's evidence: list the EXACT original quotes with the start_seconds/end_seconds taken from the matching input event. Do not paraphrase quotes or invent timestamps.\n- Exclude procedural noise (motions to approve past minutes, roll call, greetings, filler) from action items and decisions.".into(),
+                    system: format!("{}\n{}", MEETING_SECRETARY_SYSTEM_PROMPT, meeting_context),
                     user: serde_json::to_string(&pack.events).map_err(command_error)?,
                     json_schema: r#"{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"decisions":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"action_items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"unresolved":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}}},"required":["title","summary","decisions","action_items","unresolved"]}"#.into(),
                     max_output_tokens: 4_000,

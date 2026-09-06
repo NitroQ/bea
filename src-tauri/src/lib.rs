@@ -2472,6 +2472,32 @@ pub fn estimate_tokens(text: &str) -> usize {
     (text.chars().count() + 3) / 4
 }
 
+/// Human-readable speaker legend + optional custom minutes format, prepended
+/// to every LLM request for this meeting so minutes and chat answers both use
+/// real names and the user's required structure.
+pub fn build_meeting_context(
+    speaker_names: &std::collections::HashMap<u32, String>,
+    custom_format: Option<&str>,
+) -> String {
+    let mut context = String::new();
+    if !speaker_names.is_empty() {
+        let mut pairs: Vec<(u32, &String)> = speaker_names.iter().map(|(k, v)| (*k, v)).collect();
+        pairs.sort();
+        let legend = pairs
+            .iter()
+            .map(|(index, name)| format!("Speaker {} = {}", index + 1, name))
+            .collect::<Vec<_>>()
+            .join("; ");
+        context.push_str(&format!("Participants: {legend}.\n"));
+    }
+    if let Some(format) = custom_format.filter(|value| !value.trim().is_empty()) {
+        context.push_str("The user requires the minutes to follow this custom format:\n");
+        context.push_str(format.trim());
+        context.push('\n');
+    }
+    context
+}
+
 pub fn pack_context_mode(
     events: &[LedgerEvent],
     budget_tokens: usize,
@@ -3862,6 +3888,15 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
+    #[test]
+    fn chat_context_includes_speaker_names_and_custom_format() {
+        let context = build_meeting_context(
+            &std::collections::HashMap::from([(0u32, "Maria Santos".to_string())]),
+            Some("Use Q&A format."),
+        );
+        assert!(context.contains("Maria Santos"));
+        assert!(context.contains("Use Q&A format."));
+    }
     #[test]
     fn segment_speakers_support_overlap_and_rename() {
         let dir = tempdir().unwrap();
