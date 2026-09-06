@@ -55,12 +55,36 @@ pub fn authorize_url(verifier: &str) -> String {
     )
 }
 
+/// Minimal `application/x-www-form-urlencoded` percent-encoding (RFC 3986
+/// unreserved set kept literal, everything else hex-escaped). Enough for the
+/// token endpoint bodies without pulling in another dependency.
+pub fn form_urlencode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char)
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
 pub fn token_exchange_body(code: &str, verifier: &str) -> String {
-    format!("grant_type=authorization_code&code={code}&redirect_uri={REDIRECT_URI}&client_id={CLIENT_ID}&code_verifier={verifier}")
+    format!(
+        "grant_type=authorization_code&code={}&redirect_uri={}&client_id={CLIENT_ID}&code_verifier={}",
+        form_urlencode(code),
+        form_urlencode(REDIRECT_URI),
+        form_urlencode(verifier)
+    )
 }
 
 pub fn token_refresh_body(refresh_token: &str) -> String {
-    format!("grant_type=refresh_token&refresh_token={refresh_token}&client_id={CLIENT_ID}")
+    format!(
+        "grant_type=refresh_token&refresh_token={}&client_id={CLIENT_ID}",
+        form_urlencode(refresh_token)
+    )
 }
 
 /// The Codex backend speaks the Responses API, not chat/completions.
@@ -164,6 +188,24 @@ mod tests {
         assert!(url.contains("code_challenge="));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("scope=openid"));
+    }
+
+    #[test]
+    fn form_urlencode_escapes_reserved_characters() {
+        assert_eq!(form_urlencode("plain-token"), "plain-token");
+        assert_eq!(form_urlencode("a b&c=d/e"), "a%20b%26c%3Dd%2Fe");
+        assert_eq!(form_urlencode("héllo~"), "h%C3%A9llo~");
+        assert_eq!(form_urlencode("-._~"), "-._~");
+    }
+
+    #[test]
+    fn token_bodies_percent_encode_special_characters() {
+        let body = token_exchange_body("auth&code=1", "ver ifier");
+        assert!(body.contains("code=auth%26code%3D1"));
+        assert!(body.contains("code_verifier=ver%20ifier"));
+        assert!(body.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
+        let refresh = token_refresh_body("rt with+space&x");
+        assert!(refresh.contains("refresh_token=rt%20with%2Bspace%26x"));
     }
 
     #[test]

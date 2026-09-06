@@ -552,9 +552,9 @@ impl Qwen3AsrEngine {
                 model_dir.display()
             )));
         }
-        let mut config = OfflineRecognizerConfig::default();
-        config.model_config = OfflineModelConfig {
-            qwen3_asr: OfflineQwen3ASRModelConfig {
+        let config = OfflineRecognizerConfig {
+            model_config: OfflineModelConfig {
+                qwen3_asr: OfflineQwen3ASRModelConfig {
                 conv_frontend: Some(required[0].to_string_lossy().into_owned()),
                 encoder: Some(required[1].to_string_lossy().into_owned()),
                 decoder: Some(required[2].to_string_lossy().into_owned()),
@@ -575,6 +575,8 @@ impl Qwen3AsrEngine {
             num_threads: 2,
             provider: Some("cpu".into()),
             ..OfflineModelConfig::default()
+        },
+        ..OfflineRecognizerConfig::default()
         };
         let recognizer = OfflineRecognizer::create(&config).ok_or_else(|| {
             BeaError::MediaProcessing("sherpa-onnx could not initialize Qwen3-ASR".into())
@@ -700,7 +702,7 @@ fn is_degenerate_asr_text(raw: &str, language: &TranscriptLanguage) -> Option<&'
             let pattern = &words[..span];
             let repeats = words
                 .chunks(span)
-                .filter(|chunk| *chunk == &pattern[..])
+                .filter(|chunk| *chunk == pattern)
                 .count();
             if repeats * span >= 6 && repeats * span * 10 >= words.len() * 9 {
                 return Some("repetition-loop");
@@ -845,9 +847,9 @@ impl WhisperCompatibilityEngine {
                 model_dir.display()
             )));
         }
-        let mut config = OfflineRecognizerConfig::default();
-        config.model_config = OfflineModelConfig {
-            whisper: OfflineWhisperModelConfig {
+        let config = OfflineRecognizerConfig {
+            model_config: OfflineModelConfig {
+                whisper: OfflineWhisperModelConfig {
                 encoder: Some(encoder.to_string_lossy().into_owned()),
                 decoder: Some(decoder.to_string_lossy().into_owned()),
                 language: None,
@@ -860,6 +862,8 @@ impl WhisperCompatibilityEngine {
             num_threads: 2,
             provider: Some("cpu".into()),
             ..OfflineModelConfig::default()
+        },
+        ..OfflineRecognizerConfig::default()
         };
         let recognizer = OfflineRecognizer::create(&config).ok_or_else(|| {
             BeaError::MediaProcessing("sherpa-onnx could not initialize Whisper".into())
@@ -933,11 +937,13 @@ impl NemotronMultilingualEngine {
             .ok_or_else(|| BeaError::InvalidState("Nemotron tokens.txt is missing".into()))?
             .to_string_lossy()
             .into_owned();
-        let mut config = OnlineRecognizerConfig::default();
-        config.enable_endpoint = true;
-        config.rule1_min_trailing_silence = 0.8;
-        config.rule2_min_trailing_silence = 1.2;
-        config.rule3_min_utterance_length = 20.0;
+        let mut config = OnlineRecognizerConfig {
+            enable_endpoint: true,
+            rule1_min_trailing_silence: 0.8,
+            rule2_min_trailing_silence: 1.2,
+            rule3_min_utterance_length: 20.0,
+            ..OnlineRecognizerConfig::default()
+        };
         config.model_config.tokens = Some(tokens);
         config.model_config.num_threads = 2;
         config.model_config.provider = Some("cpu".into());
@@ -1354,7 +1360,6 @@ impl SpeakerDiarizer {
                 // three-person meetings and one-on-ones both label correctly.
                 num_clusters: -1,
                 threshold: 0.5,
-                ..Default::default()
             },
             ..Default::default()
         };
@@ -1891,6 +1896,7 @@ pub fn analyze_video<P: MediaPipeline>(
 /// through the same offline ASR path used by microphone recordings. Video
 /// imports also run the keyframe pipeline so the derived audio stays aligned
 /// with visual evidence timestamps.
+#[allow(clippy::too_many_arguments)]
 pub fn transcribe_imported_media<P: MediaPipeline, E: AsrEngine + Clone + Send + 'static>(
     conn: &Connection,
     meeting_id: &str,
@@ -1916,6 +1922,7 @@ pub fn transcribe_imported_media<P: MediaPipeline, E: AsrEngine + Clone + Send +
 
 /// Same as [`transcribe_imported_media`], but forwards chunk progress
 /// `(completed, total)` for UI reporting.
+#[allow(clippy::too_many_arguments)]
 pub fn transcribe_imported_media_with_progress<
     P: MediaPipeline,
     E: AsrEngine + Clone + Send + 'static,
@@ -2495,7 +2502,7 @@ pub fn pack_context(events: &[LedgerEvent], budget: usize) -> Vec<LedgerEvent> {
 }
 
 pub fn estimate_tokens(text: &str) -> usize {
-    (text.chars().count() + 3) / 4
+    text.chars().count().div_ceil(4)
 }
 
 /// Human-readable speaker legend + optional custom minutes format, prepended
@@ -3169,7 +3176,7 @@ pub fn extract_model_archive(source: &Path, destination: &Path) -> Result<(), Be
             let mut entry = archive
                 .by_index(index)
                 .map_err(|e| BeaError::InvalidState(e.to_string()))?;
-            let Some(name) = entry.enclosed_name().map(PathBuf::from) else {
+            let Some(name) = entry.enclosed_name()else {
                 return Err(BeaError::InvalidState(
                     "model archive contains an unsafe path".into(),
                 ));
@@ -3771,7 +3778,7 @@ fn summarize_segment_text(text: &str, _kind: &str) -> String {
         .or_else(|| clean.find("? "))
         .or_else(|| clean.find("! "))
     {
-        if pos >= 25 && pos <= 150 {
+        if (25..=150).contains(&pos) {
             return clean[..=pos].trim().to_string();
         }
     }
@@ -4145,6 +4152,67 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
+
+    /// A database created purely from 001_init.sql must expose the same
+    /// schema the runtime `open_database` produces: no missing app_settings
+    /// table, no missing transcript_segments.speaker column.
+    #[test]
+    fn migration_001_matches_runtime_schema() {
+        let dir = tempdir().unwrap();
+        let migration = include_str!("../migrations/001_init.sql");
+        let migrated = Connection::open(dir.path().join("migrated.db")).unwrap();
+        migrated.execute_batch(migration).unwrap();
+        // Runtime open on the same file must not fail or need repair.
+        let runtime = open_database(dir.path().join("migrated.db")).unwrap();
+        runtime
+            .execute(
+                "INSERT OR REPLACE INTO app_settings(key,value) VALUES ('k','v')",
+                [],
+            )
+            .unwrap();
+        let speaker: Option<i64> = runtime
+            .query_row(
+                "SELECT speaker FROM transcript_segments LIMIT 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(speaker, None);
+        // And a fresh runtime DB has the same core objects the migration promises.
+        let fresh = open_database(dir.path().join("fresh.db")).unwrap();
+        for table in [
+            "meetings",
+            "transcript_segments",
+            "transcript_fts",
+            "recording_chunks",
+            "jobs",
+            "media_sources",
+            "model_manifests",
+            "provider_configs",
+            "usage_records",
+            "ledger_events",
+            "minutes",
+            "app_settings",
+            "participants",
+            "context_events",
+            "topics",
+            "visual_evidence",
+            "action_items",
+            "llm_runs",
+            "speaker_names",
+            "segment_speakers",
+        ] {
+            let count: i64 = fresh
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name=?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "table {table} missing from runtime schema");
+        }
+    }
     #[test]
     fn multimodal_body_embeds_image_parts_and_ocr_fallback_text() {
         let provider = ProviderConfig {

@@ -67,12 +67,79 @@ fn command_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+/// Shared HTTP client with a 120 s timeout. Requests without a timeout used to
+/// hang the command forever when a provider stalled; the OpenRouter catalog
+/// call keeps its own shorter 30 s timeout.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Validates a meeting id before it reaches a filesystem path. Rejects empty
+/// ids, path separators, parent traversal, and anything outside the safe
+/// `[A-Za-z0-9._-]` set so `derived/<id>/` can never escape its root.
+fn sanitize_meeting_id(id: &str) -> Result<String, String> {
+    if id.is_empty() {
+        return Err("meeting id must not be empty".into());
+    }
+    if id == "." || id == ".." || id.contains('/') || id.contains('\\') || id.contains("..") {
+        return Err(format!("unsafe meeting id: {id:?}"));
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(format!("unsafe meeting id: {id:?}"));
+    }
+    Ok(id.to_string())
+}
+
+/// Resolves the playback source path against the meeting's registered media
+/// sources so only imported/recorded media can be transcoded.
+fn verify_media_source(database: &rusqlite::Connection, meeting_id: &str, source: &std::path::Path) -> Result<(), String> {
+    let mut statement = database
+        .prepare("SELECT path FROM media_sources WHERE meeting_id=?1")
+        .map_err(command_error)?;
+    let rows = statement
+        .query_map(rusqlite::params![meeting_id], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(command_error)?;
+    let source_text = source.to_string_lossy();
+    let source_lower = source_text.to_ascii_lowercase();
+    for registered in rows {
+        let registered = registered.map_err(command_error)?;
+        let registered_lower = registered.to_ascii_lowercase();
+        if registered_lower == source_lower {
+            return Ok(());
+        }
+        // Windows paths may differ in separator style; compare canonical forms
+        // where possible and fall back to separator-normalized text.
+        if let (Ok(canon_reg), Ok(canon_src)) = (
+            std::fs::canonicalize(&registered),
+            std::fs::canonicalize(source),
+        ) {
+            if canon_reg == canon_src {
+                return Ok(());
+            }
+        }
+        let normalize = |value: &str| value.replace('\\', "/");
+        if normalize(&registered_lower) == normalize(&source_lower) {
+            return Ok(());
+        }
+    }
+    Err("media path is not registered for this meeting".into())
+}
+
 fn list_context_events_payload(
     database: &rusqlite::Connection,
     meeting_id: &str,
 ) -> Result<String, String> {
+    // Chat Q&A persisted with kind 'chat' must feed future minutes too.
     let mut statement = database
-        .prepare("SELECT kind,payload FROM context_events WHERE meeting_id=?1 AND kind IN ('clarify','context') ORDER BY created_at, rowid")
+        .prepare("SELECT kind,payload FROM context_events WHERE meeting_id=?1 AND kind IN ('clarify','context','chat') ORDER BY created_at, rowid")
         .map_err(command_error)?;
     let rows = statement
         .query_map(rusqlite::params![meeting_id], |row| {
@@ -88,6 +155,41 @@ fn list_context_events_payload(
         .map(|(kind, payload)| format!("- [{kind}] {payload}"))
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+#[cfg(test)]
+mod context_payload_tests {
+    use super::list_context_events_payload;
+
+    /// Chat Q&A (kind 'chat') must reach the minutes prompt alongside
+    /// 'clarify' and 'context' events.
+    #[test]
+    fn chat_events_are_included_in_context_payload() {
+        let database = rusqlite::Connection::open_in_memory().unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE context_events (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, confidence REAL NOT NULL, created_at TEXT NOT NULL);",
+            )
+            .unwrap();
+        for (kind, payload) in [
+            ("clarify", "What date?"),
+            ("context", "Budget frozen"),
+            ("chat", "Q: Who approved?\nA: Maria"),
+            ("ignored", "noise"),
+        ] {
+            database
+                .execute(
+                    "INSERT INTO context_events(id,meeting_id,kind,payload,confidence,created_at) VALUES (?1,'m1',?2,?3,1.0,'2026-01-01')",
+                    rusqlite::params![uuid::Uuid::new_v4().to_string(), kind, payload],
+                )
+                .unwrap();
+        }
+        let payload = list_context_events_payload(&database, "m1").unwrap();
+        assert!(payload.contains("[clarify] What date?"));
+        assert!(payload.contains("[context] Budget frozen"));
+        assert!(payload.contains("[chat] Q: Who approved?"));
+        assert!(!payload.contains("noise"));
+    }
 }
 
 fn locate_tesseract(root: &std::path::Path) -> PathBuf {
@@ -219,9 +321,17 @@ fn build_input_stream(
     device: &cpal::Device,
     supported: &cpal::SupportedStreamConfig,
     recorder: Arc<Mutex<SegmentedWavRecorder>>,
+    stream_error: Arc<Mutex<Option<String>>>,
 ) -> Result<cpal::Stream, String> {
     let config = supported.config();
-    let error_callback = |_error: cpal::StreamError| {};
+    // Stream errors (device unplugged, format change, ...) are surfaced
+    // through a shared slot instead of being silently dropped; the stop path
+    // reports them.
+    let error_callback = move |error: cpal::StreamError| {
+        if let Ok(mut slot) = stream_error.lock() {
+            *slot = Some(error.to_string());
+        }
+    };
     match supported.sample_format() {
         cpal::SampleFormat::F32 => device.build_input_stream(
             &config,
@@ -291,7 +401,9 @@ fn spawn_recorder(
             .map_err(command_error)?;
             recorder.start().map_err(command_error)?;
             let recorder = Arc::new(Mutex::new(recorder));
-            let stream = build_input_stream(&device, &supported, Arc::clone(&recorder))?;
+            let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let stream =
+                build_input_stream(&device, &supported, Arc::clone(&recorder), Arc::clone(&stream_error))?;
             stream.play().map_err(command_error)?;
             ready
                 .send(Ok(()))
@@ -317,6 +429,18 @@ fn spawn_recorder(
                             .lock()
                             .map_err(|_| "recorder lock poisoned".to_string())
                             .and_then(|mut value| value.stop().map_err(command_error));
+                        // A stream error mid-recording invalidates the audio:
+                        // report it instead of handing back partial data.
+                        let stream_error = stream_error
+                            .lock()
+                            .ok()
+                            .and_then(|slot| slot.clone());
+                        let result = match (result, stream_error) {
+                            (Ok(chunks), Some(error)) if chunks.is_empty() => {
+                                Err(format!("audio stream failed: {error}"))
+                            }
+                            (result, _) => result,
+                        };
                         let _ = reply.send(result);
                         break;
                     }
@@ -377,7 +501,7 @@ fn update_transcript_segment_command(
     segment_id: String,
     text: String,
 ) -> Result<(), String> {
-    let database = open_database(&state.database_path).map_err(command_error)?;
+    let mut database = open_database(&state.database_path).map_err(command_error)?;
     let changed = database
         .execute(
             "UPDATE transcript_segments SET text=?1 WHERE id=?2",
@@ -387,18 +511,22 @@ fn update_transcript_segment_command(
     if changed == 0 {
         return Err("transcript segment not found".into());
     }
-    database
+    // Atomic FTS rebuild: a failure between DELETE and INSERT would leave
+    // search silently missing this segment.
+    let transaction = database.transaction().map_err(command_error)?;
+    transaction
         .execute(
             "DELETE FROM transcript_fts WHERE segment_id=?1",
             rusqlite::params![segment_id],
         )
         .map_err(command_error)?;
-    database
+    transaction
         .execute(
             "INSERT INTO transcript_fts(meeting_id,segment_id,text) SELECT meeting_id,id,text FROM transcript_segments WHERE id=?1",
             rusqlite::params![segment_id],
         )
         .map_err(command_error)?;
+    transaction.commit().map_err(command_error)?;
     Ok(())
 }
 
@@ -474,12 +602,13 @@ fn extract_frames_inner(
     meeting_id: &str,
     timestamps: &[u64],
 ) -> Result<Vec<ExtractedFrame>, String> {
-    let video = list_media_command_inner(database, meeting_id)?
+    let meeting_id = sanitize_meeting_id(meeting_id)?;
+    let video = list_media_command_inner(database, meeting_id.as_str())?
         .into_iter()
         .find(|media| matches!(media.kind, MediaKind::Video))
         .ok_or_else(|| "this meeting has no video source".to_string())?;
-    let ffmpeg = locate_ffmpeg(&root);
-    let tesseract = locate_tesseract(&root);
+    let ffmpeg = locate_ffmpeg(root);
+    let tesseract = locate_tesseract(root);
     let out_dir = root.join("derived").join(&meeting_id).join("frames");
     std::fs::create_dir_all(&out_dir).map_err(command_error)?;
     let ocr_engine = bea_core::TesseractOcrEngine {
@@ -572,9 +701,14 @@ fn ensure_playable_proxy_command(
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
+    let meeting_id = sanitize_meeting_id(&meeting_id)?;
     let source = std::path::PathBuf::from(&media_path);
     if !source.is_file() {
         return Err("media file not found".into());
+    }
+    {
+        let database = open_database(&state.database_path).map_err(command_error)?;
+        verify_media_source(&database, &meeting_id, &source)?;
     }
     let extension = source
         .extension()
@@ -706,7 +840,7 @@ async fn test_provider_connection_command(
         "{}/chat/completions",
         provider.base_url.trim_end_matches('/')
     );
-    let mut request_builder = reqwest::Client::new().post(endpoint);
+    let mut request_builder = http_client().post(endpoint);
     // Local servers (LM Studio / Ollama / llama.cpp) listen without auth.
     if !api_key.trim().is_empty() {
         request_builder = request_builder.bearer_auth(api_key);
@@ -800,7 +934,7 @@ async fn exchange_codex_code(
     code: &str,
     verifier: &str,
 ) -> Result<bea_core::codex_oauth::CodexTokens, String> {
-    let response = reqwest::Client::new()
+    let response = http_client()
         .post(CODEX_TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(bea_core::codex_oauth::token_exchange_body(code, verifier))
@@ -834,14 +968,19 @@ async fn exchange_codex_code(
 }
 
 /// Returns a valid access token, refreshing via the stored refresh token when
-/// the current one is within 60 seconds of expiry.
+/// the current one is within 60 seconds of expiry. A global mutex serializes
+/// the refresh flow: concurrent callers would otherwise burn the single-use
+/// refresh token twice; the second caller re-reads the freshly stored token
+/// after the first refresh completes.
 async fn fresh_codex_access_token() -> Result<String, String> {
+    static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = REFRESH_LOCK.lock().await;
     let tokens =
         load_codex_tokens().ok_or("no ChatGPT sign-in — click Sign in with ChatGPT first")?;
     if tokens.expires_at - 60 > chrono::Utc::now().timestamp() {
         return Ok(tokens.access_token);
     }
-    let response = reqwest::Client::new()
+    let response = http_client()
         .post(CODEX_TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(bea_core::codex_oauth::token_refresh_body(
@@ -869,11 +1008,53 @@ async fn fresh_codex_access_token() -> Result<String, String> {
     Ok(updated.access_token)
 }
 
+/// Parses the `code` and `state` query parameters from an OAuth callback
+/// request line. The query string starts at the path's `?` only — the old
+/// `split("code=")` also matched inside path/other params.
+fn parse_oauth_callback(
+    request_line: &str,
+    expected_state: &str,
+) -> Result<String, String> {
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "malformed HTTP request line".to_string())?;
+    let query = path
+        .split_once('?')
+        .map(|(_, query)| query)
+        .ok_or_else(|| "callback contained no query string".to_string())?;
+    let mut code: Option<String> = None;
+    let mut state_matched = false;
+    for pair in query.split('&') {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if name == "state" {
+            state_matched = value == expected_state;
+        } else if name == "code" && code.is_none() {
+            code = Some(value.to_string());
+        }
+    }
+    if !state_matched {
+        return Err("OAuth state mismatch — login attempt rejected".into());
+    }
+    code.ok_or_else(|| "callback contained no authorization code".to_string())
+}
+
+fn generate_oauth_state() -> String {
+    Uuid::new_v4().to_string()
+}
+
 #[tauri::command]
 async fn codex_oauth_login_command() -> Result<(), String> {
     use std::io::Read;
     let verifier = bea_core::codex_oauth::pkce_verifier();
-    let url = bea_core::codex_oauth::authorize_url(&verifier);
+    let state = generate_oauth_state();
+    let url = format!(
+        "{}&state={}",
+        bea_core::codex_oauth::authorize_url(&verifier),
+        state
+    );
     // Open the default browser on the Windows host.
     std::process::Command::new("cmd")
         .args(["/C", "start", "", &url])
@@ -891,14 +1072,7 @@ async fn codex_oauth_login_command() -> Result<(), String> {
         // Request line: GET /auth/callback?code=...&state=... HTTP/1.1
         let request = String::from_utf8_lossy(&buffer[..read]).to_string();
         let line = request.lines().next().unwrap_or_default();
-        let code = line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|path| path.split("code=").nth(1))
-            .and_then(|rest| rest.split('&').next())
-            .ok_or_else(|| "callback contained no authorization code".to_string())?
-            .to_string();
-        Ok(code)
+        parse_oauth_callback(line, &state)
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -924,7 +1098,7 @@ fn codex_oauth_sign_out_command() -> Result<(), String> {
 #[tauri::command]
 async fn codex_list_models_command() -> Result<Vec<String>, String> {
     let token = fresh_codex_access_token().await?;
-    let response = reqwest::Client::new()
+    let response = http_client()
         .get(format!(
             "{}/models",
             bea_core::codex_oauth::CHATGPT_API_BASE
@@ -997,7 +1171,9 @@ async fn generate_minutes_command(
             // Local servers take no auth; OAuth providers resolve a fresh
             // access token; keyring providers read their API key.
             let api_key = if provider.kind == bea_core::ProviderKind::OpenAiOAuth {
-                fresh_codex_access_token().await.ok()
+                // A failed refresh must surface, not silently fall back to
+                // local minutes — the user thinks OAuth minutes worked.
+                Some(fresh_codex_access_token().await?)
             } else {
                 keyring_secret(&provider)
             };
@@ -1034,12 +1210,13 @@ async fn generate_minutes_command(
                         &meeting_id,
                         &provider.kind,
                         &provider.model,
-                    ) {
+                    ) && !frames.is_empty()
+                    {
                         vision_images = frames
                             .iter()
                             .map(|frame| (std::path::PathBuf::from(&frame.path), String::new()))
                             .collect();
-                    } else {
+                    } else if !ocr_block.trim().is_empty() {
                         meeting_context.push_str(&format!(
                             "=== VISUAL CONTEXT (OCR of requested frames) ===\n{ocr_block}\n"
                         ));
@@ -1216,26 +1393,31 @@ fn apply_mass_correction_command(
     if find_text == replace_text {
         return Err("find and replace text are identical".into());
     }
-    let database = open_database(&state.database_path).map_err(command_error)?;
-    let changed = database
+    let mut database = open_database(&state.database_path).map_err(command_error)?;
+    // Atomic FTS rebuild plus exact-case find/replace: LIKE is
+    // case-insensitive while REPLACE is case-sensitive, so `instr` (case-
+    // sensitive, exact) is used to match REPLACE's semantics.
+    let transaction = database.transaction().map_err(command_error)?;
+    let changed = transaction
         .execute(
-            "UPDATE transcript_segments SET text=REPLACE(text,?1,?2) WHERE meeting_id=?3 AND text LIKE '%' || ?1 || '%'",
+            "UPDATE transcript_segments SET text=REPLACE(text,?1,?2) WHERE meeting_id=?3 AND instr(text,?1)>0",
             rusqlite::params![find_text, replace_text, meeting_id],
         )
         .map_err(command_error)? as u32;
     // Rebuild this meeting's FTS rows so search stays consistent.
-    database
+    transaction
         .execute(
             "DELETE FROM transcript_fts WHERE meeting_id=?1",
             rusqlite::params![meeting_id],
         )
         .map_err(command_error)?;
-    database
+    transaction
         .execute(
             "INSERT INTO transcript_fts(meeting_id,segment_id,text) SELECT meeting_id,id,text FROM transcript_segments WHERE meeting_id=?1 AND TRIM(text) != '[silence]'",
             rusqlite::params![meeting_id],
         )
         .map_err(command_error)?;
+    transaction.commit().map_err(command_error)?;
     Ok(changed)
 }
 
@@ -1330,14 +1512,19 @@ async fn chat_command(
             &provider.kind,
             &provider.model,
         );
-        frames_used = frames.len();
-        if vision_capable {
+        // Only claim frames/mode when the request actually carries visual
+        // content: vision mode counts the images attached; the OCR fallback
+        // only counts when OCR produced a non-empty block (a missing
+        // tesseract binary must not show a "frames used" chip).
+        if vision_capable && !frames.is_empty() {
+            frames_used = frames.len();
             mode = "vision".into();
             vision_images = frames
                 .iter()
                 .map(|frame| (std::path::PathBuf::from(&frame.path), String::new()))
                 .collect();
-        } else {
+        } else if !block.trim().is_empty() {
+            frames_used = frames.len();
             mode = "ocr".into();
             ocr_block = block;
         }
@@ -1562,7 +1749,7 @@ fn import_vtt_command(
     }
     bea_core::clear_transcript(&database, &meeting_id).map_err(command_error)?;
     let mut segments = Vec::new();
-    for (ordinal, cue) in cues.iter().enumerate() {
+    for cue in cues.iter() {
         let segment = TranscriptSegment {
             id: Uuid::new_v4().to_string(),
             meeting_id: meeting_id.clone(),
@@ -1947,7 +2134,7 @@ async fn discover_provider_models_command(
     {
         return Err("provider URL and API key are required".into());
     }
-    let mut request_builder = reqwest::Client::new().get(format!(
+    let mut request_builder = http_client().get(format!(
         "{}/models",
         provider.base_url.trim_end_matches('/')
     ));
@@ -2149,7 +2336,7 @@ async fn download_model_command(
     let models = root.join("models");
     std::fs::create_dir_all(&models).map_err(command_error)?;
     let temporary = models.join(format!("{}.download", manifest.id));
-    let response = reqwest::Client::new()
+    let response = http_client()
         .get(url)
         .send()
         .await
@@ -2285,7 +2472,7 @@ async fn stream_dependency_download(
     destination: &std::path::Path,
     label: &str,
 ) -> Result<u64, String> {
-    let response = reqwest::Client::new()
+    let response = http_client()
         .get(url)
         .send()
         .await
@@ -2639,6 +2826,8 @@ fn list_audio_input_devices_command() -> Result<Vec<bea_core::AudioInputDevice>,
 
 #[tauri::command]
 fn start_recording_command(state: State<'_, AppState>, meeting_id: String) -> Result<(), String> {
+    // Meeting ids reach filesystem paths here (recordings/<id>); sanitize.
+    let meeting_id = sanitize_meeting_id(&meeting_id)?;
     let database = open_database(&state.database_path).map_err(command_error)?;
     let root = state
         .database_path
@@ -2646,6 +2835,17 @@ fn start_recording_command(state: State<'_, AppState>, meeting_id: String) -> Re
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("recordings")
         .join(&meeting_id);
+    // Duplicate-recording check must come FIRST: spawning a recorder thread
+    // and flipping the DB status before discovering the duplicate orphans the
+    // existing recorder.
+    if state
+        .recorders
+        .lock()
+        .map_err(|_| "recorder state lock poisoned".to_string())?
+        .contains_key(&meeting_id)
+    {
+        return Err("a recording is already active for this meeting".into());
+    }
     bea_core::start_recording(&database, &meeting_id, &root).map_err(command_error)?;
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let commands = spawn_recorder(root, ready_tx);
@@ -2664,8 +2864,8 @@ fn start_recording_command(state: State<'_, AppState>, meeting_id: String) -> Re
         .lock()
         .map_err(|_| "recorder state lock poisoned".to_string())?;
     if recorders.contains_key(&meeting_id) {
-        // A recorder already runs for this meeting; re-inserting would orphan
-        // it while the DB claims a fresh recording is active.
+        // Race guard: two concurrent starts both passed the early check;
+        // re-inserting would orphan the first recorder, so the loser fails.
         return Err("a recording is already active for this meeting".into());
     }
     recorders.insert(meeting_id, commands);
@@ -2799,13 +2999,31 @@ async fn transcribe_recording_command(
             // 44.1/48 kHz and diarization models expect 16 kHz), then attribute
             // each transcript segment to the speaker active at its midpoint.
             // Failures here degrade gracefully to unlabeled speakers.
+            // Diarization memory guard: cap the concatenated audio at the
+            // first 60 minutes (16 kHz mono f32 ≈ 230 GB-equivalent would
+            // otherwise be unbounded for hour-long meetings).
+            const DIARIZATION_MAX_SECONDS: f32 = 60.0 * 60.0;
+            const DIARIZATION_MAX_SAMPLES: usize =
+                (DIARIZATION_MAX_SECONDS * 16_000.0) as usize;
             let mut meeting_samples: Vec<f32> = Vec::new();
-            for input in &inputs {
+            let mut truncated = false;
+            'collect: for input in &inputs {
                 if let Some((samples, _)) =
                     bea_core::read_wav_samples_resampled(&input.path, 16_000)
                 {
+                    let remaining = DIARIZATION_MAX_SAMPLES - meeting_samples.len();
+                    if samples.len() > remaining {
+                        meeting_samples.extend_from_slice(&samples[..remaining]);
+                        truncated = true;
+                        break 'collect;
+                    }
                     meeting_samples.extend(samples);
                 }
+            }
+            if truncated {
+                eprintln!(
+                    "diarization input truncated to the first {DIARIZATION_MAX_SECONDS:.0} minutes of audio"
+                );
             }
             let turns = if meeting_samples.is_empty() {
                 Vec::new()
@@ -2985,7 +3203,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::locate_tesseract;
+    use super::{locate_tesseract, parse_oauth_callback, sanitize_meeting_id, verify_media_source};
 
     #[test]
     fn tesseract_locator_checks_installed_windows_location() {
@@ -2998,5 +3216,81 @@ mod tests {
                 assert_eq!(path, installed);
             }
         }
+    }
+
+    #[test]
+    fn sanitize_meeting_id_accepts_uuid_style_ids() {
+        assert_eq!(
+            sanitize_meeting_id("abc-123_XY.9").unwrap(),
+            "abc-123_XY.9"
+        );
+        assert!(sanitize_meeting_id("6f1c2e3a-1b2c-3d4e-5f6a-7b8c9d0e1f2a").is_ok());
+    }
+
+    #[test]
+    fn sanitize_meeting_id_rejects_traversal_and_separators() {
+        assert!(sanitize_meeting_id("").is_err());
+        assert!(sanitize_meeting_id("..").is_err());
+        assert!(sanitize_meeting_id(".").is_err());
+        assert!(sanitize_meeting_id("../../etc").is_err());
+        assert!(sanitize_meeting_id("..\\..\\x").is_err());
+        assert!(sanitize_meeting_id("a/b").is_err());
+        assert!(sanitize_meeting_id("a\\b").is_err());
+        assert!(sanitize_meeting_id("a b").is_err());
+        assert!(sanitize_meeting_id("a:b").is_err());
+    }
+
+    #[test]
+    fn parse_oauth_callback_extracts_code_and_validates_state() {
+        let line = "GET /auth/callback?code=abc123&state=st-1 HTTP/1.1";
+        assert_eq!(parse_oauth_callback(line, "st-1").unwrap(), "abc123");
+        // Wrong or missing state must be rejected (CSRF guard).
+        assert!(parse_oauth_callback(line, "st-2").is_err());
+        assert!(
+            parse_oauth_callback("GET /auth/callback?code=abc123 HTTP/1.1", "st-1").is_err()
+        );
+        // Missing code with valid state errors on the code, not the state.
+        let err = parse_oauth_callback(
+            "GET /auth/callback?state=st-1 HTTP/1.1",
+            "st-1",
+        )
+        .unwrap_err();
+        assert!(err.contains("authorization code"));
+        // No query string at all.
+        assert!(parse_oauth_callback("GET /auth/callback HTTP/1.1", "st-1").is_err());
+        // code-like substrings in other params must not be picked up.
+        let tricky =
+            "GET /auth/callback?notcode=x&code=real&state=st-1 HTTP/1.1";
+        assert_eq!(parse_oauth_callback(tricky, "st-1").unwrap(), "real");
+    }
+
+    #[test]
+    fn verify_media_source_accepts_registered_path_and_rejects_strangers() {
+        let database = rusqlite::Connection::open_in_memory().unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE media_sources (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, path TEXT NOT NULL, kind TEXT NOT NULL, duration_seconds INTEGER, copied INTEGER NOT NULL DEFAULT 0);",
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("meeting.mkv");
+        std::fs::write(&media, b"x").unwrap();
+        database
+            .execute(
+                "INSERT INTO media_sources(id,meeting_id,path,kind) VALUES ('m1','meet',?1,'video')",
+                rusqlite::params![media.to_string_lossy()],
+            )
+            .unwrap();
+        // Exact registered path passes.
+        assert!(verify_media_source(&database, "meet", &media).is_ok());
+        // Separator style differences still match (Windows back/forward slash).
+        let forward = std::path::PathBuf::from(media.to_string_lossy().replace('\\', "/"));
+        assert!(verify_media_source(&database, "meet", &forward).is_ok());
+        // Unregistered path is refused.
+        let stranger = dir.path().join("stranger.mkv");
+        std::fs::write(&stranger, b"x").unwrap();
+        assert!(verify_media_source(&database, "meet", &stranger).is_err());
+        // Right path, wrong meeting is refused.
+        assert!(verify_media_source(&database, "other", &media).is_err());
     }
 }

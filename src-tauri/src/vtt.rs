@@ -86,10 +86,7 @@ pub fn parse_vtt(input: &str) -> Result<Vec<VttCue>, BeaError> {
         }
         if let Some((_, _, _, text_lines)) = current.as_mut() {
             // A bare cue-identifier line (no "-->", no prior text) is skipped.
-            if text_lines.is_empty()
-                && cues.iter().all(|_| true)
-                && line.chars().all(|c| c.is_ascii_digit())
-            {
+            if text_lines.is_empty() && line.chars().all(|c| c.is_ascii_digit()) {
                 continue;
             }
             if text_lines.is_empty() {
