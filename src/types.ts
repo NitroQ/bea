@@ -19,6 +19,7 @@ export type ProviderVerification = { verified: boolean; checkedAt?: string; mess
 export type SetupStatus = { tools: SetupTool[]; engines: AsrEngineDescriptor[]; selectedEngine: AsrEngineId; provider: ProviderVerification; complete: boolean };
 
 export const statusLabel: Record<MeetingStatus, string> = { draft: 'Draft', recording: 'Recording', paused: 'Paused', processing: 'Processing', ready: 'Ready', failed: 'Needs attention' };
+export type ContextEventRow = { id: string; meeting_id: string; kind: string; payload: string; created_at: string };
 export type SpeakerName = { speaker_index: number; name: string };
 export const speakerLabel = (index: number | null, names: SpeakerName[], extra: number[] = []) => {
   const primary = index === null ? 'Speaker —' : names.find((n) => n.speaker_index === index)?.name ?? `Speaker ${index + 1}`;
