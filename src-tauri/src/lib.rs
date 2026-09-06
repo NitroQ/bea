@@ -3471,6 +3471,14 @@ pub async fn call_provider(
         .json::<serde_json::Value>()
         .await
         .map_err(|error| BeaError::ProviderRequest(error.to_string()))?;
+    // The OAuth (Codex) backend speaks the Responses API: unwrap the message
+    // output_text first, then parse minutes from it like any other text.
+    if provider.kind == ProviderKind::OpenAiOAuth {
+        let text = codex_oauth::responses_output_text(&payload).ok_or_else(|| {
+            BeaError::InvalidModelOutput("responses payload had no message output_text".into())
+        })?;
+        return parse_provider_minutes_text(&text);
+    }
     parse_provider_minutes(&payload)
 }
 
@@ -3503,6 +3511,9 @@ pub async fn call_provider_text(
         .json::<serde_json::Value>()
         .await
         .map_err(|error| BeaError::ProviderRequest(error.to_string()))?;
+    if provider.kind == ProviderKind::OpenAiOAuth {
+        return Ok(codex_oauth::responses_output_text(&payload).unwrap_or_default());
+    }
     Ok(payload
         .pointer("/choices/0/message/content")
         .and_then(|value| value.as_str())
@@ -4415,6 +4426,35 @@ mod tests {
         assert!(pack.estimated_input_tokens > 0);
         assert_eq!(pack.evidence_count, 1);
         assert_eq!(estimate_tokens("1234"), 1);
+    }
+    #[test]
+    fn openai_oauth_uses_the_responses_endpoint_and_codex_payload() {
+        let provider = ProviderConfig {
+            id: "openai-oauth".into(),
+            kind: ProviderKind::OpenAiOAuth,
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            model: "gpt-5.1-codex".into(),
+            credential_ref: None,
+            enabled: true,
+        };
+        let prepared = build_provider_request(
+            &provider,
+            &LlmRequest {
+                model: "gpt-5.1-codex".into(),
+                system: "sys".into(),
+                user: "usr".into(),
+                json_schema: String::new(),
+                max_output_tokens: 100,
+            },
+        );
+        assert_eq!(
+            prepared.url,
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(prepared.body["instructions"], "sys");
+        // The chat/completions-only body keys must be absent.
+        assert!(prepared.body.get("messages").is_none());
+        assert!(prepared.body.get("response_format").is_none());
     }
     #[test]
     fn provider_kinds_round_trip_through_the_database() {
