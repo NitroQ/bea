@@ -4417,6 +4417,29 @@ mod tests {
         assert_eq!(estimate_tokens("1234"), 1);
     }
     #[test]
+    fn provider_kinds_round_trip_through_the_database() {
+        let dir = tempdir().unwrap();
+        let c = open_database(dir.path().join("bea.db")).unwrap();
+        for kind in [
+            ProviderKind::OpenRouter,
+            ProviderKind::OpenAiCompatible,
+            ProviderKind::ClaudeCompatible,
+            ProviderKind::Local,
+            ProviderKind::OpenAiOAuth,
+        ] {
+            let provider = ProviderConfig {
+                id: format!("p-{}", kind.as_str()),
+                kind: kind.clone(),
+                base_url: "http://x".into(),
+                model: "m".into(),
+                credential_ref: None,
+                enabled: true,
+            };
+            save_provider(&c, &provider).unwrap();
+            assert_eq!(load_provider(&c, &provider.id).unwrap(), Some(provider));
+        }
+    }
+    #[test]
     fn local_providers_do_not_require_api_keys_but_cloud_ones_do() {
         assert!(!ProviderKind::Local.requires_api_key());
         assert!(ProviderKind::OpenRouter.requires_api_key());
