@@ -77,9 +77,7 @@ fn list_context_events_payload(
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(command_error)?;
-    let collected = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(command_error)?;
+    let collected = rows.collect::<Result<Vec<_>, _>>().map_err(command_error)?;
     if collected.is_empty() {
         return Ok("(none)".into());
     }
@@ -498,16 +496,19 @@ async fn test_provider_connection_command(
     if provider.base_url.trim().is_empty() || provider.model.trim().is_empty() {
         return Err("provider URL and model are required".into());
     }
-    if api_key.trim().is_empty() {
+    if api_key.trim().is_empty() && provider.kind.requires_api_key() {
         return Err("an API key is required for the connection test".into());
     }
     let endpoint = format!(
         "{}/chat/completions",
         provider.base_url.trim_end_matches('/')
     );
-    let response = reqwest::Client::new()
-        .post(endpoint)
-        .bearer_auth(api_key)
+    let mut request_builder = reqwest::Client::new().post(endpoint);
+    // Local servers (LM Studio / Ollama / llama.cpp) listen without auth.
+    if !api_key.trim().is_empty() {
+        request_builder = request_builder.bearer_auth(api_key);
+    }
+    let response = request_builder
         .json(&serde_json::json!({
             "model": provider.model,
             "messages": [{"role": "user", "content": "Reply with the single word: ready"}],
@@ -612,11 +613,17 @@ async fn generate_minutes_command(
     if let Some(provider) = load_provider(&database, "primary").map_err(command_error)? {
         if provider.enabled {
             if let Some(api_key) = keyring_secret(&provider) {
-let speaker_names = bea_core::list_speaker_names(&database, &meeting_id).unwrap_or_default();
-            let custom_format = bea_core::get_app_setting(&database, &format!("custom_minutes_format:{meeting_id}")).map_err(command_error)?;
-            let user_notes = list_context_events_payload(&database, &meeting_id)?;
-            let mut meeting_context = bea_core::build_meeting_context(&speaker_names, custom_format.as_deref());
-            meeting_context.push_str(&format!("\n=== USER CLARIFICATIONS & CONTEXT (treat as authoritative) ===\n{user_notes}\n"));
+                let speaker_names =
+                    bea_core::list_speaker_names(&database, &meeting_id).unwrap_or_default();
+                let custom_format = bea_core::get_app_setting(
+                    &database,
+                    &format!("custom_minutes_format:{meeting_id}"),
+                )
+                .map_err(command_error)?;
+                let user_notes = list_context_events_payload(&database, &meeting_id)?;
+                let mut meeting_context =
+                    bea_core::build_meeting_context(&speaker_names, custom_format.as_deref());
+                meeting_context.push_str(&format!("\n=== USER CLARIFICATIONS & CONTEXT (treat as authoritative) ===\n{user_notes}\n"));
                 let pack = bea_core::pack_context_mode(&events, 12_000, ContextMode::Balanced);
                 let request = LlmRequest {
                     model: provider.model.clone(),
@@ -699,7 +706,13 @@ fn add_context_event_command_inner(
             rusqlite::params![id, meeting_id, kind, payload, created_at],
         )
         .map_err(command_error)?;
-    Ok(ContextEventRow { id, meeting_id: meeting_id.into(), kind: kind.into(), payload: payload.into(), created_at })
+    Ok(ContextEventRow {
+        id,
+        meeting_id: meeting_id.into(),
+        kind: kind.into(),
+        payload: payload.into(),
+        created_at,
+    })
 }
 
 #[tauri::command]
@@ -746,7 +759,10 @@ fn delete_context_event_command(
 ) -> Result<(), String> {
     let database = open_database(&state.database_path).map_err(command_error)?;
     database
-        .execute("DELETE FROM context_events WHERE id=?1", rusqlite::params![event_id])
+        .execute(
+            "DELETE FROM context_events WHERE id=?1",
+            rusqlite::params![event_id],
+        )
         .map_err(command_error)?;
     Ok(())
 }
@@ -800,9 +816,11 @@ async fn chat_command(
     let provider = load_provider(&database, "primary")
         .map_err(command_error)?
         .filter(|provider| provider.enabled);
-    let provider = provider.ok_or_else(|| "a verified provider is required for chat".to_string())?;
-    let api_key = keyring_secret(&provider)
-        .ok_or_else(|| "provider API key is missing — re-verify the connection in Settings".to_string())?;
+    let provider =
+        provider.ok_or_else(|| "a verified provider is required for chat".to_string())?;
+    let api_key = keyring_secret(&provider).ok_or_else(|| {
+        "provider API key is missing — re-verify the connection in Settings".to_string()
+    })?;
     let transcript = list_transcript(&database, &meeting_id).map_err(command_error)?;
     if transcript.is_empty() {
         return Err("there is no transcript to ask about yet".into());
@@ -840,7 +858,13 @@ async fn chat_command(
             } else {
                 format!("{who} + {}", extra.join(" + "))
             };
-            format!("[{:02}:{:02}] {}: {}", segment.start_seconds / 60, segment.start_seconds % 60, who, segment.text.trim())
+            format!(
+                "[{:02}:{:02}] {}: {}",
+                segment.start_seconds / 60,
+                segment.start_seconds % 60,
+                who,
+                segment.text.trim()
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -884,8 +908,10 @@ async fn suggest_clarifications_command(
     let provider = load_provider(&database, "primary")
         .map_err(command_error)?
         .filter(|provider| provider.enabled);
-    let provider = provider.ok_or_else(|| "a verified provider is required for clarifications".to_string())?;
-    let api_key = keyring_secret(&provider).ok_or_else(|| "provider API key is missing".to_string())?;
+    let provider =
+        provider.ok_or_else(|| "a verified provider is required for clarifications".to_string())?;
+    let api_key =
+        keyring_secret(&provider).ok_or_else(|| "provider API key is missing".to_string())?;
     let transcript = list_transcript(&database, &meeting_id).map_err(command_error)?;
     if transcript.is_empty() {
         return Err("a transcript is required before clarifications can be suggested".into());
@@ -899,9 +925,18 @@ async fn suggest_clarifications_command(
         .iter()
         .filter(|segment| segment.text.trim() != "[silence]")
         .map(|segment| {
-            let who = segment.speaker.and_then(|index| speaker_names.get(&index))
-                .map(|name| name.as_str()).unwrap_or("Speaker ?");
-            format!("[{:02}:{:02}] {}: {}", segment.start_seconds / 60, segment.start_seconds % 60, who, segment.text.trim())
+            let who = segment
+                .speaker
+                .and_then(|index| speaker_names.get(&index))
+                .map(|name| name.as_str())
+                .unwrap_or("Speaker ?");
+            format!(
+                "[{:02}:{:02}] {}: {}",
+                segment.start_seconds / 60,
+                segment.start_seconds % 60,
+                who,
+                segment.text.trim()
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -925,13 +960,21 @@ async fn suggest_clarifications_command(
     let mut suggestions = Vec::new();
     if let Some(questions) = parsed.get("questions").and_then(|value| value.as_array()) {
         for question in questions {
-            let Some(text) = question.get("question").and_then(|value| value.as_str()) else { continue };
+            let Some(text) = question.get("question").and_then(|value| value.as_str()) else {
+                continue;
+            };
             suggestions.push(ClarificationSuggestion {
                 question: text.to_string(),
                 options: question
                     .get("options")
                     .and_then(|value| value.as_array())
-                    .map(|values| values.iter().filter_map(|value| value.as_str().map(str::to_string)).take(4).collect())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str().map(str::to_string))
+                            .take(4)
+                            .collect()
+                    })
                     .unwrap_or_default(),
             });
         }
@@ -960,12 +1003,11 @@ fn load_custom_minutes_format_command(
     meeting_id: String,
 ) -> Result<String, String> {
     let database = open_database(&state.database_path).map_err(command_error)?;
-    Ok(bea_core::get_app_setting(
-        &database,
-        &format!("custom_minutes_format:{meeting_id}"),
+    Ok(
+        bea_core::get_app_setting(&database, &format!("custom_minutes_format:{meeting_id}"))
+            .map_err(command_error)?
+            .unwrap_or_default(),
     )
-    .map_err(command_error)?
-    .unwrap_or_default())
 }
 
 #[tauri::command]
@@ -975,7 +1017,8 @@ fn assign_segment_speaker_command(
     speaker_index: u32,
 ) -> Result<(), String> {
     let database = open_database(&state.database_path).map_err(command_error)?;
-    bea_core::update_segment_speaker(&database, &segment_id, Some(speaker_index)).map_err(command_error)
+    bea_core::update_segment_speaker(&database, &segment_id, Some(speaker_index))
+        .map_err(command_error)
 }
 
 #[tauri::command]
@@ -1012,7 +1055,8 @@ fn import_vtt_command(
         return Err("the VTT file contains no transcript cues".into());
     }
     // Map distinct speaker names to stable indices 0..n, in first-appearance order.
-    let mut speaker_index: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut speaker_index: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
     let mut ordered_names: Vec<String> = Vec::new();
     for cue in &cues {
         if let Some(name) = &cue.speaker {
@@ -1049,7 +1093,10 @@ fn import_vtt_command(
         &database,
         &meeting_id,
         bea_core::MeetingStatus::Ready,
-        segments.last().map(|segment| segment.end_seconds).unwrap_or(0),
+        segments
+            .last()
+            .map(|segment| segment.end_seconds)
+            .unwrap_or(0),
     )
     .map_err(command_error)?;
     Ok(segments)
@@ -1394,15 +1441,20 @@ async fn discover_provider_models_command(
     provider: ProviderConfig,
     api_key: String,
 ) -> Result<Vec<String>, String> {
-    if provider.base_url.trim().is_empty() || api_key.trim().is_empty() {
+    if provider.base_url.trim().is_empty()
+        || (api_key.trim().is_empty() && provider.kind.requires_api_key())
+    {
         return Err("provider URL and API key are required".into());
     }
-    let response = reqwest::Client::new()
-        .get(format!(
-            "{}/models",
-            provider.base_url.trim_end_matches('/')
-        ))
-        .bearer_auth(api_key)
+    let mut request_builder = reqwest::Client::new().get(format!(
+        "{}/models",
+        provider.base_url.trim_end_matches('/')
+    ));
+    // Local servers publish /v1/models without auth.
+    if !api_key.trim().is_empty() {
+        request_builder = request_builder.bearer_auth(api_key);
+    }
+    let response = request_builder
         .send()
         .await
         .map_err(command_error)?
@@ -2264,7 +2316,9 @@ async fn transcribe_recording_command(
 }
 
 #[tauri::command]
-fn check_for_updates_command(app: tauri::AppHandle) -> Result<Option<bea_core::updater::UpdateInfo>, String> {
+fn check_for_updates_command(
+    app: tauri::AppHandle,
+) -> Result<Option<bea_core::updater::UpdateInfo>, String> {
     bea_core::updater::check_now(&app)
 }
 
