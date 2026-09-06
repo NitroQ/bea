@@ -161,6 +161,10 @@ pub struct Minutes {
     pub summary: String,
     #[serde(default)]
     pub agenda: Vec<AgendaItem>,
+    /// Observations the model derived from requested video frames (vision
+    /// images or OCR text). Empty unless visual context was provided.
+    #[serde(default)]
+    pub visual_observations: Vec<String>,
     pub decisions: Vec<LedgerEvent>,
     pub action_items: Vec<LedgerEvent>,
     pub unresolved: Vec<LedgerEvent>,
@@ -3835,6 +3839,7 @@ pub fn generate_minutes(title: &str, events: &[LedgerEvent]) -> Minutes {
         title: title.to_string(),
         summary,
         agenda: Vec::new(),
+        visual_observations: Vec::new(),
         decisions,
         action_items,
         unresolved,
@@ -4196,6 +4201,7 @@ mod tests {
                 start_seconds: Some(120),
                 end_seconds: Some(600),
             }],
+            visual_observations: vec![],
             decisions: vec![],
             action_items: vec![],
             unresolved: vec![],

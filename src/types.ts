@@ -5,7 +5,7 @@ export type Meeting = { id: string; title: string; status: MeetingStatus; durati
 export type Evidence = { start_seconds: number; end_seconds: number; quote: string };
 export type LedgerEvent = { kind: string; summary: string; owner?: string | null; due?: string | null; confidence: number; evidence: Evidence[] };
 export type AgendaItem = { heading: string; start_seconds?: number | null; end_seconds?: number | null };
-export type Minutes = { title: string; summary: string; agenda: AgendaItem[]; decisions: LedgerEvent[]; action_items: LedgerEvent[]; unresolved: LedgerEvent[] };
+export type Minutes = { title: string; summary: string; agenda: AgendaItem[]; visual_observations?: string[]; decisions: LedgerEvent[]; action_items: LedgerEvent[]; unresolved: LedgerEvent[] };
 export type TranscriptSegment = { id: string; meeting_id: string; start_seconds: number; end_seconds: number; text: string; language_detected?: string | null; language_confidence?: number | null; speaker?: number | null };
 export const SILENCE_TEXT = '[silence]';
 export const isSilenceSegment = (segment: TranscriptSegment) => segment.text.trim() === SILENCE_TEXT;

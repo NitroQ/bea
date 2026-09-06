@@ -51,7 +51,8 @@ Rules:
 - Every item's summary must be ONE concise, capitalized, grammatical headline sentence in English (example: "Admission limits remain at the discretion of the Dean"). NEVER copy raw transcript speech as a summary.
 - Every item's evidence: list the EXACT original quotes with the start_seconds/end_seconds taken from the matching input event. Do not paraphrase quotes or invent timestamps.
 - Exclude procedural noise (motions to approve past minutes, roll call, greetings, filler) from action items and decisions.
-- If a Participants legend or custom format is provided in the system prompt, use real participant names instead of "Speaker N" and follow the custom format's structure while still returning the same JSON schema."#;
+- If a Participants legend or custom format is provided in the system prompt, use real participant names instead of "Speaker N" and follow the custom format's structure while still returning the same JSON schema.
+- visual_observations: when visual context (frame images or OCR text of video frames) is provided, add one short observation string per notable thing seen on the frames (e.g. "Slide at 320s shows the Q3 budget table"). Omit the array or return [] when no visual context is provided."#;
 
 fn language_from_code(code: &str) -> TranscriptLanguage {
     match code {
@@ -908,6 +909,7 @@ fn preview_provider_context_command(
 async fn generate_minutes_command(
     state: State<'_, AppState>,
     meeting_id: String,
+    include_frames: Option<Vec<u64>>,
 ) -> Result<Minutes, String> {
     let database = open_database(&state.database_path).map_err(command_error)?;
     let meeting = list_meetings(&database)
@@ -944,15 +946,62 @@ async fn generate_minutes_command(
                 let mut meeting_context =
                     bea_core::build_meeting_context(&speaker_names, custom_format.as_deref());
                 meeting_context.push_str(&format!("\n=== USER CLARIFICATIONS & CONTEXT (treat as authoritative) ===\n{user_notes}\n"));
+                // Visual context: vision-capable models get the frame images
+                // inline; text-only models get the OCR text of the same frames
+                // appended to the prompt.
+                let mut vision_images: Vec<(std::path::PathBuf, String)> = Vec::new();
+                if let Some(timestamps) = include_frames.as_ref().filter(|list| !list.is_empty()) {
+                    let root = state
+                        .database_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_path_buf();
+                    let (frames, ocr_block) = gather_visual_context(
+                        &root,
+                        &database,
+                        &meeting_id,
+                        timestamps,
+                    )?;
+                    if meeting_vision_capable(
+                        &database,
+                        &meeting_id,
+                        &provider.kind,
+                        &provider.model,
+                    ) {
+                        vision_images = frames
+                            .iter()
+                            .map(|frame| (std::path::PathBuf::from(&frame.path), String::new()))
+                            .collect();
+                    } else {
+                        meeting_context.push_str(&format!(
+                            "=== VISUAL CONTEXT (OCR of requested frames) ===\n{ocr_block}\n"
+                        ));
+                    }
+                }
                 let pack = bea_core::pack_context_mode(&events, 12_000, ContextMode::Balanced);
                 let request = LlmRequest {
                     model: provider.model.clone(),
                     system: format!("{}\n{}", MEETING_SECRETARY_SYSTEM_PROMPT, meeting_context),
                     user: serde_json::to_string(&pack.events).map_err(command_error)?,
-                    json_schema: r#"{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"agenda":{"type":"array","items":{"type":"object","properties":{"heading":{"type":"string"},"start_seconds":{"type":"number"},"end_seconds":{"type":"number"}},"required":["heading"]}},"decisions":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"action_items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"unresolved":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}}},"required":["title","summary","decisions","action_items","unresolved"]}"#.into(),
+                    json_schema: r#"{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"agenda":{"type":"array","items":{"type":"object","properties":{"heading":{"type":"string"},"start_seconds":{"type":"number"},"end_seconds":{"type":"number"}},"required":["heading"]}},"visual_observations":{"type":"array","items":{"type":"string"}},"decisions":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"action_items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"unresolved":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}}},"required":["title","summary","decisions","action_items","unresolved"]}"#.into(),
                     max_output_tokens: 4_000,
                 };
-                if let Ok(remote_minutes) = call_provider(&provider, &request, Some(&api_key)).await
+                if let Ok(remote_minutes) = if vision_images.is_empty() {
+                    call_provider(&provider, &request, Some(&api_key)).await
+                } else {
+                    // Vision path: send the frame images inline and parse the
+                    // minutes JSON out of the free-text reply.
+                    bea_core::call_provider_messages(
+                        &provider,
+                        &request.system,
+                        &request.user,
+                        &vision_images,
+                        request.max_output_tokens,
+                        Some(&api_key),
+                    )
+                    .await
+                    .and_then(|text| bea_core::parse_minutes_json(&text))
+                }
                 {
                     let output_tokens = estimate_tokens(
                         &serde_json::to_string(&remote_minutes).unwrap_or_default(),
