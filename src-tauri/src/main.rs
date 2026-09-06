@@ -1,0 +1,1909 @@
+// Hides the console window Windows would otherwise allocate for the app on
+// launch. Must stay above any `use` statements; only affects release builds
+// so `cargo run` keeps showing logs in development.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use bea_core::{
+    call_provider, create_job, create_meeting_with_engine, delete_meeting, estimate_tokens,
+    export_minutes, extract_ledger_events, generate_minutes, get_app_setting, import_media,
+    inspect_asr_model_package, inspect_runtime, install_qwen_model_package,
+    install_sherpa_model_package, list_audio_input_devices, list_completed_recording_chunks,
+    list_meetings, list_transcript, load_asr_engine, load_minutes, load_provider, open_database,
+    persist_completed_audio_chunk, record_usage, register_model, save_ledger_events, save_minutes,
+    save_provider, search_transcript, set_app_setting, transcribe_chunks_with_progress,
+    transcribe_imported_media_with_progress, update_meeting_title, waveform_peaks, AudioChunkInput,
+    CompletedAudioChunk, ContextMode, ExportFormat, FfmpegPipeline, LlmRequest, MediaKind,
+    MediaSource, Meeting, Minutes, ModelInstallProgress, ModelManifest, ProviderConfig,
+    RecorderConfig, RuntimeAvailability, SegmentedWavRecorder, TranscriptLanguage,
+    TranscriptSegment, UsageRecord,
+};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use keyring::Entry;
+use std::collections::HashMap;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
+use tauri::{Emitter, Manager, State};
+use uuid::Uuid;
+
+struct AppState {
+    database_path: PathBuf,
+    recorders: Mutex<HashMap<String, Sender<RecorderCommand>>>,
+    /// Serializes speaker-model downloads: two concurrent transcriptions must
+    /// not race through the download/rename staging paths. Tokio mutex because
+    /// downloads await while holding it.
+    speaker_models_lock: tauri::async_runtime::Mutex<()>,
+}
+
+enum RecorderCommand {
+    Pause(mpsc::SyncSender<Result<(), String>>),
+    Resume(mpsc::SyncSender<Result<(), String>>),
+    Stop(mpsc::SyncSender<Result<Vec<CompletedAudioChunk>, String>>),
+}
+
+fn language_from_code(code: &str) -> TranscriptLanguage {
+    match code {
+        "en" => TranscriptLanguage::English,
+        "fil" => TranscriptLanguage::Filipino,
+        "taglish" => TranscriptLanguage::Taglish,
+        _ => TranscriptLanguage::Auto,
+    }
+}
+
+fn command_error(error: impl std::fmt::Display) -> String {
+    error.to_string()
+}
+
+fn locate_tesseract(root: &std::path::Path) -> PathBuf {
+    let mut candidates = Vec::new();
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            // Development builds place resource directories beside the binary;
+            // installed Tauri bundles may place them under resources/.
+            candidates.push(
+                parent
+                    .join("binaries")
+                    .join("tesseract")
+                    .join("tesseract.exe"),
+            );
+            candidates.push(
+                parent
+                    .join("resources")
+                    .join("binaries")
+                    .join("tesseract")
+                    .join("tesseract.exe"),
+            );
+            candidates.push(
+                parent
+                    .join("resources")
+                    .join("tesseract")
+                    .join("tesseract.exe"),
+            );
+        }
+    }
+    candidates.push(root.join("bin").join("tesseract").join("tesseract.exe"));
+    if let Ok(program_files) = std::env::var("ProgramFiles") {
+        candidates.push(
+            PathBuf::from(program_files)
+                .join("Tesseract-OCR")
+                .join("tesseract.exe"),
+        );
+    }
+    if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
+        candidates.push(
+            PathBuf::from(program_files_x86)
+                .join("Tesseract-OCR")
+                .join("tesseract.exe"),
+        );
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| root.join("bin").join("tesseract").join("tesseract.exe"))
+}
+
+fn copy_directory(source: &std::path::Path, destination: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(destination).map_err(command_error)?;
+    for entry in std::fs::read_dir(source).map_err(command_error)? {
+        let entry = entry.map_err(command_error)?;
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        if from.is_dir() {
+            copy_directory(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to).map_err(command_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn bundled_binary_candidates(name: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            candidates.push(parent.join(name));
+            candidates.push(parent.join("resources").join(name));
+            candidates.push(parent.join("resources").join("binaries").join(name));
+        }
+    }
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    candidates.push(source_root.join("binaries").join(name));
+    if name == "ffmpeg.exe" {
+        candidates.push(
+            source_root
+                .join("binaries")
+                .join("ffmpeg-x86_64-pc-windows-msvc.exe"),
+        );
+    }
+    if name == "ffprobe.exe" {
+        candidates.push(
+            source_root
+                .join("binaries")
+                .join("ffprobe-x86_64-pc-windows-msvc.exe"),
+        );
+    }
+    candidates
+}
+
+/// Locate a usable FFmpeg/FFprobe pair as a unit. Tauri development builds place
+/// sidecars beside `bea.exe`; packaged builds may place them under resources, and
+/// repaired installations use the app-data `bin` directory. A lone ffmpeg file is
+/// not enough because media probing requires ffprobe too.
+fn locate_ffmpeg(root: &std::path::Path) -> PathBuf {
+    let mut directories = Vec::new();
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            directories.push(parent.to_path_buf());
+            directories.push(parent.join("resources"));
+            directories.push(parent.join("resources").join("binaries"));
+        }
+    }
+    directories.push(root.join("bin"));
+    directories.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries"));
+    let ffmpeg_names = ["ffmpeg.exe", "ffmpeg-x86_64-pc-windows-msvc.exe"];
+    let ffprobe_names = ["ffprobe.exe", "ffprobe-x86_64-pc-windows-msvc.exe"];
+    for directory in &directories {
+        for ffmpeg_name in ffmpeg_names {
+            let ffmpeg = directory.join(ffmpeg_name);
+            if !ffmpeg.is_file() {
+                continue;
+            }
+            if ffprobe_names
+                .iter()
+                .any(|name| directory.join(name).is_file())
+            {
+                return ffmpeg;
+            }
+        }
+    }
+    root.join("bin").join("ffmpeg.exe")
+}
+
+fn build_input_stream(
+    device: &cpal::Device,
+    supported: &cpal::SupportedStreamConfig,
+    recorder: Arc<Mutex<SegmentedWavRecorder>>,
+) -> Result<cpal::Stream, String> {
+    let config = supported.config();
+    let error_callback = |_error: cpal::StreamError| {};
+    match supported.sample_format() {
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            &config,
+            move |data: &[f32], _| {
+                if let Ok(mut recorder) = recorder.lock() {
+                    let samples: Vec<i16> = data
+                        .iter()
+                        .map(|sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                        .collect();
+                    let _ = recorder.push_samples(&samples);
+                }
+            },
+            error_callback,
+            None,
+        ),
+        cpal::SampleFormat::I16 => device.build_input_stream(
+            &config,
+            move |data: &[i16], _| {
+                if let Ok(mut recorder) = recorder.lock() {
+                    let _ = recorder.push_samples(data);
+                }
+            },
+            error_callback,
+            None,
+        ),
+        cpal::SampleFormat::U16 => device.build_input_stream(
+            &config,
+            move |data: &[u16], _| {
+                if let Ok(mut recorder) = recorder.lock() {
+                    let samples: Vec<i16> = data
+                        .iter()
+                        .map(|sample| (*sample as i32 - 32768) as i16)
+                        .collect();
+                    let _ = recorder.push_samples(&samples);
+                }
+            },
+            error_callback,
+            None,
+        ),
+        format => return Err(format!("unsupported input sample format: {format:?}")),
+    }
+    .map_err(|error| error.to_string())
+}
+
+fn spawn_recorder(
+    root: PathBuf,
+    ready: mpsc::SyncSender<Result<(), String>>,
+) -> Sender<RecorderCommand> {
+    let (commands, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<(), String> {
+            let device = cpal::default_host()
+                .default_input_device()
+                .ok_or_else(|| "no default microphone is available".to_string())?;
+            let supported = device.default_input_config().map_err(command_error)?;
+            let mut recorder = SegmentedWavRecorder::new(
+                root,
+                RecorderConfig {
+                    sample_rate: supported.sample_rate().0,
+                    channels: supported.channels(),
+                    // Whisper-family engines only process the first 30 s of an
+                    // input; keep recorded chunks under that ceiling.
+                    chunk_seconds: 28,
+                    max_duration_seconds: 5 * 60 * 60,
+                },
+            )
+            .map_err(command_error)?;
+            recorder.start().map_err(command_error)?;
+            let recorder = Arc::new(Mutex::new(recorder));
+            let stream = build_input_stream(&device, &supported, Arc::clone(&recorder))?;
+            stream.play().map_err(command_error)?;
+            ready
+                .send(Ok(()))
+                .map_err(|_| "recording startup acknowledgement failed".to_string())?;
+            for command in receiver {
+                match command {
+                    RecorderCommand::Pause(reply) => {
+                        let result = recorder
+                            .lock()
+                            .map_err(|_| "recorder lock poisoned".to_string())
+                            .and_then(|mut value| value.pause().map_err(command_error));
+                        let _ = reply.send(result);
+                    }
+                    RecorderCommand::Resume(reply) => {
+                        let result = recorder
+                            .lock()
+                            .map_err(|_| "recorder lock poisoned".to_string())
+                            .and_then(|mut value| value.resume().map_err(command_error));
+                        let _ = reply.send(result);
+                    }
+                    RecorderCommand::Stop(reply) => {
+                        let result = recorder
+                            .lock()
+                            .map_err(|_| "recorder lock poisoned".to_string())
+                            .and_then(|mut value| value.stop().map_err(command_error));
+                        let _ = reply.send(result);
+                        break;
+                    }
+                }
+            }
+            drop(stream);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = ready.send(Err(error));
+        }
+    });
+    commands
+}
+
+#[tauri::command]
+fn create_meeting_command(
+    state: State<'_, AppState>,
+    title: String,
+    language: String,
+    asr_engine_id: Option<String>,
+) -> Result<Meeting, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    create_meeting_with_engine(
+        &database,
+        &title,
+        language_from_code(&language),
+        asr_engine_id.as_deref().unwrap_or("whisper-compatibility"),
+    )
+    .map_err(command_error)
+}
+
+#[tauri::command]
+fn list_meetings_command(state: State<'_, AppState>) -> Result<Vec<Meeting>, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    list_meetings(&database).map_err(command_error)
+}
+
+#[tauri::command]
+fn rename_meeting_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    title: String,
+) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    update_meeting_title(&database, &meeting_id, &title).map_err(command_error)
+}
+
+#[tauri::command]
+fn delete_meeting_command(state: State<'_, AppState>, meeting_id: String) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    delete_meeting(&database, &meeting_id).map_err(command_error)
+}
+
+#[tauri::command]
+fn update_transcript_segment_command(
+    state: State<'_, AppState>,
+    segment_id: String,
+    text: String,
+) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let changed = database
+        .execute(
+            "UPDATE transcript_segments SET text=?1 WHERE id=?2",
+            rusqlite::params![text.trim(), segment_id],
+        )
+        .map_err(command_error)?;
+    if changed == 0 {
+        return Err("transcript segment not found".into());
+    }
+    database
+        .execute(
+            "DELETE FROM transcript_fts WHERE segment_id=?1",
+            rusqlite::params![segment_id],
+        )
+        .map_err(command_error)?;
+    database
+        .execute(
+            "INSERT INTO transcript_fts(meeting_id,segment_id,text) SELECT meeting_id,id,text FROM transcript_segments WHERE id=?1",
+            rusqlite::params![segment_id],
+        )
+        .map_err(command_error)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_media_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<MediaSource>, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let mut statement = database
+        .prepare("SELECT id,meeting_id,path,kind,duration_seconds,copied FROM media_sources WHERE meeting_id=?1 ORDER BY rowid")
+        .map_err(command_error)?;
+    let rows = statement
+        .query_map(rusqlite::params![meeting_id], |row| {
+            let kind = match row.get::<_, String>(3)?.as_str() {
+                "audio" => MediaKind::Audio,
+                _ => MediaKind::Video,
+            };
+            Ok(MediaSource {
+                id: row.get(0)?,
+                meeting_id: row.get(1)?,
+                path: PathBuf::from(row.get::<_, String>(2)?),
+                kind,
+                duration_seconds: row.get(4)?,
+                copied: row.get::<_, i64>(5)? != 0,
+            })
+        })
+        .map_err(command_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(command_error)
+}
+
+#[tauri::command]
+fn waveform_peaks_command(path: String, peak_count: Option<usize>) -> Result<Vec<f32>, String> {
+    waveform_peaks(path, peak_count.unwrap_or(256)).map_err(command_error)
+}
+
+#[tauri::command]
+fn repair_runtime_command(
+    state: State<'_, AppState>,
+    tools: Vec<String>,
+) -> Result<RuntimeAvailability, String> {
+    let root = state
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let model_path = root.join("models");
+    let bin_root = root.join("bin");
+    std::fs::create_dir_all(&bin_root).map_err(command_error)?;
+    if tools.iter().any(|tool| tool == "ffmpeg") {
+        if let Some(source) = bundled_binary_candidates("ffmpeg.exe")
+            .into_iter()
+            .find(|path| path.is_file())
+        {
+            std::fs::copy(source, bin_root.join("ffmpeg.exe")).map_err(command_error)?;
+        }
+        if let Some(source) = bundled_binary_candidates("ffprobe.exe")
+            .into_iter()
+            .find(|path| path.is_file())
+        {
+            std::fs::copy(source, bin_root.join("ffprobe.exe")).map_err(command_error)?;
+        }
+    }
+    if tools.iter().any(|tool| tool == "tesseract") {
+        let sources = [
+            std::env::current_exe().ok().and_then(|path| {
+                path.parent()
+                    .map(|parent| parent.join("binaries").join("tesseract"))
+            }),
+            std::env::current_exe().ok().and_then(|path| {
+                path.parent()
+                    .map(|parent| parent.join("resources").join("binaries").join("tesseract"))
+            }),
+            Some(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("binaries")
+                    .join("tesseract"),
+            ),
+        ];
+        if let Some(source) = sources
+            .into_iter()
+            .flatten()
+            .find(|path| path.join("tesseract.exe").is_file())
+        {
+            copy_directory(&source, &bin_root.join("tesseract"))?;
+        }
+    }
+    let ffmpeg_path = locate_ffmpeg(root);
+    let ocr_path = locate_tesseract(root);
+    Ok(inspect_runtime(model_path, ffmpeg_path, ocr_path, None))
+}
+
+#[tauri::command]
+async fn test_provider_connection_command(
+    provider: ProviderConfig,
+    api_key: String,
+) -> Result<(), String> {
+    if provider.base_url.trim().is_empty() || provider.model.trim().is_empty() {
+        return Err("provider URL and model are required".into());
+    }
+    if api_key.trim().is_empty() {
+        return Err("an API key is required for the connection test".into());
+    }
+    let endpoint = format!(
+        "{}/chat/completions",
+        provider.base_url.trim_end_matches('/')
+    );
+    let response = reqwest::Client::new()
+        .post(endpoint)
+        .bearer_auth(api_key)
+        .json(&serde_json::json!({
+            "model": provider.model,
+            "messages": [{"role": "user", "content": "Reply with the single word: ready"}],
+            "max_tokens": 4,
+            "temperature": 0
+        }))
+        .send()
+        .await
+        .map_err(command_error)?;
+    if !response.status().is_success() {
+        return Err(format!("provider returned HTTP {}", response.status()));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn search_transcript_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    query: String,
+) -> Result<Vec<TranscriptSegment>, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    search_transcript(&database, &meeting_id, &query).map_err(command_error)
+}
+
+#[tauri::command]
+fn list_transcript_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<TranscriptSegment>, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    list_transcript(&database, &meeting_id).map_err(command_error)
+}
+
+#[tauri::command]
+fn load_minutes_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Option<Minutes>, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    load_minutes(&database, &meeting_id).map_err(command_error)
+}
+
+#[tauri::command]
+fn save_minutes_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    minutes: Minutes,
+) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    save_minutes(&database, &meeting_id, &minutes).map_err(command_error)
+}
+
+#[derive(serde::Serialize)]
+struct ProviderContextPreview {
+    evidence_count: usize,
+    estimated_input_tokens: usize,
+    disclosure: String,
+}
+
+fn keyring_secret(provider: &ProviderConfig) -> Option<String> {
+    let credential_ref = provider.credential_ref.as_deref()?;
+    let id = credential_ref.strip_prefix("keyring:")?;
+    Entry::new("bea-provider", id).ok()?.get_password().ok()
+}
+
+#[tauri::command]
+fn preview_provider_context_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<ProviderContextPreview, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let transcript = list_transcript(&database, &meeting_id).map_err(command_error)?;
+    let events = extract_ledger_events(&transcript);
+    let pack = bea_core::pack_context_mode(&events, 12_000, ContextMode::Balanced);
+    Ok(ProviderContextPreview {
+        evidence_count: pack.evidence_count,
+        estimated_input_tokens: pack.estimated_input_tokens,
+        disclosure: "Only packed transcript text and timestamped evidence will be sent. Raw audio and video stay local.".into(),
+    })
+}
+
+#[tauri::command]
+async fn generate_minutes_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Minutes, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let meeting = list_meetings(&database)
+        .map_err(command_error)?
+        .into_iter()
+        .find(|meeting| meeting.id == meeting_id)
+        .ok_or_else(|| "meeting not found".to_string())?;
+    let transcript = list_transcript(&database, &meeting_id).map_err(command_error)?;
+    if transcript.is_empty() {
+        return Err("a transcript is required before minutes can be generated".to_string());
+    }
+    let events = extract_ledger_events(&transcript);
+    save_ledger_events(&database, &meeting_id, &events).map_err(command_error)?;
+    let local_minutes = generate_minutes(&meeting.title, &events);
+    let mut minutes = local_minutes.clone();
+    if let Some(provider) = load_provider(&database, "primary").map_err(command_error)? {
+        if provider.enabled {
+            if let Some(api_key) = keyring_secret(&provider) {
+                let pack = bea_core::pack_context_mode(&events, 12_000, ContextMode::Balanced);
+                let request = LlmRequest {
+                    model: provider.model.clone(),
+                    system: "You are an expert meeting secretary. From the transcript events below, produce strict JSON meeting minutes in English.\nRules:\n- summary: a 2-4 sentence executive summary of the whole meeting.\n- decisions / action_items / unresolved: exactly one entry per distinct point; merge duplicates.\n- Every item's summary must be ONE concise, capitalized, grammatical headline sentence in English (example: \"Admission limits remain at the discretion of the Dean\"). NEVER copy raw transcript speech as a summary.\n- Every item's evidence: list the EXACT original quotes with the start_seconds/end_seconds taken from the matching input event. Do not paraphrase quotes or invent timestamps.\n- Exclude procedural noise (motions to approve past minutes, roll call, greetings, filler) from action items and decisions.".into(),
+                    user: serde_json::to_string(&pack.events).map_err(command_error)?,
+                    json_schema: r#"{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"decisions":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"action_items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"unresolved":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}}},"required":["title","summary","decisions","action_items","unresolved"]}"#.into(),
+                    max_output_tokens: 4_000,
+                };
+                if let Ok(remote_minutes) = call_provider(&provider, &request, Some(&api_key)).await
+                {
+                    let output_tokens = estimate_tokens(
+                        &serde_json::to_string(&remote_minutes).unwrap_or_default(),
+                    ) as u64;
+                    record_usage(
+                        &database,
+                        &UsageRecord {
+                            provider_id: provider.id,
+                            model: provider.model,
+                            input_tokens: pack.estimated_input_tokens as u64,
+                            output_tokens,
+                            estimated_cost: None,
+                            operation: "minutes".into(),
+                        },
+                    )
+                    .map_err(command_error)?;
+                    minutes = remote_minutes;
+                }
+            }
+        }
+    }
+    save_minutes(&database, &meeting_id, &minutes).map_err(command_error)?;
+    Ok(minutes)
+}
+
+#[tauri::command]
+fn import_vtt_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    path: String,
+    title: Option<String>,
+) -> Result<Vec<TranscriptSegment>, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| format!("unable to read VTT file: {error}"))?;
+    let cues = bea_core::vtt::parse_vtt(&raw).map_err(command_error)?;
+    if cues.is_empty() {
+        return Err("the VTT file contains no transcript cues".into());
+    }
+    // Map distinct speaker names to stable indices 0..n, in first-appearance order.
+    let mut speaker_index: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut ordered_names: Vec<String> = Vec::new();
+    for cue in &cues {
+        if let Some(name) = &cue.speaker {
+            if !speaker_index.contains_key(name) {
+                speaker_index.insert(name.clone(), ordered_names.len() as u32);
+                ordered_names.push(name.clone());
+            }
+        }
+    }
+    bea_core::clear_transcript(&database, &meeting_id).map_err(command_error)?;
+    let mut segments = Vec::new();
+    for (ordinal, cue) in cues.iter().enumerate() {
+        let segment = TranscriptSegment {
+            id: Uuid::new_v4().to_string(),
+            meeting_id: meeting_id.clone(),
+            start_seconds: cue.start_seconds,
+            end_seconds: cue.end_seconds.max(cue.start_seconds),
+            text: cue.text.clone(),
+            language_detected: None,
+            language_confidence: None,
+            speaker: cue.speaker.as_ref().map(|name| speaker_index[name]),
+        };
+        bea_core::add_segment(&database, &segment).map_err(command_error)?;
+        segments.push(segment);
+    }
+    for (index, name) in ordered_names.iter().enumerate() {
+        bea_core::set_speaker_name(&database, &meeting_id, index as u32, name)
+            .map_err(command_error)?;
+    }
+    if let Some(new_title) = title.as_deref().filter(|value| !value.trim().is_empty()) {
+        update_meeting_title(&database, &meeting_id, new_title).map_err(command_error)?;
+    }
+    bea_core::set_meeting_status(
+        &database,
+        &meeting_id,
+        bea_core::MeetingStatus::Ready,
+        segments.last().map(|segment| segment.end_seconds).unwrap_or(0),
+    )
+    .map_err(command_error)?;
+    Ok(segments)
+}
+
+#[tauri::command]
+fn import_media_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    path: String,
+    kind: String,
+    copy_into_library: bool,
+) -> Result<MediaSource, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let media_kind = match kind.as_str() {
+        "audio" => MediaKind::Audio,
+        "video" => MediaKind::Video,
+        _ => return Err("media kind must be audio or video".to_string()),
+    };
+    let library_root = state
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    import_media(
+        &database,
+        &meeting_id,
+        path,
+        media_kind,
+        None,
+        copy_into_library,
+        library_root,
+    )
+    .map_err(command_error)
+}
+
+#[tauri::command]
+async fn process_imported_media_command(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    meeting_id: String,
+    path: String,
+    kind: String,
+    language: String,
+) -> Result<Vec<TranscriptSegment>, String> {
+    let media_kind = match kind.as_str() {
+        "audio" => MediaKind::Audio,
+        "video" => MediaKind::Video,
+        _ => return Err("media kind must be audio or video".to_string()),
+    };
+    let root = state
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let model_root = root.join("models");
+    let engine_id = list_meetings(&open_database(&state.database_path).map_err(command_error)?)
+        .map_err(command_error)?
+        .into_iter()
+        .find(|meeting| meeting.id == meeting_id)
+        .map(|meeting| meeting.asr_engine_id)
+        .unwrap_or_else(|| "whisper-compatibility".into());
+    let executable_dir = std::env::current_exe()
+        .ok()
+        .and_then(|value| value.parent().map(std::path::Path::to_path_buf));
+    let sidecar = |name: &str| {
+        executable_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("{name}.exe")))
+            .filter(|value| value.is_file())
+            .unwrap_or_else(|| root.join("bin").join(format!("{name}.exe")))
+    };
+    let pipeline = FfmpegPipeline {
+        ffmpeg: sidecar("ffmpeg"),
+        ffprobe: sidecar("ffprobe"),
+    };
+    let output_dir = root.join("derived").join(&meeting_id);
+    let database_path = state.database_path.clone();
+    // Heavy ffmpeg + sherpa-onnx work runs on a worker thread so the UI stays
+    // responsive; per-chunk progress is streamed as events.
+    let worker_meeting_id = meeting_id.clone();
+    let status_meeting_id = meeting_id.clone();
+    // Speaker models download once on first use (~35 MB total) so multi-speaker
+    // labeling works out of the box. Failure only costs the speaker labels;
+    // transcription continues unlabeled.
+    if let Err(error) = ensure_speaker_models(&state, &app).await {
+        eprintln!("speaker-diarization models unavailable: {error}");
+    }
+    let segments =
+        tauri::async_runtime::spawn_blocking(move || -> Result<Vec<TranscriptSegment>, String> {
+            let database = open_database(&database_path).map_err(command_error)?;
+            let engine = load_asr_engine(&model_root, &engine_id).map_err(command_error)?;
+            // Diarize the whole normalized meeting once (if the speaker models are
+            // present) so every chunk can be attributed to a speaker. Read through
+            // the resampling helper because normalized audio may not be 16 kHz.
+            // Failures here degrade gracefully to unlabeled speakers.
+            let audio_path = std::path::Path::new(&output_dir).join("audio.wav");
+            let turns = bea_core::read_wav_samples_resampled(&audio_path, 16_000)
+                .map(|(samples, _)| samples)
+                .and_then(|samples| {
+                    bea_core::SpeakerDiarizer::from_models_dir(&model_root)
+                        .and_then(|diarizer| diarizer.process_wave(&samples))
+                })
+                .unwrap_or_default();
+            // Re-transcription replaces the previous transcript instead of
+            // appending duplicate segments beside it.
+            bea_core::clear_transcript(&database, &worker_meeting_id).map_err(command_error)?;
+            transcribe_imported_media_with_progress(
+                &database,
+                &worker_meeting_id,
+                std::path::Path::new(&path),
+                &media_kind,
+                &output_dir,
+                &language_from_code(&language),
+                &pipeline,
+                engine,
+                |segment, completed, total| {
+                    // Attribute the segment to the speaker active at its midpoint.
+                    let midpoint = (segment.start_seconds + segment.end_seconds) as f32 / 2.0;
+                    let mut labeled = segment.clone();
+                    labeled.speaker = turns
+                        .iter()
+                        .find(|turn| midpoint >= turn.start && midpoint < turn.end)
+                        .map(|turn| turn.speaker);
+                    let _ = app.emit(
+                        "transcription-progress",
+                        serde_json::json!({
+                            "meeting_id": meeting_id,
+                            "completed": completed,
+                            "total": total,
+                            "segment": labeled,
+                        }),
+                    );
+                },
+            )
+            .map(|segments| {
+                // Persist speaker labels on the stored segments (the transcribe
+                // loop already wrote them without labels).
+                segments
+                    .into_iter()
+                    .map(|mut segment| {
+                        let midpoint = (segment.start_seconds + segment.end_seconds) as f32 / 2.0;
+                        segment.speaker = turns
+                            .iter()
+                            .find(|turn| midpoint >= turn.start && midpoint < turn.end)
+                            .map(|turn| turn.speaker);
+                        let _ = bea_core::update_segment_speaker(
+                            &database,
+                            &segment.id,
+                            segment.speaker,
+                        );
+                        segment
+                    })
+                    .collect()
+            })
+            .map_err(command_error)
+        })
+        .await
+        .map_err(|error| format!("transcription worker failed: {error}"))??;
+    bea_core::set_meeting_status(
+        &open_database(&state.database_path).map_err(command_error)?,
+        &status_meeting_id,
+        bea_core::MeetingStatus::Ready,
+        segments
+            .last()
+            .map(|segment| segment.end_seconds)
+            .unwrap_or(0),
+    )
+    .map_err(command_error)?;
+    Ok(segments)
+}
+
+#[tauri::command]
+fn export_minutes_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    format: String,
+    destination: String,
+) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let minutes = load_minutes(&database, &meeting_id)
+        .map_err(command_error)?
+        .ok_or_else(|| "minutes have not been saved for this meeting".to_string())?;
+    let output_format = match format.as_str() {
+        "markdown" => ExportFormat::Markdown,
+        "pdf" => ExportFormat::Pdf,
+        "docx" => ExportFormat::Docx,
+        _ => return Err("format must be markdown, pdf, or docx".to_string()),
+    };
+    let bytes = export_minutes(&minutes, output_format.clone()).map_err(command_error)?;
+    let destination_path = std::path::Path::new(&destination);
+    // Refuse suspicious destinations: only document extensions, no overwriting
+    // existing files (the UI's save dialog already picks a fresh path).
+    let extension = destination_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    let expected = match output_format {
+        ExportFormat::Markdown => "md",
+        ExportFormat::Pdf => "pdf",
+        ExportFormat::Docx => "docx",
+    };
+    if extension.as_deref() != Some(expected) {
+        return Err(format!(
+            "export destination must have a .{expected} extension"
+        ));
+    }
+    if destination_path.exists() {
+        return Err("export destination already exists; pick a new file name".into());
+    }
+    if let Some(parent) = destination_path.parent() {
+        std::fs::create_dir_all(parent).map_err(command_error)?;
+    }
+    std::fs::write(destination_path, bytes).map_err(command_error)
+}
+
+#[tauri::command]
+fn inspect_runtime_command(state: State<'_, AppState>) -> Result<RuntimeAvailability, String> {
+    let root = state
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let model_path = root.join("models");
+    // Tauri external binaries are installed beside the application executable;
+    // keep the app-data `bin` location as a development/runtime fallback.
+    let ffmpeg_path = locate_ffmpeg(root);
+    let ocr_path = locate_tesseract(root);
+    Ok(inspect_runtime(model_path, ffmpeg_path, ocr_path, None))
+}
+
+#[derive(serde::Serialize)]
+struct SetupSnapshot {
+    runtime: RuntimeAvailability,
+    selected_engine: String,
+    setup_complete: bool,
+    provider_verified: bool,
+}
+
+#[tauri::command]
+fn setup_status_command(state: State<'_, AppState>) -> Result<SetupSnapshot, String> {
+    let root = state
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let provider = load_provider(&database, "primary").map_err(command_error)?;
+    let selected_engine = get_app_setting(&database, "selected_asr_engine")
+        .map_err(command_error)?
+        .unwrap_or_else(|| "whisper-compatibility".into());
+    let setup_complete = get_app_setting(&database, "setup_complete")
+        .map_err(command_error)?
+        .as_deref()
+        == Some("true");
+    let runtime = inspect_runtime(
+        root.join("models"),
+        locate_ffmpeg(root),
+        locate_tesseract(root),
+        provider.as_ref(),
+    );
+    let provider_verified = provider
+        .as_ref()
+        .map(|value| value.enabled && keyring_secret(value).is_some())
+        .unwrap_or(false);
+    Ok(SetupSnapshot {
+        runtime,
+        selected_engine,
+        setup_complete,
+        provider_verified,
+    })
+}
+
+#[tauri::command]
+fn set_engine_selection_command(
+    state: State<'_, AppState>,
+    engine_id: String,
+) -> Result<(), String> {
+    if !matches!(
+        engine_id.as_str(),
+        "qwen-standard" | "whisper-compatibility" | "nemotron-multilingual"
+    ) {
+        return Err("unsupported ASR engine".into());
+    }
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    set_app_setting(&database, "selected_asr_engine", &engine_id).map_err(command_error)
+}
+
+#[tauri::command]
+fn complete_setup_command(state: State<'_, AppState>) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    set_app_setting(&database, "setup_complete", "true").map_err(command_error)
+}
+
+#[tauri::command]
+fn list_model_catalog_command(state: State<'_, AppState>) -> Result<Vec<ModelManifest>, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let mut statement = database.prepare("SELECT id,name,version,size_bytes,sha256,runtime,languages,installed FROM model_manifests ORDER BY name").map_err(command_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            let languages =
+                serde_json::from_str::<Vec<String>>(&row.get::<_, String>(6)?).unwrap_or_default();
+            Ok(ModelManifest {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                version: row.get(2)?,
+                size_bytes: row.get(3)?,
+                sha256: row.get(4)?,
+                runtime: row.get(5)?,
+                languages,
+                installed: row.get::<_, i64>(7)? != 0,
+            })
+        })
+        .map_err(command_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(command_error)
+}
+
+#[tauri::command]
+fn remove_model_command(state: State<'_, AppState>, engine_id: String) -> Result<(), String> {
+    let model_id = match engine_id.as_str() {
+        "qwen-standard" => "qwen3-asr-0.6b-int8",
+        "whisper-compatibility" => "whisper-compatibility",
+        "nemotron-multilingual" => "nemotron-multilingual",
+        _ => return Err("unsupported ASR engine".into()),
+    };
+    let root = state
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let target = root.join("models").join(model_id);
+    if target.exists() {
+        std::fs::remove_dir_all(&target).map_err(command_error)?;
+    }
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    database
+        .execute(
+            "DELETE FROM model_manifests WHERE id=?1",
+            rusqlite::params![model_id],
+        )
+        .map_err(command_error)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn discover_provider_models_command(
+    provider: ProviderConfig,
+    api_key: String,
+) -> Result<Vec<String>, String> {
+    if provider.base_url.trim().is_empty() || api_key.trim().is_empty() {
+        return Err("provider URL and API key are required".into());
+    }
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}/models",
+            provider.base_url.trim_end_matches('/')
+        ))
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(command_error)?
+        .error_for_status()
+        .map_err(command_error)?;
+    let payload = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(command_error)?;
+    Ok(payload
+        .get("data")
+        .and_then(|value| value.as_array())
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| {
+                    model
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+fn inspect_model_package_command(path: String) -> Result<ModelManifest, String> {
+    inspect_asr_model_package(path).map_err(command_error)
+}
+
+#[tauri::command]
+fn install_model_command(
+    state: State<'_, AppState>,
+    source: String,
+    mut manifest: ModelManifest,
+) -> Result<ModelInstallProgress, String> {
+    let root = state
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let destination = root.join("models").join(&manifest.id);
+    let progress = if manifest.id == "qwen3-asr-0.6b-int8" {
+        install_qwen_model_package(source, &destination, &manifest).map_err(command_error)?
+    } else {
+        install_sherpa_model_package(source, &destination, &manifest).map_err(command_error)?
+    };
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    manifest.installed = true;
+    register_model(&database, &manifest).map_err(command_error)?;
+    Ok(progress)
+}
+
+#[tauri::command]
+async fn download_model_command(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    url: String,
+    manifest: ModelManifest,
+) -> Result<ModelInstallProgress, String> {
+    // The manifest digest is caller-supplied, so it cannot be trusted as
+    // verification on its own — but refusing empty/short digests and non-HTTPS
+    // URLs closes the trivially-abusable cases (self-asserted "no check", or
+    // plaintext download channels).
+    if manifest.sha256.trim().len() != 64 {
+        return Err("model package must carry a 64-character SHA-256 digest".to_string());
+    }
+    if !url.starts_with("https://") {
+        return Err("model downloads must use HTTPS".to_string());
+    }
+    let root = state
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let models = root.join("models");
+    std::fs::create_dir_all(&models).map_err(command_error)?;
+    let temporary = models.join(format!("{}.download", manifest.id));
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .map_err(command_error)?
+        .error_for_status()
+        .map_err(command_error)?;
+    let mut output = std::fs::File::create(&temporary).map_err(command_error)?;
+    let mut downloaded = 0u64;
+    let expected_length = response.content_length();
+    let mut response = response;
+    while let Some(chunk) = response.chunk().await.map_err(command_error)? {
+        output.write_all(&chunk).map_err(command_error)?;
+        downloaded += chunk.len() as u64;
+        let _ = app.emit(
+            "model-install-progress",
+            serde_json::json!({
+                "model_id": manifest.id.clone(),
+                "downloaded": downloaded,
+                "total": expected_length,
+            }),
+        );
+    }
+    drop(output);
+    if let Some(expected_length) = expected_length {
+        if expected_length != downloaded {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!(
+                "download length mismatch: expected {expected_length}, got {downloaded}"
+            ));
+        }
+    }
+    let destination = models.join(&manifest.id);
+    let progress = if manifest.id == "qwen3-asr-0.6b-int8" {
+        install_qwen_model_package(&temporary, &destination, &manifest).map_err(command_error)?
+    } else {
+        install_sherpa_model_package(&temporary, &destination, &manifest).map_err(command_error)?
+    };
+    let _ = std::fs::remove_file(&temporary);
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let mut installed_manifest = manifest;
+    installed_manifest.installed = true;
+    register_model(&database, &installed_manifest).map_err(command_error)?;
+    Ok(progress)
+}
+
+/// Pinned download sources for every setup dependency. Each engine points at a
+/// specific sherpa-onnx release asset so installs are reproducible; the tools
+/// point at their official Windows distributions. `sha256` may be empty for
+/// moving targets (latest-release builds) — the install step still validates
+/// the archive layout before an engine is registered.
+#[derive(serde::Serialize, Clone)]
+struct DependencyDownload {
+    id: &'static str,
+    kind: &'static str,
+    label: &'static str,
+    url: &'static str,
+    size_label: &'static str,
+    sha256: &'static str,
+}
+
+const DEPENDENCY_DOWNLOADS: &[DependencyDownload] = &[
+    DependencyDownload {
+        id: "whisper-compatibility",
+        kind: "engine",
+        label: "Bea Standard · Whisper Large-v3-Turbo",
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-turbo.tar.bz2",
+        size_label: "≈565 MB archive",
+        sha256: "b11acbbcd660b44a8e0df33724feb5aaa709cf65668f2823d59f656312544f22",
+    },
+    DependencyDownload {
+        id: "qwen-standard",
+        kind: "engine",
+        label: "Qwen3-ASR 0.6B INT8",
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2",
+        size_label: "≈880 MB archive",
+        sha256: "393f8a14e2f5fb96746aaab342997a40641001fbd5bf9592a080a8329178ee96",
+    },
+    DependencyDownload {
+        id: "nemotron-multilingual",
+        kind: "engine",
+        label: "Nemotron 3.5 streaming 0.6B INT8 · 560ms",
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11.tar.bz2",
+        size_label: "≈475 MB archive",
+        sha256: "c6bf5e0df765f9d5b43bc9e0536d4b4b3e7d40bdf5ecf13e45f134c51c05ae3a",
+    },
+    DependencyDownload {
+        id: "ffmpeg",
+        kind: "tool",
+        label: "FFmpeg + FFprobe (BtbN win64 GPL build)",
+        // Pinned to an exact release with the SHA-256 from BtbN's own
+        // checksums.sha256 for that tag; `releases/latest` URLs can swap
+        // assets underneath any pin at any time.
+        url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-25-13-06/ffmpeg-N-126264-g007cd1fd43-win64-gpl.zip",
+        size_label: "≈163 MB archive",
+        sha256: "776c5c1c379bbd8acf1e0c93005c633ea163ad12ef7914c5bfec0db760164b84",
+    },
+    DependencyDownload {
+        id: "tesseract",
+        kind: "tool",
+        label: "Tesseract OCR 5 (UB Mannheim installer)",
+        url: "https://github.com/UB-Mannheim/tesseract/releases/download/v5.4.0.20240606/tesseract-ocr-w64-setup-5.4.0.20240606.exe",
+        size_label: "≈50 MB installer",
+        sha256: "",
+    },
+    DependencyDownload {
+        id: "speaker-segmentation",
+        kind: "model",
+        label: "Pyannote speaker segmentation (diarization)",
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2",
+        size_label: "≈7 MB archive",
+        sha256: "",
+    },
+    DependencyDownload {
+        id: "speaker-embedding",
+        kind: "model",
+        label: "3D-Speaker embedding model (diarization)",
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
+        size_label: "≈28 MB model",
+        sha256: "",
+    },
+];
+
+#[tauri::command]
+fn list_dependency_downloads_command() -> Vec<DependencyDownload> {
+    DEPENDENCY_DOWNLOADS.to_vec()
+}
+
+/// Streams a file from `url` to `destination`, emitting `dependency-progress`
+/// events so the UI can render a progress bar.
+async fn stream_dependency_download(
+    app: &tauri::AppHandle,
+    url: &str,
+    destination: &std::path::Path,
+    label: &str,
+) -> Result<u64, String> {
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .map_err(command_error)?
+        .error_for_status()
+        .map_err(command_error)?;
+    let mut output = std::fs::File::create(destination).map_err(command_error)?;
+    let mut downloaded = 0u64;
+    let expected_length = response.content_length();
+    let mut response = response;
+    while let Some(chunk) = response.chunk().await.map_err(command_error)? {
+        output.write_all(&chunk).map_err(command_error)?;
+        downloaded += chunk.len() as u64;
+        let _ = app.emit(
+            "dependency-progress",
+            serde_json::json!({
+                "id": label,
+                "downloaded": downloaded,
+                "total": expected_length,
+            }),
+        );
+    }
+    drop(output);
+    if let Some(expected_length) = expected_length {
+        if expected_length != downloaded {
+            let _ = std::fs::remove_file(destination);
+            return Err(format!(
+                "download length mismatch: expected {expected_length}, got {downloaded}"
+            ));
+        }
+    }
+    Ok(downloaded)
+}
+
+/// Downloads and installs one of the pinned ASR engines directly from the
+/// sherpa-onnx release catalog. The archive is checksum-verified when the
+/// catalog pins a digest, extracted, and only registered after the required
+/// sherpa-onnx model files are present.
+#[tauri::command]
+async fn download_engine_command(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    engine_id: String,
+) -> Result<ModelInstallProgress, String> {
+    let entry = DEPENDENCY_DOWNLOADS
+        .iter()
+        .find(|entry| entry.kind == "engine" && entry.id == engine_id)
+        .ok_or_else(|| format!("no pinned download for engine {engine_id}"))?;
+    let model_id = match engine_id.as_str() {
+        "qwen-standard" => "qwen3-asr-0.6b-int8",
+        other => other,
+    };
+    let root = state
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let models = root.join("models");
+    std::fs::create_dir_all(&models).map_err(command_error)?;
+    // Keep the archive extension on the staging file so downstream format
+    // detection (and any user inspection) sees a bzip2/tar/zip file.
+    let temporary = models.join(format!("{model_id}.download.tar.bz2"));
+    let downloaded =
+        stream_dependency_download(&app, entry.url, &temporary, engine_id.as_str()).await?;
+    let manifest = ModelManifest {
+        id: model_id.into(),
+        name: entry.label.into(),
+        version: "pinned-release".into(),
+        size_bytes: downloaded,
+        sha256: entry.sha256.into(),
+        runtime: "sherpa-onnx".into(),
+        languages: match engine_id.as_str() {
+            "qwen-standard" => vec!["en".into(), "fil".into(), "taglish".into()],
+            _ => vec!["multilingual".into()],
+        },
+        installed: false,
+    };
+    let destination = models.join(model_id);
+    let progress = if model_id == "qwen3-asr-0.6b-int8" {
+        install_qwen_model_package(&temporary, &destination, &manifest).map_err(command_error)?
+    } else {
+        install_sherpa_model_package(&temporary, &destination, &manifest).map_err(command_error)?
+    };
+    let _ = std::fs::remove_file(&temporary);
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let mut installed_manifest = manifest;
+    installed_manifest.installed = true;
+    register_model(&database, &installed_manifest).map_err(command_error)?;
+    Ok(progress)
+}
+
+fn extract_zip_archive(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<(), String> {
+    let file = std::fs::File::open(source).map_err(command_error)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(command_error)?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(command_error)?;
+        let Some(name) = entry.enclosed_name() else {
+            return Err("tool archive contains an unsafe path".into());
+        };
+        let target = destination.join(name);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&target).map_err(command_error)?;
+        } else {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(command_error)?;
+            }
+            let mut output = std::fs::File::create(&target).map_err(command_error)?;
+            std::io::copy(&mut entry, &mut output).map_err(command_error)?;
+        }
+    }
+    Ok(())
+}
+
+/// Downloads and installs a local tool (FFmpeg/FFprobe or Tesseract). The
+/// bundled-copy repair path stays available as a fallback for offline machines
+/// with the full installer payload; this command covers machines that were
+/// never bundled with the binaries.
+/// Ensure the speaker-diarization models are present in `models/`. Downloads
+/// them on first use (they are small: ~7 MB + ~28 MB). Returns Ok(()) when the
+/// models are available, Err with the last download error otherwise.
+async fn ensure_speaker_models(
+    state: &State<'_, AppState>,
+    app: &tauri::AppHandle,
+) -> Result<(), String> {
+    // Only one caller at a time may run the check/download/extract sequence;
+    // concurrent transcription jobs would otherwise collide on the same
+    // staging files and fail with opaque rename errors. Tokio mutex because
+    // the download below awaits while holding the guard.
+    let _guard = state.speaker_models_lock.lock().await;
+    let root = state
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let models = root.join("models");
+    let segmentation_dir = models.join("pyannote-segmentation-3-0");
+    let embedding = models.join("3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx");
+    if segmentation_dir.join("model.onnx").is_file() && embedding.is_file() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&models).map_err(command_error)?;
+    for id in ["speaker-segmentation", "speaker-embedding"] {
+        let entry = DEPENDENCY_DOWNLOADS
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| format!("missing catalog entry {id}"))?;
+        let temporary = models.join(format!("{id}.download"));
+        if !temporary.is_file() {
+            stream_dependency_download(app, entry.url, &temporary, id).await?;
+        }
+        if id == "speaker-segmentation" {
+            let staging = models.join("pyannote-staging");
+            let _ = std::fs::remove_dir_all(&staging);
+            extract_archive_auto(&temporary, &staging)?;
+            // Find model.onnx wherever it landed in the archive.
+            let model = find_file_by_name(&staging, "model.onnx")
+                .ok_or_else(|| "pyannote archive has no model.onnx".to_string())?;
+            std::fs::create_dir_all(&segmentation_dir).map_err(command_error)?;
+            std::fs::rename(&model, segmentation_dir.join("model.onnx")).map_err(command_error)?;
+            let _ = std::fs::remove_dir_all(&staging);
+        } else {
+            std::fs::rename(&temporary, &embedding).map_err(command_error)?;
+        }
+        let _ = std::fs::remove_file(&temporary);
+    }
+    Ok(())
+}
+
+/// Extract a zip or tar(.bz2) archive, sniffing the format from magic bytes.
+fn extract_archive_auto(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<(), String> {
+    std::fs::create_dir_all(destination).map_err(command_error)?;
+    if bea_core::file_starts_with(source, b"PK\x03\x04") {
+        extract_zip_archive(source, destination)
+    } else {
+        bea_core::extract_model_archive(source, destination).map_err(|e| e.to_string())
+    }
+}
+
+/// Recursively find a file with `name` under `dir`.
+fn find_file_by_name(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let candidate = dir.join(name);
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            find_file_by_name(&path, name)
+        } else {
+            None
+        }
+    })
+}
+
+#[tauri::command]
+async fn download_tool_command(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    tool: String,
+) -> Result<RuntimeAvailability, String> {
+    let entry = DEPENDENCY_DOWNLOADS
+        .iter()
+        .find(|entry| entry.kind == "tool" && entry.id == tool)
+        .ok_or_else(|| format!("no pinned download for tool {tool}"))?;
+    let root = state
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let bin_root = root.join("bin");
+    std::fs::create_dir_all(&bin_root).map_err(command_error)?;
+    let temporary = bin_root.join(format!("{tool}.download"));
+    stream_dependency_download(&app, entry.url, &temporary, &tool).await?;
+    // Integrity gate: when a digest is pinned, verify before anything touches
+    // the download. When it is not (moving upstream builds), at minimum require
+    // a valid Authenticode signature on executables before running them.
+    if entry.sha256.is_empty() {
+        bea_core::verify_executable_authenticode(&temporary).map_err(|error| {
+            let _ = std::fs::remove_file(&temporary);
+            format!(
+                "downloaded {tool} has no pinned checksum and failed its \
+                 Authenticode signature check: {error}"
+            )
+        })?;
+    } else {
+        bea_core::verify_model_checksum(&temporary, entry.sha256).map_err(|error| {
+            let _ = std::fs::remove_file(&temporary);
+            error.to_string()
+        })?;
+    }
+    let install_result: Result<(), String> = match tool.as_str() {
+        "ffmpeg" => install_downloaded_ffmpeg(&temporary, &bin_root),
+        "tesseract" => install_downloaded_tesseract(&temporary, &bin_root).map(|_| ()),
+        other => Err(format!("unsupported tool {other}")),
+    };
+    let _ = std::fs::remove_file(&temporary);
+    install_result?;
+    let ffmpeg_path = locate_ffmpeg(root);
+    let ocr_path = locate_tesseract(root);
+    Ok(inspect_runtime(
+        root.join("models"),
+        ffmpeg_path,
+        ocr_path,
+        None,
+    ))
+}
+
+/// The BtbN archive extracts as `ffmpeg-master-latest-win64-gpl/bin/*.exe`;
+/// copy both executables into the app-data `bin` directory.
+fn install_downloaded_ffmpeg(
+    archive: &std::path::Path,
+    bin_root: &std::path::Path,
+) -> Result<(), String> {
+    let staging = bin_root.join("ffmpeg-staging");
+    let _ = std::fs::remove_dir_all(&staging);
+    extract_zip_archive(archive, &staging)?;
+    let mut copied = 0;
+    if let Ok(entries) = std::fs::read_dir(&staging) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("bin");
+            for name in ["ffmpeg.exe", "ffprobe.exe"] {
+                let source = candidate.join(name);
+                if source.is_file() {
+                    std::fs::copy(&source, bin_root.join(name)).map_err(command_error)?;
+                    copied += 1;
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+    if copied < 2 {
+        return Err(format!(
+            "FFmpeg archive did not contain the expected executables (found {copied}/2)"
+        ));
+    }
+    Ok(())
+}
+
+/// The UB-Mannheim installer is an Inno Setup executable; run it silently with
+/// a destination inside Bea's app-data so no admin rights are needed.
+fn install_downloaded_tesseract(
+    installer: &std::path::Path,
+    bin_root: &std::path::Path,
+) -> Result<PathBuf, String> {
+    let target = bin_root.join("tesseract");
+    let _ = std::fs::remove_dir_all(&target);
+    std::fs::create_dir_all(&target).map_err(command_error)?;
+    let mut command = std::process::Command::new(installer);
+    command.args([
+        "/VERYSILENT",
+        "/NORESTART",
+        "/SUPPRESSMSGBOXES",
+        "/NOCANCEL",
+        format!("/DIR={}", target.display()).as_str(),
+    ]);
+    bea_core::hide_console_window(&mut command);
+    let status = command.status().map_err(command_error)?;
+    if !status.success() {
+        return Err(format!("Tesseract installer exited with {status}"));
+    }
+    if !target.join("tesseract.exe").is_file() {
+        return Err(
+            "Tesseract installer did not produce tesseract.exe in the Bea data directory".into(),
+        );
+    }
+    Ok(target)
+}
+
+#[tauri::command]
+fn load_provider_command(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> Result<Option<ProviderConfig>, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    load_provider(&database, &provider_id).map_err(command_error)
+}
+
+#[tauri::command]
+fn save_provider_command(
+    state: State<'_, AppState>,
+    provider: ProviderConfig,
+) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    save_provider(&database, &provider).map_err(command_error)
+}
+
+#[tauri::command]
+fn save_provider_secure_command(
+    state: State<'_, AppState>,
+    mut provider: ProviderConfig,
+    api_key: String,
+) -> Result<(), String> {
+    if api_key.trim().is_empty() {
+        return Err("an API key is required".into());
+    }
+    let entry = Entry::new("bea-provider", &provider.id).map_err(command_error)?;
+    entry.set_password(&api_key).map_err(command_error)?;
+    provider.credential_ref = Some(format!("keyring:{}", provider.id));
+    provider.enabled = true;
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    save_provider(&database, &provider).map_err(command_error)
+}
+
+#[tauri::command]
+fn list_audio_input_devices_command() -> Result<Vec<bea_core::AudioInputDevice>, String> {
+    list_audio_input_devices().map_err(command_error)
+}
+
+#[tauri::command]
+fn start_recording_command(state: State<'_, AppState>, meeting_id: String) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let root = state
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("recordings")
+        .join(&meeting_id);
+    bea_core::start_recording(&database, &meeting_id, &root).map_err(command_error)?;
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let commands = spawn_recorder(root, ready_tx);
+    ready_rx
+        .recv()
+        .map_err(|_| "recording thread stopped during startup".to_string())??;
+    bea_core::set_meeting_status(
+        &database,
+        &meeting_id,
+        bea_core::MeetingStatus::Recording,
+        0,
+    )
+    .map_err(command_error)?;
+    let mut recorders = state
+        .recorders
+        .lock()
+        .map_err(|_| "recorder state lock poisoned".to_string())?;
+    if recorders.contains_key(&meeting_id) {
+        // A recorder already runs for this meeting; re-inserting would orphan
+        // it while the DB claims a fresh recording is active.
+        return Err("a recording is already active for this meeting".into());
+    }
+    recorders.insert(meeting_id, commands);
+    Ok(())
+}
+
+/// Sends a command to the meeting's recorder thread and waits for its reply
+/// without holding the recorder-state lock across the wait — a wedged recorder
+/// thread must not deadlock every other recorder command. Bounded by a timeout
+/// so a stuck thread surfaces as an error instead of hanging the UI.
+fn recorder_command_with_reply(
+    state: &State<'_, AppState>,
+    meeting_id: &str,
+    kind: &'static str,
+) -> Result<(), String> {
+    let sender = {
+        let recorders = state
+            .recorders
+            .lock()
+            .map_err(|_| "recorder state lock poisoned".to_string())?;
+        recorders
+            .get(meeting_id)
+            .ok_or_else(|| "recording not found".to_string())?
+            .clone()
+    };
+    let (tx, rx) = mpsc::sync_channel(1);
+    let command = match kind {
+        "pause" => RecorderCommand::Pause(tx),
+        _ => RecorderCommand::Resume(tx),
+    };
+    sender.send(command).map_err(command_error)?;
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .map_err(|_| "recording thread stopped or timed out".to_string())?
+}
+
+#[tauri::command]
+fn pause_recording_command(state: State<'_, AppState>, meeting_id: String) -> Result<(), String> {
+    recorder_command_with_reply(&state, &meeting_id, "pause")
+}
+
+#[tauri::command]
+fn resume_recording_command(state: State<'_, AppState>, meeting_id: String) -> Result<(), String> {
+    recorder_command_with_reply(&state, &meeting_id, "resume")
+}
+
+#[tauri::command]
+fn stop_recording_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<CompletedAudioChunk>, String> {
+    let commands = state
+        .recorders
+        .lock()
+        .map_err(|_| "recorder state lock poisoned".to_string())?
+        .remove(&meeting_id)
+        .ok_or_else(|| "recording not found".to_string())?;
+    let (tx, rx) = mpsc::sync_channel(1);
+    commands
+        .send(RecorderCommand::Stop(tx))
+        .map_err(command_error)?;
+    let chunks = rx
+        .recv()
+        .map_err(|_| "recording thread stopped".to_string())??;
+    let duration = chunks.last().map(|chunk| chunk.end_seconds).unwrap_or(0);
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    bea_core::set_meeting_status(
+        &database,
+        &meeting_id,
+        bea_core::MeetingStatus::Processing,
+        duration,
+    )
+    .map_err(command_error)?;
+    for chunk in &chunks {
+        persist_completed_audio_chunk(&database, &meeting_id, chunk).map_err(command_error)?;
+    }
+    create_job(&database, &meeting_id, bea_core::JobKind::Transcription).map_err(command_error)?;
+    Ok(chunks)
+}
+
+#[tauri::command]
+async fn transcribe_recording_command(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    meeting_id: String,
+    language: String,
+) -> Result<Vec<TranscriptSegment>, String> {
+    let database_path = state.database_path.clone();
+    let model_root = database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("models");
+    let engine_id = {
+        let database = open_database(&database_path).map_err(command_error)?;
+        list_meetings(&database)
+            .map_err(command_error)?
+            .into_iter()
+            .find(|meeting| meeting.id == meeting_id)
+            .map(|meeting| meeting.asr_engine_id)
+            .unwrap_or_else(|| "whisper-compatibility".into())
+    };
+    let chunks = {
+        let database = open_database(&database_path).map_err(command_error)?;
+        list_completed_recording_chunks(&database, &meeting_id).map_err(command_error)?
+    };
+    if chunks.is_empty() {
+        return Err("no completed recording chunks are available".to_string());
+    }
+    let inputs = chunks
+        .iter()
+        .map(|chunk| AudioChunkInput {
+            path: chunk.path.clone(),
+            start_seconds: chunk.start_seconds,
+            end_seconds: chunk.end_seconds,
+        })
+        .collect::<Vec<_>>();
+    // sherpa-onnx inference is CPU-heavy; run it off the main thread and stream
+    // per-chunk progress to the UI.
+    let worker_meeting_id = meeting_id.clone();
+    // Speaker models download once on first use (~35 MB total) so multi-speaker
+    // labeling works out of the box for recordings too. Failure only costs the
+    // speaker labels; transcription continues unlabeled.
+    if let Err(error) = ensure_speaker_models(&state, &app).await {
+        eprintln!("speaker-diarization models unavailable: {error}");
+    }
+    let segments =
+        tauri::async_runtime::spawn_blocking(move || -> Result<Vec<TranscriptSegment>, String> {
+            let database = open_database(&database_path).map_err(command_error)?;
+            let engine = load_asr_engine(&model_root, &engine_id).map_err(command_error)?;
+            // Diarize the full recorded meeting once: concatenate every chunk's
+            // samples (resampled to 16 kHz — microphone devices commonly run at
+            // 44.1/48 kHz and diarization models expect 16 kHz), then attribute
+            // each transcript segment to the speaker active at its midpoint.
+            // Failures here degrade gracefully to unlabeled speakers.
+            let mut meeting_samples: Vec<f32> = Vec::new();
+            for input in &inputs {
+                if let Some((samples, _)) =
+                    bea_core::read_wav_samples_resampled(&input.path, 16_000)
+                {
+                    meeting_samples.extend(samples);
+                }
+            }
+            let turns = if meeting_samples.is_empty() {
+                Vec::new()
+            } else {
+                bea_core::SpeakerDiarizer::from_models_dir(&model_root)
+                    .and_then(|diarizer| diarizer.process_wave(&meeting_samples))
+                    .unwrap_or_default()
+            };
+            let speaker_at = |segment: &TranscriptSegment| -> Option<u32> {
+                let midpoint = (segment.start_seconds + segment.end_seconds) as f32 / 2.0;
+                turns
+                    .iter()
+                    .find(|turn| midpoint >= turn.start && midpoint < turn.end)
+                    .map(|turn| turn.speaker)
+            };
+            // Re-transcription replaces the previous transcript instead of
+            // appending duplicate segments beside it.
+            bea_core::clear_transcript(&database, &worker_meeting_id).map_err(command_error)?;
+            transcribe_chunks_with_progress(
+                &database,
+                &worker_meeting_id,
+                &inputs,
+                &language_from_code(&language),
+                engine,
+                |segment, completed, total| {
+                    let mut labeled = segment.clone();
+                    labeled.speaker = speaker_at(segment);
+                    let _ = app.emit(
+                        "transcription-progress",
+                        serde_json::json!({
+                            "meeting_id": worker_meeting_id,
+                            "completed": completed,
+                            "total": total,
+                            "segment": labeled,
+                        }),
+                    );
+                },
+            )
+            .map(|segments| {
+                // Persist speaker labels on the stored segments (the transcribe
+                // loop already wrote them without labels).
+                segments
+                    .into_iter()
+                    .map(|mut segment| {
+                        segment.speaker = speaker_at(&segment);
+                        let _ = bea_core::update_segment_speaker(
+                            &database,
+                            &segment.id,
+                            segment.speaker,
+                        );
+                        segment
+                    })
+                    .collect()
+            })
+            .map_err(command_error)
+        })
+        .await
+        .map_err(|error| format!("transcription worker failed: {error}"))??;
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    database
+        .execute(
+            "UPDATE jobs SET state='completed',progress=1,error=NULL WHERE id=(SELECT id FROM jobs WHERE meeting_id=?1 AND kind='transcription' ORDER BY rowid DESC LIMIT 1)",
+            rusqlite::params![meeting_id],
+        )
+        .map_err(command_error)?;
+    let duration = segments
+        .last()
+        .map(|segment| segment.end_seconds)
+        .unwrap_or(0);
+    bea_core::set_meeting_status(
+        &database,
+        &meeting_id,
+        bea_core::MeetingStatus::Ready,
+        duration,
+    )
+    .map_err(command_error)?;
+    Ok(segments)
+}
+
+fn main() {
+    tauri::Builder::default()
+        .setup(|app| {
+            let data_dir = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&data_dir)?;
+            app.manage(AppState {
+                database_path: data_dir.join("bea.db"),
+                recorders: Mutex::new(HashMap::new()),
+                speaker_models_lock: tauri::async_runtime::Mutex::new(()),
+            });
+            Ok(())
+        })
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![
+            create_meeting_command,
+            list_meetings_command,
+            rename_meeting_command,
+            delete_meeting_command,
+            update_transcript_segment_command,
+            list_media_command,
+            waveform_peaks_command,
+            repair_runtime_command,
+            test_provider_connection_command,
+            search_transcript_command,
+            list_transcript_command,
+            load_minutes_command,
+            preview_provider_context_command,
+            save_minutes_command,
+            generate_minutes_command,
+            import_media_command,
+            import_vtt_command,
+            process_imported_media_command,
+            export_minutes_command,
+            inspect_runtime_command,
+            setup_status_command,
+            set_engine_selection_command,
+            complete_setup_command,
+            list_model_catalog_command,
+            remove_model_command,
+            discover_provider_models_command,
+            inspect_model_package_command,
+            install_model_command,
+            download_model_command,
+            list_dependency_downloads_command,
+            download_engine_command,
+            download_tool_command,
+            load_provider_command,
+            save_provider_command,
+            save_provider_secure_command,
+            list_audio_input_devices_command,
+            start_recording_command,
+            pause_recording_command,
+            resume_recording_command,
+            stop_recording_command,
+            transcribe_recording_command
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running Bea");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::locate_tesseract;
+
+    #[test]
+    fn tesseract_locator_checks_installed_windows_location() {
+        let path = locate_tesseract(std::path::Path::new("missing-bea-data"));
+        if let Ok(program_files) = std::env::var("ProgramFiles") {
+            let installed = std::path::PathBuf::from(program_files)
+                .join("Tesseract-OCR")
+                .join("tesseract.exe");
+            if installed.is_file() {
+                assert_eq!(path, installed);
+            }
+        }
+    }
+}
