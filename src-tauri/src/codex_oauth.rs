@@ -11,8 +11,7 @@ pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const AUTH_ISSUER: &str = "https://auth.openai.com";
 pub const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 /// Same URI, percent-encoded for the authorize query string.
-pub const REDIRECT_URI_ENCODED: &str =
-    "http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback";
+pub const REDIRECT_URI_ENCODED: &str = "http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback";
 pub const CHATGPT_API_BASE: &str = "https://chatgpt.com/backend-api/codex";
 
 /// OAuth tokens for the ChatGPT (Codex) subscription flow. Persisted as JSON

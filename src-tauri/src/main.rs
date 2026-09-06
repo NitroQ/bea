@@ -579,7 +579,10 @@ const CODEX_KEYRING_ID: &str = "codex-oauth";
 const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
 fn load_codex_tokens() -> Option<bea_core::codex_oauth::CodexTokens> {
-    let raw = Entry::new("bea-provider", CODEX_KEYRING_ID).ok()?.get_password().ok()?;
+    let raw = Entry::new("bea-provider", CODEX_KEYRING_ID)
+        .ok()?
+        .get_password()
+        .ok()?;
     serde_json::from_str(&raw).ok()
 }
 
@@ -590,7 +593,10 @@ fn store_codex_tokens(tokens: &bea_core::codex_oauth::CodexTokens) -> Result<(),
         .map_err(command_error)
 }
 
-async fn exchange_codex_code(code: &str, verifier: &str) -> Result<bea_core::codex_oauth::CodexTokens, String> {
+async fn exchange_codex_code(
+    code: &str,
+    verifier: &str,
+) -> Result<bea_core::codex_oauth::CodexTokens, String> {
     let response = reqwest::Client::new()
         .post(CODEX_TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -627,15 +633,17 @@ async fn exchange_codex_code(code: &str, verifier: &str) -> Result<bea_core::cod
 /// Returns a valid access token, refreshing via the stored refresh token when
 /// the current one is within 60 seconds of expiry.
 async fn fresh_codex_access_token() -> Result<String, String> {
-    let tokens = load_codex_tokens()
-        .ok_or("no ChatGPT sign-in — click Sign in with ChatGPT first")?;
+    let tokens =
+        load_codex_tokens().ok_or("no ChatGPT sign-in — click Sign in with ChatGPT first")?;
     if tokens.expires_at - 60 > chrono::Utc::now().timestamp() {
         return Ok(tokens.access_token);
     }
     let response = reqwest::Client::new()
         .post(CODEX_TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(bea_core::codex_oauth::token_refresh_body(&tokens.refresh_token))
+        .body(bea_core::codex_oauth::token_refresh_body(
+            &tokens.refresh_token,
+        ))
         .send()
         .await
         .map_err(command_error)?
@@ -651,8 +659,7 @@ async fn fresh_codex_access_token() -> Result<String, String> {
             .as_str()
             .map(str::to_string)
             .unwrap_or(tokens.refresh_token.clone()),
-        expires_at: chrono::Utc::now().timestamp()
-            + payload["expires_in"].as_i64().unwrap_or(3600),
+        expires_at: chrono::Utc::now().timestamp() + payload["expires_in"].as_i64().unwrap_or(3600),
         account_id: tokens.account_id.clone(),
     };
     store_codex_tokens(&updated)?;
@@ -715,7 +722,10 @@ fn codex_oauth_sign_out_command() -> Result<(), String> {
 async fn codex_list_models_command() -> Result<Vec<String>, String> {
     let token = fresh_codex_access_token().await?;
     let response = reqwest::Client::new()
-        .get(format!("{}/models", bea_core::codex_oauth::CHATGPT_API_BASE))
+        .get(format!(
+            "{}/models",
+            bea_core::codex_oauth::CHATGPT_API_BASE
+        ))
         .bearer_auth(token)
         .send()
         .await

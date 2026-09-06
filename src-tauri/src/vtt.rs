@@ -14,11 +14,22 @@ fn timestamp_seconds(raw: &str) -> Result<u64, BeaError> {
     let (hours, minutes, seconds) = match parts.as_slice() {
         [h, m, s] => (*h, *m, *s),
         [m, s] => ("0", *m, *s),
-        _ => return Err(BeaError::UnsupportedMedia(format!("bad VTT timestamp: {raw}"))),
+        _ => {
+            return Err(BeaError::UnsupportedMedia(format!(
+                "bad VTT timestamp: {raw}"
+            )))
+        }
     };
-    let hours: u64 = hours.trim().parse().map_err(|_| BeaError::UnsupportedMedia(format!("bad VTT timestamp: {raw}")))?;
-    let minutes: u64 = minutes.parse().map_err(|_| BeaError::UnsupportedMedia(format!("bad VTT timestamp: {raw}")))?;
-    let seconds_f: f64 = seconds.parse().map_err(|_| BeaError::UnsupportedMedia(format!("bad VTT timestamp: {raw}")))?;
+    let hours: u64 = hours
+        .trim()
+        .parse()
+        .map_err(|_| BeaError::UnsupportedMedia(format!("bad VTT timestamp: {raw}")))?;
+    let minutes: u64 = minutes
+        .parse()
+        .map_err(|_| BeaError::UnsupportedMedia(format!("bad VTT timestamp: {raw}")))?;
+    let seconds_f: f64 = seconds
+        .parse()
+        .map_err(|_| BeaError::UnsupportedMedia(format!("bad VTT timestamp: {raw}")))?;
     Ok(hours * 3600 + minutes * 60 + seconds_f.round() as u64)
 }
 
@@ -34,7 +45,9 @@ fn strip_speaker_tag(text: &str) -> (Option<String>, String) {
 
 pub fn parse_vtt(input: &str) -> Result<Vec<VttCue>, BeaError> {
     if !input.trim_start().starts_with("WEBVTT") {
-        return Err(BeaError::UnsupportedMedia("file is not a WebVTT document".into()));
+        return Err(BeaError::UnsupportedMedia(
+            "file is not a WebVTT document".into(),
+        ));
     }
     let mut cues = Vec::new();
     let mut current: Option<(u64, u64, Option<String>, Vec<String>)> = None;
@@ -44,7 +57,12 @@ pub fn parse_vtt(input: &str) -> Result<Vec<VttCue>, BeaError> {
             if let Some((start, end, speaker, text_lines)) = current.take() {
                 let text = text_lines.join(" ").trim().to_string();
                 if !text.is_empty() {
-                    cues.push(VttCue { start_seconds: start, end_seconds: end, speaker, text });
+                    cues.push(VttCue {
+                        start_seconds: start,
+                        end_seconds: end,
+                        speaker,
+                        text,
+                    });
                 }
             }
             continue;
@@ -58,12 +76,20 @@ pub fn parse_vtt(input: &str) -> Result<Vec<VttCue>, BeaError> {
             ));
             continue;
         }
-        if line.starts_with("WEBVTT") || line.starts_with("NOTE") || line.starts_with("STYLE") || line.starts_with("Kind:") || line.starts_with("Language:") {
+        if line.starts_with("WEBVTT")
+            || line.starts_with("NOTE")
+            || line.starts_with("STYLE")
+            || line.starts_with("Kind:")
+            || line.starts_with("Language:")
+        {
             continue;
         }
         if let Some((_, _, _, text_lines)) = current.as_mut() {
             // A bare cue-identifier line (no "-->", no prior text) is skipped.
-            if text_lines.is_empty() && cues.iter().all(|_| true) && line.chars().all(|c| c.is_ascii_digit()) {
+            if text_lines.is_empty()
+                && cues.iter().all(|_| true)
+                && line.chars().all(|c| c.is_ascii_digit())
+            {
                 continue;
             }
             if text_lines.is_empty() {
@@ -83,7 +109,12 @@ pub fn parse_vtt(input: &str) -> Result<Vec<VttCue>, BeaError> {
     if let Some((start, end, speaker, text_lines)) = current.take() {
         let text = text_lines.join(" ").trim().to_string();
         if !text.is_empty() {
-            cues.push(VttCue { start_seconds: start, end_seconds: end, speaker, text });
+            cues.push(VttCue {
+                start_seconds: start,
+                end_seconds: end,
+                speaker,
+                text,
+            });
         }
     }
     Ok(cues)
