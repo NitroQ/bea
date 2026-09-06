@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { SLASH_HELP } from './chatActions';
 import Icon from './Icon';
 
-export type ChatMessage = { id: string; role: 'user' | 'bea' | 'system'; text: string };
+export type ChatMessage = { id: string; role: 'user' | 'bea' | 'system'; text: string; chip?: string };
 type Props = {
   messages: ChatMessage[];
   busy: boolean;
@@ -21,7 +21,7 @@ export default function ChatPanel({ messages, busy, hasCustomFormat, onSend, onO
         <p>Ask about this meeting, or use:</p>
         <ul>{SLASH_HELP.map((line) => <li key={line}><code>{line}</code></li>)}</ul>
       </div>}
-      {messages.map((message) => <div key={message.id} className={`chat-message ${message.role}`}>{message.text}</div>)}
+      {messages.map((message) => <div key={message.id} className={`chat-message ${message.role}`}>{message.text}{message.chip && <span className="chat-frame-chip">{message.chip}</span>}</div>)}
       {busy && <div className="chat-message bea chat-busy">Thinking…</div>}
     </div>
     <form className="chat-input-row" onSubmit={(event) => { event.preventDefault(); if (!input.trim() || busy) return; onSend(input); setInput(''); }}>

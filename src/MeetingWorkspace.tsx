@@ -131,11 +131,20 @@ export default function MeetingWorkspace({ meeting, onBack, onNotice, onImport, 
       } catch (error) { setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'system', text: `Could not save: ${String(error)}` }]); }
       return;
     }
-    // plain question → chat_command
+    // plain question → chat_command. A trailing `/vision 320, 480` requests
+    // video frames at those seconds; it is stripped from the question text.
     setChatBusy(true);
+    const visionMatch = input.trim().match(/\s*\/vision\s+([\d\s,]+)\s*$/i);
+    const includeFrames = visionMatch
+      ? visionMatch[1].split(',').map((part) => Number.parseInt(part.trim(), 10)).filter((value) => Number.isFinite(value) && value >= 0)
+      : undefined;
+    const question = visionMatch ? input.trim().slice(0, visionMatch.index).trim() : input.trim();
     try {
-      const answer = await invoke<string>('chat_command', { meetingId: meeting.id, question: input.trim() });
-      setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'bea', text: answer }]);
+      const reply = await invoke<{ answer: string; frames_used: number; mode: string }>('chat_command', { meetingId: meeting.id, question, includeFrames });
+      const chip = reply.mode && reply.frames_used > 0
+        ? `📹 ${reply.frames_used} frame${reply.frames_used === 1 ? '' : 's'} (${reply.mode === 'vision' ? 'vision' : 'OCR fallback'})`
+        : undefined;
+      setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'bea', text: reply.answer, chip }]);
     } catch (error) {
       setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'system', text: `Chat failed: ${String(error)}` }]);
     } finally { setChatBusy(false); }

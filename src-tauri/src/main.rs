@@ -460,7 +460,20 @@ fn extract_frames_command(
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
     let database = open_database(&state.database_path).map_err(command_error)?;
-    let video = list_media_command_inner(&database, &meeting_id)?
+    extract_frames_inner(&root, &database, &meeting_id, &timestamps)
+}
+
+/// Shared frame-extraction logic used by `extract_frames_command` and by the
+/// chat/minutes commands that want visual context. Grabs one JPEG per
+/// requested timestamp (cached on disk) and OCRs each frame so callers can
+/// fall back to text when the model has no vision.
+fn extract_frames_inner(
+    root: &std::path::Path,
+    database: &rusqlite::Connection,
+    meeting_id: &str,
+    timestamps: &[u64],
+) -> Result<Vec<ExtractedFrame>, String> {
+    let video = list_media_command_inner(database, meeting_id)?
         .into_iter()
         .find(|media| matches!(media.kind, MediaKind::Video))
         .ok_or_else(|| "this meeting has no video source".to_string())?;
@@ -474,6 +487,7 @@ fn extract_frames_command(
     };
     let mut frames = Vec::new();
     for ts in timestamps {
+        let ts = *ts;
         let path = out_dir.join(format!("frame-{ts:06}.jpg"));
         if !path.exists() {
             let args = vec![
@@ -512,6 +526,41 @@ fn extract_frames_command(
         });
     }
     Ok(frames)
+}
+
+/// Builds the OCR-context block appended to prompts when the selected model
+/// cannot see images. Empty when no frame carried OCR text.
+fn ocr_context_block(frames: &[ExtractedFrame]) -> String {
+    let entries: Vec<String> = frames
+        .iter()
+        .filter_map(|frame| {
+            frame
+                .ocr_text
+                .as_deref()
+                .map(|text| format!("[{}s] {}", frame.timestamp_seconds, text.trim()))
+        })
+        .collect();
+    if entries.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n=== VISUAL CONTEXT (OCR of requested frames) ===\n{}\n",
+            entries.join("\n---\n")
+        )
+    }
+}
+
+/// Extracts the requested frames and returns them plus the OCR context block
+/// for the non-vision path. Shared by chat and minutes generation.
+fn gather_visual_context(
+    root: &std::path::Path,
+    database: &rusqlite::Connection,
+    meeting_id: &str,
+    timestamps: &[u64],
+) -> Result<(Vec<ExtractedFrame>, String), String> {
+    let frames = extract_frames_inner(root, database, meeting_id, timestamps)?;
+    let ocr_block = ocr_context_block(&frames);
+    Ok((frames, ocr_block))
 }
 
 #[tauri::command]
@@ -1079,7 +1128,8 @@ async fn chat_command(
     state: State<'_, AppState>,
     meeting_id: String,
     question: String,
-) -> Result<String, String> {
+    include_frames: Option<Vec<u64>>,
+) -> Result<serde_json::Value, String> {
     if question.trim().is_empty() {
         return Err("a question is required".into());
     }
@@ -1143,21 +1193,67 @@ async fn chat_command(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    // Visual context: extract the requested frames either as images (vision
+    // models) or as OCR text (fallback). Frames dedupe via the disk cache, and
+    // the per-request cap keeps token costs bounded.
+    let mut vision_images: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut ocr_block = String::new();
+    let mut mode = String::new();
+    let mut frames_used = 0usize;
+    if let Some(timestamps) = include_frames.filter(|list| !list.is_empty()) {
+        let root = state
+            .database_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        let (frames, block) =
+            gather_visual_context(&root, &database, &meeting_id, &timestamps)?;
+        let vision_capable = meeting_vision_capable(
+            &database,
+            &meeting_id,
+            &provider.kind,
+            &provider.model,
+        );
+        frames_used = frames.len();
+        if vision_capable {
+            mode = "vision".into();
+            vision_images = frames
+                .iter()
+                .map(|frame| (std::path::PathBuf::from(&frame.path), String::new()))
+                .collect();
+        } else {
+            mode = "ocr".into();
+            ocr_block = block;
+        }
+    }
     let system = format!(
-        "You are Bea, an assistant answering questions about one meeting.\n{meeting_context}\nAnswer using ONLY the transcript and notes below. Cite speaker names and timestamps. If the answer is not in the material, say so plainly.\n\n=== MEETING NOTES (user-added clarifications/context) ===\n{}\n\n=== MEETING LEDGER ===\n{}\n\n=== FULL TRANSCRIPT ===\n{raw_transcript}",
+        "You are Bea, an assistant answering questions about one meeting.\n{meeting_context}\nAnswer using ONLY the transcript, notes, and any visual context below. Cite speaker names and timestamps. If the answer is not in the material, say so plainly.\n\n=== MEETING NOTES (user-added clarifications/context) ===\n{}\n\n=== MEETING LEDGER ===\n{}\n\n=== FULL TRANSCRIPT ===\n{raw_transcript}{ocr_block}",
         list_context_events_payload(&database, &meeting_id)?,
         serde_json::to_string(&pack.events).map_err(command_error)?
     );
-    let request = bea_core::LlmRequest {
-        model: provider.model.clone(),
-        system,
-        user: question.trim().to_string(),
-        json_schema: String::new(),
-        max_output_tokens: 1_500,
-    };
-    let answer = bea_core::call_provider_text(&provider, &request, Some(&api_key))
+    let answer = if vision_images.is_empty() {
+        let request = bea_core::LlmRequest {
+            model: provider.model.clone(),
+            system,
+            user: question.trim().to_string(),
+            json_schema: String::new(),
+            max_output_tokens: 1_500,
+        };
+        bea_core::call_provider_text(&provider, &request, Some(&api_key))
+            .await
+            .map_err(command_error)?
+    } else {
+        bea_core::call_provider_messages(
+            &provider,
+            &system,
+            question.trim(),
+            &vision_images,
+            1_500,
+            Some(&api_key),
+        )
         .await
-        .map_err(command_error)?;
+        .map_err(command_error)?
+    };
     // Persist the Q&A pair so it survives restarts and feeds future minutes.
     add_context_event_command_inner(
         &database,
@@ -1165,7 +1261,11 @@ async fn chat_command(
         "chat",
         &format!("Q: {}\nA: {}", question.trim(), answer),
     )?;
-    Ok(answer)
+    Ok(serde_json::json!({
+        "answer": answer,
+        "frames_used": frames_used,
+        "mode": mode,
+    }))
 }
 
 #[derive(serde::Serialize, Clone)]
