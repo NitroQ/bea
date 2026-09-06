@@ -14,6 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod updater;
 pub mod vtt;
 
 const CHUNK_SECONDS: u64 = 60;
@@ -146,10 +147,19 @@ pub struct LedgerEvent {
     pub evidence: Vec<Evidence>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgendaItem {
+    pub heading: String,
+    pub start_seconds: Option<u64>,
+    pub end_seconds: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Minutes {
     pub title: String,
     pub summary: String,
+    #[serde(default)]
+    pub agenda: Vec<AgendaItem>,
     pub decisions: Vec<LedgerEvent>,
     pub action_items: Vec<LedgerEvent>,
     pub unresolved: Vec<LedgerEvent>,
@@ -3641,6 +3651,7 @@ pub fn generate_minutes(title: &str, events: &[LedgerEvent]) -> Minutes {
     Minutes {
         title: title.to_string(),
         summary,
+        agenda: Vec::new(),
         decisions,
         action_items,
         unresolved,
@@ -3721,6 +3732,17 @@ pub fn export_markdown(minutes: &Minutes) -> String {
         "# Minutes of the Meeting\n\n## {}\n\n{}\n",
         minutes.title, minutes.summary
     );
+    if !minutes.agenda.is_empty() {
+        out.push_str("## Agenda\n");
+        for item in &minutes.agenda {
+            let span = match (item.start_seconds, item.end_seconds) {
+                (Some(start), Some(end)) => format!(" ({:02}:{:02}\u{2013}{:02}:{:02})", start / 60, start % 60, end / 60, end % 60),
+                _ => String::new(),
+            };
+            out.push_str(&format!("- {}{}\n", item.heading, span));
+        }
+        out.push('\n');
+    }
     append_events(&mut out, "Decisions", &minutes.decisions);
     append_events(&mut out, "Action Items", &minutes.action_items);
     append_events(&mut out, "Unresolved Matters", &minutes.unresolved);
@@ -3929,6 +3951,25 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
+    #[test]
+    fn minutes_serializes_agenda_and_exports_it() {
+        let minutes = Minutes {
+            title: "Weekly sync".into(),
+            summary: "Summary.".into(),
+            agenda: vec![AgendaItem { heading: "Budget review".into(), start_seconds: Some(120), end_seconds: Some(600) }],
+            decisions: vec![],
+            action_items: vec![],
+            unresolved: vec![],
+        };
+        let json = serde_json::to_string(&minutes).unwrap();
+        assert!(json.contains("\"agenda\""));
+        // Old saved minutes without an agenda still deserialize.
+        let old: Minutes = serde_json::from_str(r#"{"title":"T","summary":"S","decisions":[],"action_items":[],"unresolved":[]}"#).unwrap();
+        assert!(old.agenda.is_empty());
+        let markdown = export_markdown(&minutes);
+        assert!(markdown.contains("## Agenda"));
+        assert!(markdown.contains("Budget review"));
+    }
     #[test]
     fn chat_context_includes_speaker_names_and_custom_format() {
         let context = build_meeting_context(

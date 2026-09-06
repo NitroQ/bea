@@ -4,7 +4,8 @@ export type AsrEngineId = 'qwen-standard' | 'whisper-compatibility' | 'nemotron-
 export type Meeting = { id: string; title: string; status: MeetingStatus; duration_seconds: number; language: TranscriptLanguage; created_at: string; asr_engine_id?: AsrEngineId; last_opened_at?: string };
 export type Evidence = { start_seconds: number; end_seconds: number; quote: string };
 export type LedgerEvent = { kind: string; summary: string; owner?: string | null; due?: string | null; confidence: number; evidence: Evidence[] };
-export type Minutes = { title: string; summary: string; decisions: LedgerEvent[]; action_items: LedgerEvent[]; unresolved: LedgerEvent[] };
+export type AgendaItem = { heading: string; start_seconds?: number | null; end_seconds?: number | null };
+export type Minutes = { title: string; summary: string; agenda: AgendaItem[]; decisions: LedgerEvent[]; action_items: LedgerEvent[]; unresolved: LedgerEvent[] };
 export type TranscriptSegment = { id: string; meeting_id: string; start_seconds: number; end_seconds: number; text: string; language_detected?: string | null; language_confidence?: number | null; speaker?: number | null };
 export const SILENCE_TEXT = '[silence]';
 export const isSilenceSegment = (segment: TranscriptSegment) => segment.text.trim() === SILENCE_TEXT;
