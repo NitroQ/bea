@@ -7,11 +7,14 @@ type Props = {
   messages: ChatMessage[];
   busy: boolean;
   hasCustomFormat: boolean;
+  meetingModel: string;
+  modelOptions: string[];
+  onModelChange: (model: string) => void;
   onSend: (input: string) => void;
   onOpenCustomFormat: () => void;
 };
 
-export default function ChatPanel({ messages, busy, hasCustomFormat, onSend, onOpenCustomFormat }: Props) {
+export default function ChatPanel({ messages, busy, hasCustomFormat, meetingModel, modelOptions, onModelChange, onSend, onOpenCustomFormat }: Props) {
   const [input, setInput] = useState('');
   const [menuOpen, setMenuOpen] = useState(false);
   const logRef = useRef<HTMLDivElement | null>(null);
@@ -37,6 +40,13 @@ export default function ChatPanel({ messages, busy, hasCustomFormat, onSend, onO
       {busy && <div className="chat-message bea chat-busy">Thinking…</div>}
     </div>
     <div className="chat-command-row">
+      <label className="chat-model-select" title="Model for this meeting — leave empty to use the Settings default">
+        <select value={meetingModel} onChange={(event) => onModelChange(event.target.value)} aria-label="Model for this meeting">
+          <option value="">Default model (Settings)</option>
+          {modelOptions.filter((id) => id !== meetingModel).map((id) => <option key={id} value={id}>{id}</option>)}
+          {meetingModel && !modelOptions.includes(meetingModel) && <option value={meetingModel}>{meetingModel}</option>}
+        </select>
+      </label>
       <button type="button" className="secondary small" onClick={onOpenCustomFormat} title="Custom minutes format">
         <Icon name="file" size={14} />{hasCustomFormat ? 'Format set' : '/custom'}
       </button>

@@ -1223,8 +1223,10 @@ async fn generate_minutes_command(
                     }
                 }
                 let pack = bea_core::pack_context_mode(&events, 12_000, ContextMode::Balanced);
+                let effective_model =
+                    effective_meeting_model(&database, &meeting_id, &provider.model);
                 let request = LlmRequest {
-                    model: provider.model.clone(),
+                    model: effective_model,
                     system: format!("{}\n{}", MEETING_SECRETARY_SYSTEM_PROMPT, meeting_context),
                     user: serde_json::to_string(&pack.events).map_err(command_error)?,
                     json_schema: r#"{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"agenda":{"type":"array","items":{"type":"object","properties":{"heading":{"type":"string"},"start_seconds":{"type":"number"},"end_seconds":{"type":"number"}},"required":["heading"]}},"visual_observations":{"type":"array","items":{"type":"string"}},"decisions":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"action_items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"unresolved":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}}},"required":["title","summary","decisions","action_items","unresolved"]}"#.into(),
@@ -1548,7 +1550,7 @@ async fn chat_command(
     );
     let answer = if vision_images.is_empty() {
         let request = bea_core::LlmRequest {
-            model: provider.model.clone(),
+            model: effective_meeting_model(&database, &meeting_id, &provider.model),
             system,
             user: question.trim().to_string(),
             json_schema: String::new(),
@@ -2295,6 +2297,53 @@ fn meeting_vision_capable(
     ]
     .iter()
     .any(|marker| model.contains(marker))
+}
+
+/// Resolves the model a meeting's LLM calls should use: the per-meeting
+/// override when set (chat tab model picker), otherwise the provider default
+/// from Settings.
+fn effective_meeting_model(
+    database: &rusqlite::Connection,
+    meeting_id: &str,
+    provider_model: &str,
+) -> String {
+    bea_core::get_app_setting(database, &format!("meeting_model:{meeting_id}"))
+        .ok()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| provider_model.to_string())
+}
+
+#[tauri::command]
+fn set_meeting_model_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    model: String,
+) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    bea_core::set_app_setting(
+        &database,
+        &format!("meeting_model:{meeting_id}"),
+        model.trim(),
+    )
+    .map_err(command_error)
+}
+
+/// Returns the meeting's model override; empty string means "use the provider
+/// default".
+#[tauri::command]
+fn get_meeting_model_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<String, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    Ok(bea_core::get_app_setting(
+        &database,
+        &format!("meeting_model:{meeting_id}"),
+    )
+    .map_err(command_error)?
+    .unwrap_or_default())
 }
 
 #[tauri::command]
@@ -3187,6 +3236,8 @@ fn main() {
             discover_provider_models_command,
             fetch_openrouter_models_command,
             set_meeting_vision_flag_command,
+            set_meeting_model_command,
+            get_meeting_model_command,
             inspect_model_package_command,
             install_model_command,
             download_model_command,
