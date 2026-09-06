@@ -575,6 +575,174 @@ fn keyring_secret(provider: &ProviderConfig) -> Option<String> {
     Entry::new("bea-provider", id).ok()?.get_password().ok()
 }
 
+const CODEX_KEYRING_ID: &str = "codex-oauth";
+const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+
+fn load_codex_tokens() -> Option<bea_core::codex_oauth::CodexTokens> {
+    let raw = Entry::new("bea-provider", CODEX_KEYRING_ID).ok()?.get_password().ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn store_codex_tokens(tokens: &bea_core::codex_oauth::CodexTokens) -> Result<(), String> {
+    let entry = Entry::new("bea-provider", CODEX_KEYRING_ID).map_err(command_error)?;
+    entry
+        .set_password(&serde_json::to_string(tokens).map_err(command_error)?)
+        .map_err(command_error)
+}
+
+async fn exchange_codex_code(code: &str, verifier: &str) -> Result<bea_core::codex_oauth::CodexTokens, String> {
+    let response = reqwest::Client::new()
+        .post(CODEX_TOKEN_URL)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(bea_core::codex_oauth::token_exchange_body(code, verifier))
+        .send()
+        .await
+        .map_err(command_error)?
+        .error_for_status()
+        .map_err(command_error)?;
+    let payload: serde_json::Value = response.json().await.map_err(command_error)?;
+    let account_id = payload
+        .get("https://api.openai.com/auth")
+        .and_then(|value| value.get("chatgpt_account_id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok(bea_core::codex_oauth::CodexTokens {
+        access_token: payload["access_token"]
+            .as_str()
+            .ok_or("token response missing access_token")?
+            .to_string(),
+        refresh_token: payload["refresh_token"]
+            .as_str()
+            .ok_or("token response missing refresh_token")?
+            .to_string(),
+        expires_at: chrono::Utc::now().timestamp()
+            + payload["expires_in"]
+                .as_i64()
+                .ok_or("token response missing expires_in")?,
+        account_id,
+    })
+}
+
+/// Returns a valid access token, refreshing via the stored refresh token when
+/// the current one is within 60 seconds of expiry.
+async fn fresh_codex_access_token() -> Result<String, String> {
+    let tokens = load_codex_tokens()
+        .ok_or("no ChatGPT sign-in — click Sign in with ChatGPT first")?;
+    if tokens.expires_at - 60 > chrono::Utc::now().timestamp() {
+        return Ok(tokens.access_token);
+    }
+    let response = reqwest::Client::new()
+        .post(CODEX_TOKEN_URL)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(bea_core::codex_oauth::token_refresh_body(&tokens.refresh_token))
+        .send()
+        .await
+        .map_err(command_error)?
+        .error_for_status()
+        .map_err(command_error)?;
+    let payload: serde_json::Value = response.json().await.map_err(command_error)?;
+    let updated = bea_core::codex_oauth::CodexTokens {
+        access_token: payload["access_token"]
+            .as_str()
+            .ok_or("refresh response missing access_token")?
+            .to_string(),
+        refresh_token: payload["refresh_token"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or(tokens.refresh_token.clone()),
+        expires_at: chrono::Utc::now().timestamp()
+            + payload["expires_in"].as_i64().unwrap_or(3600),
+        account_id: tokens.account_id.clone(),
+    };
+    store_codex_tokens(&updated)?;
+    Ok(updated.access_token)
+}
+
+#[tauri::command]
+async fn codex_oauth_login_command() -> Result<(), String> {
+    use std::io::Read;
+    let verifier = bea_core::codex_oauth::pkce_verifier();
+    let url = bea_core::codex_oauth::authorize_url(&verifier);
+    // Open the default browser on the Windows host.
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", &url])
+        .spawn()
+        .map_err(|e| format!("could not open the browser: {e}"))?;
+    let code = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:1455")
+            .map_err(|e| format!("port 1455 unavailable (another login is running?): {e}"))?;
+        let (mut stream, _) = listener.accept().map_err(|e| e.to_string())?;
+        let mut buffer = [0u8; 4096];
+        let read = stream.read(&mut buffer).map_err(|e| e.to_string())?;
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body style='font-family:sans-serif'><h2>Bea is connected.</h2>You can close this tab.</body></html>",
+        );
+        // Request line: GET /auth/callback?code=...&state=... HTTP/1.1
+        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+        let line = request.lines().next().unwrap_or_default();
+        let code = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|path| path.split("code=").nth(1))
+            .and_then(|rest| rest.split('&').next())
+            .ok_or_else(|| "callback contained no authorization code".to_string())?
+            .to_string();
+        Ok(code)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let tokens = exchange_codex_code(&code, &verifier).await?;
+    store_codex_tokens(&tokens)
+}
+
+#[tauri::command]
+fn codex_oauth_status_command() -> Result<bool, String> {
+    Ok(load_codex_tokens()
+        .map(|t| t.expires_at - 60 > chrono::Utc::now().timestamp())
+        .unwrap_or(false))
+}
+
+#[tauri::command]
+fn codex_oauth_sign_out_command() -> Result<(), String> {
+    if let Ok(entry) = Entry::new("bea-provider", CODEX_KEYRING_ID) {
+        let _ = entry.delete_credential();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn codex_list_models_command() -> Result<Vec<String>, String> {
+    let token = fresh_codex_access_token().await?;
+    let response = reqwest::Client::new()
+        .get(format!("{}/models", bea_core::codex_oauth::CHATGPT_API_BASE))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(command_error)?;
+    // The Codex backend may not publish a catalog; an empty list tells the
+    // UI to fall back to the static model list.
+    if !response.status().is_success() {
+        return Ok(vec![]);
+    }
+    let payload: serde_json::Value = response.json().await.map_err(command_error)?;
+    Ok(payload
+        .get("data")
+        .and_then(|value| value.as_array())
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| {
+                    model
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 #[tauri::command]
 fn preview_provider_context_command(
     state: State<'_, AppState>,
@@ -612,7 +780,14 @@ async fn generate_minutes_command(
     let mut minutes = local_minutes.clone();
     if let Some(provider) = load_provider(&database, "primary").map_err(command_error)? {
         if provider.enabled {
-            if let Some(api_key) = keyring_secret(&provider) {
+            // Local servers take no auth; OAuth providers resolve a fresh
+            // access token; keyring providers read their API key.
+            let api_key = if provider.kind == bea_core::ProviderKind::OpenAiOAuth {
+                fresh_codex_access_token().await.ok()
+            } else {
+                keyring_secret(&provider)
+            };
+            if let Some(api_key) = api_key {
                 let speaker_names =
                     bea_core::list_speaker_names(&database, &meeting_id).unwrap_or_default();
                 let custom_format = bea_core::get_app_setting(
@@ -818,9 +993,13 @@ async fn chat_command(
         .filter(|provider| provider.enabled);
     let provider =
         provider.ok_or_else(|| "a verified provider is required for chat".to_string())?;
-    let api_key = keyring_secret(&provider).ok_or_else(|| {
-        "provider API key is missing — re-verify the connection in Settings".to_string()
-    })?;
+    let api_key = if provider.kind == bea_core::ProviderKind::OpenAiOAuth {
+        fresh_codex_access_token().await?
+    } else {
+        keyring_secret(&provider).ok_or_else(|| {
+            "provider API key is missing — re-verify the connection in Settings".to_string()
+        })?
+    };
     let transcript = list_transcript(&database, &meeting_id).map_err(command_error)?;
     if transcript.is_empty() {
         return Err("there is no transcript to ask about yet".into());
@@ -910,8 +1089,11 @@ async fn suggest_clarifications_command(
         .filter(|provider| provider.enabled);
     let provider =
         provider.ok_or_else(|| "a verified provider is required for clarifications".to_string())?;
-    let api_key =
-        keyring_secret(&provider).ok_or_else(|| "provider API key is missing".to_string())?;
+    let api_key = if provider.kind == bea_core::ProviderKind::OpenAiOAuth {
+        fresh_codex_access_token().await?
+    } else {
+        keyring_secret(&provider).ok_or_else(|| "provider API key is missing".to_string())?
+    };
     let transcript = list_transcript(&database, &meeting_id).map_err(command_error)?;
     if transcript.is_empty() {
         return Err("a transcript is required before clarifications can be suggested".into());
@@ -1356,7 +1538,14 @@ fn setup_status_command(state: State<'_, AppState>) -> Result<SetupSnapshot, Str
     );
     let provider_verified = provider
         .as_ref()
-        .map(|value| value.enabled && keyring_secret(value).is_some())
+        .map(|value| {
+            value.enabled
+                && if value.kind == bea_core::ProviderKind::OpenAiOAuth {
+                    load_codex_tokens().is_some()
+                } else {
+                    keyring_secret(value).is_some()
+                }
+        })
         .unwrap_or(false);
     Ok(SetupSnapshot {
         runtime,
@@ -2393,6 +2582,10 @@ fn main() {
             load_provider_command,
             save_provider_command,
             save_provider_secure_command,
+            codex_oauth_login_command,
+            codex_oauth_status_command,
+            codex_oauth_sign_out_command,
+            codex_list_models_command,
             list_audio_input_devices_command,
             start_recording_command,
             pause_recording_command,
