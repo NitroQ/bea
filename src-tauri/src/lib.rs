@@ -3809,35 +3809,47 @@ pub fn generate_minutes(title: &str, events: &[LedgerEvent]) -> Minutes {
     let summary = if decisions.is_empty() && action_items.is_empty() && unresolved.is_empty() {
         format!("Meeting discussion for {title}. No formal decisions or action items recorded.")
     } else {
-        let mut parts = vec![format!("Executive summary for {title}.")];
+        // A fallback summary must state WHAT was decided/assigned, not just
+        // count entries — counts tell the reader nothing.
+        let mut parts: Vec<String> = Vec::new();
         if !decisions.is_empty() {
-            let decision_count = decisions.len();
-            let noun = if decision_count == 1 {
-                "decision"
+            let heads: Vec<String> = decisions
+                .iter()
+                .take(2)
+                .map(|d| d.summary.trim_end_matches('.').to_string())
+                .collect();
+            let more = if decisions.len() > 2 {
+                format!(" (+{} more)", decisions.len() - 2)
             } else {
-                "decisions"
+                String::new()
             };
-            parts.push(format!("{decision_count} key {noun} recorded."));
+            parts.push(format!("Decided: {}{more}.", heads.join("; ")));
         }
         if !action_items.is_empty() {
-            let action_count = action_items.len();
-            let noun = if action_count == 1 {
-                "action item"
+            let heads: Vec<String> = action_items
+                .iter()
+                .take(2)
+                .map(|a| a.summary.trim_end_matches('.').to_string())
+                .collect();
+            let more = if action_items.len() > 2 {
+                format!(" (+{} more)", action_items.len() - 2)
             } else {
-                "action items"
+                String::new()
             };
-            parts.push(format!("{action_count} {noun} identified."));
+            parts.push(format!("Action items: {}{more}.", heads.join("; ")));
         }
         if !unresolved.is_empty() {
-            let open_count = unresolved.len();
-            let (noun, verb) = if open_count == 1 {
-                ("item", "remains")
+            let heads: Vec<String> = unresolved
+                .iter()
+                .take(1)
+                .map(|u| u.summary.trim_end_matches('.').to_string())
+                .collect();
+            let more = if unresolved.len() > 1 {
+                format!(" (+{} more)", unresolved.len() - 1)
             } else {
-                ("items", "remain")
+                String::new()
             };
-            parts.push(format!(
-                "{open_count} open {noun} {verb} pending further review."
-            ));
+            parts.push(format!("Still open: {}{more}.", heads.join("; ")));
         }
         parts.join(" ")
     };
@@ -4397,6 +4409,33 @@ mod tests {
         let minutes = generate_minutes("Planning", &[]);
         save_minutes(&c, &m.id, &minutes).unwrap();
         assert_eq!(load_minutes(&c, &m.id).unwrap().unwrap(), minutes);
+    }
+    #[test]
+    fn fallback_summary_states_outcomes_not_counts() {
+        let events = vec![
+            LedgerEvent {
+                kind: "decision".into(),
+                summary: "The passing grade is set to 2.0".into(),
+                owner: None,
+                due: None,
+                confidence: 0.85,
+                evidence: vec![Evidence { start_seconds: 10, end_seconds: 20, quote: "q".into() }],
+            },
+            LedgerEvent {
+                kind: "action".into(),
+                summary: "Submit the revision to CHED".into(),
+                owner: None,
+                due: None,
+                confidence: 0.8,
+                evidence: vec![Evidence { start_seconds: 30, end_seconds: 40, quote: "q".into() }],
+            },
+        ];
+        let minutes = generate_minutes("Council", &events);
+        assert!(minutes.summary.contains("Decided: The passing grade is set to 2.0"), "summary: {}", minutes.summary);
+        assert!(minutes.summary.contains("Action items: Submit the revision to CHED"), "summary: {}", minutes.summary);
+        assert!(!minutes.summary.contains("1 key decision recorded"), "count-template must be gone");
+        let empty = generate_minutes("Empty", &[]);
+        assert!(empty.summary.contains("No formal decisions"));
     }
     #[test]
     fn meeting_crud_and_pause_state_survive_database_round_trip() {
