@@ -675,6 +675,228 @@ fn list_speaker_names_command(
     Ok(names)
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ContextEventRow {
+    id: String,
+    meeting_id: String,
+    kind: String,
+    payload: String,
+    created_at: String,
+}
+
+fn add_context_event_command_inner(
+    database: &rusqlite::Connection,
+    meeting_id: &str,
+    kind: &str,
+    payload: &str,
+) -> Result<ContextEventRow, String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let created_at = chrono::Utc::now().to_rfc3339();
+    database
+        .execute(
+            "INSERT INTO context_events(id,meeting_id,kind,payload,confidence,created_at) VALUES (?1,?2,?3,?4,1.0,?5)",
+            rusqlite::params![id, meeting_id, kind, payload, created_at],
+        )
+        .map_err(command_error)?;
+    Ok(ContextEventRow { id, meeting_id: meeting_id.into(), kind: kind.into(), payload: payload.into(), created_at })
+}
+
+#[tauri::command]
+fn add_context_event_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    kind: String,
+    payload: String,
+) -> Result<ContextEventRow, String> {
+    if !matches!(kind.as_str(), "clarify" | "context" | "chat") {
+        return Err("kind must be clarify, context, or chat".into());
+    }
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    add_context_event_command_inner(&database, &meeting_id, &kind, payload.trim())
+}
+
+#[tauri::command]
+fn list_context_events_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<ContextEventRow>, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let mut statement = database
+        .prepare("SELECT id,meeting_id,kind,payload,created_at FROM context_events WHERE meeting_id=?1 ORDER BY created_at, rowid")
+        .map_err(command_error)?;
+    let rows = statement
+        .query_map(rusqlite::params![meeting_id], |row| {
+            Ok(ContextEventRow {
+                id: row.get(0)?,
+                meeting_id: row.get(1)?,
+                kind: row.get(2)?,
+                payload: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })
+        .map_err(command_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(command_error)
+}
+
+#[tauri::command]
+fn delete_context_event_command(
+    state: State<'_, AppState>,
+    event_id: String,
+) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    database
+        .execute("DELETE FROM context_events WHERE id=?1", rusqlite::params![event_id])
+        .map_err(command_error)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn apply_mass_correction_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    find_text: String,
+    replace_text: String,
+) -> Result<u32, String> {
+    if find_text.trim().is_empty() {
+        return Err("find text is required".into());
+    }
+    if find_text == replace_text {
+        return Err("find and replace text are identical".into());
+    }
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let changed = database
+        .execute(
+            "UPDATE transcript_segments SET text=REPLACE(text,?1,?2) WHERE meeting_id=?3 AND text LIKE '%' || ?1 || '%'",
+            rusqlite::params![find_text, replace_text, meeting_id],
+        )
+        .map_err(command_error)? as u32;
+    // Rebuild this meeting's FTS rows so search stays consistent.
+    database
+        .execute(
+            "DELETE FROM transcript_fts WHERE meeting_id=?1",
+            rusqlite::params![meeting_id],
+        )
+        .map_err(command_error)?;
+    database
+        .execute(
+            "INSERT INTO transcript_fts(meeting_id,segment_id,text) SELECT meeting_id,id,text FROM transcript_segments WHERE meeting_id=?1 AND TRIM(text) != '[silence]'",
+            rusqlite::params![meeting_id],
+        )
+        .map_err(command_error)?;
+    Ok(changed)
+}
+
+#[tauri::command]
+async fn chat_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    question: String,
+) -> Result<String, String> {
+    if question.trim().is_empty() {
+        return Err("a question is required".into());
+    }
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let provider = load_provider(&database, "primary")
+        .map_err(command_error)?
+        .filter(|provider| provider.enabled);
+    let provider = provider.ok_or_else(|| "a verified provider is required for chat".to_string())?;
+    let api_key = keyring_secret(&provider)
+        .ok_or_else(|| "provider API key is missing — re-verify the connection in Settings".to_string())?;
+    let transcript = list_transcript(&database, &meeting_id).map_err(command_error)?;
+    if transcript.is_empty() {
+        return Err("there is no transcript to ask about yet".into());
+    }
+    let speaker_names = bea_core::list_speaker_names(&database, &meeting_id).unwrap_or_default();
+    let custom_format = None; // chat does not need the format block
+    let meeting_context = bea_core::build_meeting_context(&speaker_names, custom_format);
+    let events = extract_ledger_events(&transcript);
+    let pack = bea_core::pack_context_mode(&events, 12_000, ContextMode::Balanced);
+    // Transcript dump with speaker names; overlapping-speech segments show
+    // every attached speaker (e.g. "Maria + John").
+    let overlaps = bea_core::list_segment_speakers(&database, &meeting_id).unwrap_or_default();
+    let raw_transcript = transcript
+        .iter()
+        .filter(|segment| segment.text.trim() != "[silence]")
+        .map(|segment| {
+            let who = segment
+                .speaker
+                .and_then(|index| speaker_names.get(&index))
+                .map(|name| name.as_str())
+                .unwrap_or("Speaker ?");
+            let extra = overlaps
+                .get(&segment.id)
+                .map(|indexes| {
+                    indexes
+                        .iter()
+                        .filter(|index| Some(**index) != segment.speaker)
+                        .filter_map(|index| speaker_names.get(index))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let who = if extra.is_empty() {
+                who.to_string()
+            } else {
+                format!("{who} + {}", extra.join(" + "))
+            };
+            format!("[{:02}:{:02}] {}: {}", segment.start_seconds / 60, segment.start_seconds % 60, who, segment.text.trim())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let system = format!(
+        "You are Bea, an assistant answering questions about one meeting.\n{meeting_context}\nAnswer using ONLY the transcript and notes below. Cite speaker names and timestamps. If the answer is not in the material, say so plainly.\n\n=== MEETING NOTES (user-added clarifications/context) ===\n{}\n\n=== MEETING LEDGER ===\n{}\n\n=== FULL TRANSCRIPT ===\n{raw_transcript}",
+        list_context_events_payload(&database, &meeting_id)?,
+        serde_json::to_string(&pack.events).map_err(command_error)?
+    );
+    let request = bea_core::LlmRequest {
+        model: provider.model.clone(),
+        system,
+        user: question.trim().to_string(),
+        json_schema: String::new(),
+        max_output_tokens: 1_500,
+    };
+    let answer = bea_core::call_provider_text(&provider, &request, Some(&api_key))
+        .await
+        .map_err(command_error)?;
+    // Persist the Q&A pair so it survives restarts and feeds future minutes.
+    add_context_event_command_inner(
+        &database,
+        &meeting_id,
+        "chat",
+        &format!("Q: {}\nA: {}", question.trim(), answer),
+    )?;
+    Ok(answer)
+}
+
+#[tauri::command]
+fn save_custom_minutes_format_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    format: String,
+) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    bea_core::set_app_setting(
+        &database,
+        &format!("custom_minutes_format:{meeting_id}"),
+        format.trim(),
+    )
+    .map_err(command_error)
+}
+
+#[tauri::command]
+fn load_custom_minutes_format_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<String, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    Ok(bea_core::get_app_setting(
+        &database,
+        &format!("custom_minutes_format:{meeting_id}"),
+    )
+    .map_err(command_error)?
+    .unwrap_or_default())
+}
+
 #[tauri::command]
 fn assign_segment_speaker_command(
     state: State<'_, AppState>,
@@ -1959,6 +2181,13 @@ fn main() {
             assign_segment_speaker_command,
             set_segment_speakers_command,
             list_segment_speakers_command,
+            add_context_event_command,
+            list_context_events_command,
+            delete_context_event_command,
+            apply_mass_correction_command,
+            chat_command,
+            save_custom_minutes_format_command,
+            load_custom_minutes_format_command,
             process_imported_media_command,
             export_minutes_command,
             inspect_runtime_command,
