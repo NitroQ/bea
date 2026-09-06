@@ -868,6 +868,76 @@ async fn chat_command(
     Ok(answer)
 }
 
+#[derive(serde::Serialize, Clone)]
+struct ClarificationSuggestion {
+    question: String,
+    options: Vec<String>,
+}
+
+#[tauri::command]
+async fn suggest_clarifications_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<ClarificationSuggestion>, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let provider = load_provider(&database, "primary")
+        .map_err(command_error)?
+        .filter(|provider| provider.enabled);
+    let provider = provider.ok_or_else(|| "a verified provider is required for clarifications".to_string())?;
+    let api_key = keyring_secret(&provider).ok_or_else(|| "provider API key is missing".to_string())?;
+    let transcript = list_transcript(&database, &meeting_id).map_err(command_error)?;
+    if transcript.is_empty() {
+        return Err("a transcript is required before clarifications can be suggested".into());
+    }
+    let speaker_names = bea_core::list_speaker_names(&database, &meeting_id).unwrap_or_default();
+    let meeting_context = bea_core::build_meeting_context(&speaker_names, None);
+    // Already-answered clarifications (from /clarify or a previous wizard run)
+    // are shown so the model does not re-ask the same things.
+    let existing = list_context_events_payload(&database, &meeting_id)?;
+    let raw_transcript = transcript
+        .iter()
+        .filter(|segment| segment.text.trim() != "[silence]")
+        .map(|segment| {
+            let who = segment.speaker.and_then(|index| speaker_names.get(&index))
+                .map(|name| name.as_str()).unwrap_or("Speaker ?");
+            format!("[{:02}:{:02}] {}: {}", segment.start_seconds / 60, segment.start_seconds % 60, who, segment.text.trim())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let system = format!(
+        "You review a meeting transcript before formal minutes are written.\n{meeting_context}\nIdentify up to 3 genuine ambiguities that would change the minutes: an unclear decision, an unattributed action item, a vague number/date, or a contradiction. Do NOT ask about procedural noise (greetings, roll call). Each question may have up to 4 candidate answers drawn from the transcript (speaker names, dates, quantities) — leave options empty if free-form input is more natural. Already-recorded notes below must NOT be asked about again.\nReply with STRICT JSON only: {{\"questions\":[{{\"question\":\"...\",\"options\":[\"...\",\"...\"]}}]}}. If nothing is ambiguous, reply {{\"questions\":[]}}.\n\n=== MEETING NOTES ALREADY RECORDED ===\n{existing}\n\n=== TRANSCRIPT ===\n{raw_transcript}"
+    );
+    let request = bea_core::LlmRequest {
+        model: provider.model.clone(),
+        system,
+        user: "List the clarifying questions.".into(),
+        json_schema: String::new(),
+        max_output_tokens: 900,
+    };
+    let raw = bea_core::call_provider_text(&provider, &request, Some(&api_key))
+        .await
+        .map_err(command_error)?;
+    // Parse on the Rust side and return typed suggestions; the same
+    // parseClarificationSuggestions guard also exists in the UI for defense.
+    let parsed: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("clarification suggestions were not valid JSON: {error}"))?;
+    let mut suggestions = Vec::new();
+    if let Some(questions) = parsed.get("questions").and_then(|value| value.as_array()) {
+        for question in questions {
+            let Some(text) = question.get("question").and_then(|value| value.as_str()) else { continue };
+            suggestions.push(ClarificationSuggestion {
+                question: text.to_string(),
+                options: question
+                    .get("options")
+                    .and_then(|value| value.as_array())
+                    .map(|values| values.iter().filter_map(|value| value.as_str().map(str::to_string)).take(4).collect())
+                    .unwrap_or_default(),
+            });
+        }
+    }
+    Ok(suggestions)
+}
+
 #[tauri::command]
 fn save_custom_minutes_format_command(
     state: State<'_, AppState>,
@@ -2145,6 +2215,16 @@ async fn transcribe_recording_command(
     Ok(segments)
 }
 
+#[tauri::command]
+fn check_for_updates_command(app: tauri::AppHandle) -> Result<Option<bea_core::updater::UpdateInfo>, String> {
+    bea_core::updater::check_now(&app)
+}
+
+#[tauri::command]
+fn install_update_command(app: tauri::AppHandle) -> Result<(), String> {
+    bea_core::updater::download_and_install(&app)
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -2155,8 +2235,11 @@ fn main() {
                 recorders: Mutex::new(HashMap::new()),
                 speaker_models_lock: tauri::async_runtime::Mutex::new(()),
             });
+            bea_core::updater::spawn_scheduled_checks(app.handle().clone());
             Ok(())
         })
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             create_meeting_command,
@@ -2187,6 +2270,7 @@ fn main() {
             apply_mass_correction_command,
             chat_command,
             save_custom_minutes_format_command,
+            suggest_clarifications_command,
             load_custom_minutes_format_command,
             process_imported_media_command,
             export_minutes_command,
@@ -2211,7 +2295,9 @@ fn main() {
             pause_recording_command,
             resume_recording_command,
             stop_recording_command,
-            transcribe_recording_command
+            transcribe_recording_command,
+            check_for_updates_command,
+            install_update_command
         ])
         .run(tauri::generate_context!())
         .expect("error while running Bea");
