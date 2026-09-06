@@ -60,7 +60,7 @@ export default function ChatPanel({ messages, busy, hasCustomFormat, meetingMode
       </div>}
     </div>
     <form className="chat-input-row" onSubmit={(event) => { event.preventDefault(); if (!input.trim() || busy) return; onSend(input); setInput(''); setMenuOpen(false); }}>
-      <input ref={inputRef} value={input} onChange={(event) => onInputChange(event.target.value)} placeholder="Ask about the meeting, or /clarify /context /correction /custom" disabled={busy} aria-label="Meeting chat input" />
+      <input ref={inputRef} value={input} onChange={(event) => onInputChange(event.target.value)} placeholder="Ask about the meeting, or /minutes /clarify /context /correction /custom" disabled={busy} aria-label="Meeting chat input" />
       <button type="submit" className="primary" disabled={busy || !input.trim()}><Icon name="arrow-right" size={14} />Send</button>
     </form>
   </div>;

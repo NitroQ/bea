@@ -1,6 +1,6 @@
 export type SlashParse = { action: string | null; arg: string };
 
-const ACTIONS = ['clarify', 'context', 'correction', 'custom'] as const;
+const ACTIONS = ['clarify', 'context', 'correction', 'custom', 'minutes'] as const;
 
 export function parseSlashCommand(input: string): SlashParse {
   const trimmed = input.trim();
@@ -17,6 +17,7 @@ export function parseSlashCommand(input: string): SlashParse {
 }
 
 export const SLASH_COMMANDS = [
+  { name: '/minutes', description: 'Change the minutes: /minutes add an agenda item about X' },
   { name: '/clarify', description: 'Add a clarification minutes should honor' },
   { name: '/context', description: 'Add background context the transcript lacks' },
   { name: '/correction', description: 'Fix a name/term across the transcript' },
@@ -25,6 +26,7 @@ export const SLASH_COMMANDS = [
 ];
 
 export const SLASH_HELP = [
+  '/minutes <change> — ask Bea to change the generated minutes (agenda, decisions, action items…)',
   '/clarify <note> — add a clarification Bea should honor in minutes and answers',
   '/context <fact> — add background context the meeting transcript lacks',
   '/correction FIND=>REPLACE — fix a name/term across the whole transcript',

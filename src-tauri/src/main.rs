@@ -1297,6 +1297,59 @@ async fn generate_minutes_command(
 }
 
 #[tauri::command]
+async fn modify_minutes_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    instruction: String,
+) -> Result<bea_core::Minutes, String> {
+    if instruction.trim().is_empty() {
+        return Err("an instruction is required".into());
+    }
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let meeting_id = sanitize_meeting_id(&meeting_id)?;
+    let provider = load_provider(&database, "primary")
+        .map_err(command_error)?
+        .filter(|provider| provider.enabled)
+        .ok_or_else(|| "a verified AI provider is required to modify minutes".to_string())?;
+    let api_key = provider_key(&provider).await?;
+    let current = bea_core::load_minutes(&database, &meeting_id)
+        .map_err(command_error)?
+        .ok_or_else(|| "generate minutes first — there is nothing to modify yet".to_string())?;
+    let context = list_context_events_payload(&database, &meeting_id)?;
+    let effective_model =
+        effective_meeting_model(&database, &meeting_id, &provider.model);
+
+    let system = format!(
+        "{}\n\nThe user reviewed the minutes below and asks for a change. Apply EXACTLY the requested change, keep everything else verbatim (including timestamps and evidence quotes), and return the complete updated JSON matching the schema.\n\nUser instruction: {instruction}\n\nContext notes (clarifications and facts to honor):\n{context}",
+        MEETING_SECRETARY_SYSTEM_PROMPT
+    );
+    let request = LlmRequest {
+        model: effective_model,
+        system,
+        user: serde_json::to_string(&current).map_err(command_error)?,
+        json_schema: r#"{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"agenda":{"type":"array","items":{"type":"object","properties":{"heading":{"type":"string"},"start_seconds":{"type":"number"},"end_seconds":{"type":"number"}},"required":["heading"]}},"visual_observations":{"type":"array","items":{"type":"string"}},"decisions":{"type":"array"},"action_items":{"type":"array"},"unresolved":{"type":"array"}},"required":["title","summary","decisions","action_items"]}"#.to_string(),
+        max_output_tokens: 4096,
+    };
+    let text = bea_core::call_provider_text(&provider, &request, Some(&api_key))
+        .await
+        .map_err(command_error)?;
+    let minutes = bea_core::parse_minutes_json(&text).map_err(command_error)?;
+    bea_core::save_minutes(&database, &meeting_id, &minutes).map_err(command_error)?;
+    Ok(minutes)
+}
+
+/// Resolves the API key for a provider (OAuth refresh or keyring), shared by
+/// the minutes/chat commands.
+async fn provider_key(provider: &ProviderConfig) -> Result<String, String> {
+    if provider.kind == bea_core::ProviderKind::OpenAiOAuth {
+        fresh_codex_access_token().await
+    } else {
+        keyring_secret(provider)
+            .ok_or_else(|| "provider API key is missing — re-verify the connection in Settings".to_string())
+    }
+}
+
+#[tauri::command]
 fn set_speaker_name_command(
     state: State<'_, AppState>,
     meeting_id: String,
@@ -3335,6 +3388,7 @@ fn main() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+        modify_minutes_command,
             create_meeting_command,
             list_meetings_command,
             rename_meeting_command,

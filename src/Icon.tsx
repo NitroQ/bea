@@ -2,7 +2,7 @@ import type { ReactElement, SVGProps } from 'react';
 
 export type IconName =
   | 'arrow-left' | 'arrow-right' | 'check' | 'chevron-down' | 'chevron-right'
-  | 'clock' | 'download' | 'file' | 'folder' | 'grid' | 'headphones' | 'image'
+  | 'clock' | 'list' | 'download' | 'file' | 'folder' | 'grid' | 'headphones' | 'image'
   | 'mic' | 'more' | 'pause' | 'play' | 'plus' | 'refresh' | 'search' | 'settings'
   | 'spark' | 'trash' | 'upload' | 'video' | 'waveform' | 'x';
 
@@ -13,6 +13,7 @@ const paths: Record<IconName, ReactElement> = {
   'chevron-down': <path d="m6 9 6 6 6-6" />,
   'chevron-right': <path d="m9 18 6-6-6-6" />,
   clock: <><circle cx="12" cy="12" r="8" /><path d="M12 8v4l3 2" /></>,
+  list: <><path d="M8 6h13M8 12h13M8 18h13" /><circle cx="4" cy="6" r="0.5" fill="currentColor" /><circle cx="4" cy="12" r="0.5" fill="currentColor" /><circle cx="4" cy="18" r="0.5" fill="currentColor" /></>,
   download: <><path d="M12 4v10" /><path d="m8 10 4 4 4-4" /><path d="M5 19h14" /></>,
   file: <><path d="M6 3h8l4 4v14H6z" /><path d="M14 3v5h5" /></>,
   folder: <path d="M3 6h6l2 2h10v10H3z" />,

@@ -7,6 +7,7 @@ describe('slash command parsing', () => {
     expect(parseSlashCommand('/clarify the vote was 5-2')).toEqual({ action: 'clarify', arg: 'the vote was 5-2' });
     expect(parseSlashCommand('/context Q3 budget is frozen')).toEqual({ action: 'context', arg: 'Q3 budget is frozen' });
     expect(parseSlashCommand('/custom')).toEqual({ action: 'custom', arg: '' });
+    expect(parseSlashCommand('/minutes add an agenda item about the budget')).toEqual({ action: 'minutes', arg: 'add an agenda item about the budget' });
   });
   it('treats plain text as a question', () => {
     expect(parseSlashCommand('who owned the hiring decision?')).toEqual({ action: null, arg: 'who owned the hiring decision?' });
