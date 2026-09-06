@@ -46,6 +46,7 @@ const MEETING_SECRETARY_SYSTEM_PROMPT: &str = r#"You are an expert meeting secre
 Rules:
 - summary: a 2-4 sentence executive summary of the whole meeting.
 - decisions / action_items / unresolved: exactly one entry per distinct point; merge duplicates.
+- agenda: the meeting's topics in the order they were discussed, each as a short noun-phrase heading (e.g. "Q3 budget review"); attach start_seconds/end_seconds from the transcript when the topic's discussion span is identifiable. If no agenda structure is discernible, return an empty array.
 - Every item's summary must be ONE concise, capitalized, grammatical headline sentence in English (example: "Admission limits remain at the discretion of the Dean"). NEVER copy raw transcript speech as a summary.
 - Every item's evidence: list the EXACT original quotes with the start_seconds/end_seconds taken from the matching input event. Do not paraphrase quotes or invent timestamps.
 - Exclude procedural noise (motions to approve past minutes, roll call, greetings, filler) from action items and decisions.
@@ -621,7 +622,7 @@ let speaker_names = bea_core::list_speaker_names(&database, &meeting_id).unwrap_
                     model: provider.model.clone(),
                     system: format!("{}\n{}", MEETING_SECRETARY_SYSTEM_PROMPT, meeting_context),
                     user: serde_json::to_string(&pack.events).map_err(command_error)?,
-                    json_schema: r#"{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"decisions":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"action_items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"unresolved":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}}},"required":["title","summary","decisions","action_items","unresolved"]}"#.into(),
+                    json_schema: r#"{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"agenda":{"type":"array","items":{"type":"object","properties":{"heading":{"type":"string"},"start_seconds":{"type":"number"},"end_seconds":{"type":"number"}},"required":["heading"]}},"decisions":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"action_items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"unresolved":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}}},"required":["title","summary","decisions","action_items","unresolved"]}"#.into(),
                     max_output_tokens: 4_000,
                 };
                 if let Ok(remote_minutes) = call_provider(&provider, &request, Some(&api_key)).await
@@ -1422,6 +1423,53 @@ async fn discover_provider_models_command(
                         .get("id")
                         .and_then(|id| id.as_str())
                         .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+#[derive(serde::Serialize, Clone)]
+struct OpenRouterModelInfo {
+    id: String,
+    name: String,
+    context_length: Option<u64>,
+}
+
+#[tauri::command]
+async fn fetch_openrouter_models_command() -> Result<Vec<OpenRouterModelInfo>, String> {
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(command_error)?
+        .get("https://openrouter.ai/api/v1/models")
+        .send()
+        .await
+        .map_err(command_error)?
+        .error_for_status()
+        .map_err(command_error)?;
+    let payload = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(command_error)?;
+    Ok(payload
+        .get("data")
+        .and_then(|value| value.as_array())
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| {
+                    Some(OpenRouterModelInfo {
+                        id: model.get("id")?.as_str()?.to_string(),
+                        name: model
+                            .get("name")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        context_length: model
+                            .get("context_length")
+                            .and_then(|value| value.as_u64()),
+                    })
                 })
                 .collect()
         })
@@ -2281,6 +2329,7 @@ fn main() {
             list_model_catalog_command,
             remove_model_command,
             discover_provider_models_command,
+            fetch_openrouter_models_command,
             inspect_model_package_command,
             install_model_command,
             download_model_command,
