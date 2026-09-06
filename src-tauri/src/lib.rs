@@ -14,6 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod codex_oauth;
 pub mod updater;
 pub mod vtt;
 
@@ -284,14 +285,22 @@ pub enum ProviderKind {
     OpenAiCompatible,
     ClaudeCompatible,
     Local,
+    OpenAiOAuth,
 }
 impl ProviderKind {
+    // LM Studio / Ollama / llama.cpp servers listen without auth; everything
+    // else needs a credential before a connection test can succeed.
+    pub fn requires_api_key(&self) -> bool {
+        !matches!(self, ProviderKind::Local)
+    }
+
     fn as_str(&self) -> &'static str {
         match self {
             Self::OpenRouter => "openrouter",
             Self::OpenAiCompatible => "openai_compatible",
             Self::ClaudeCompatible => "claude_compatible",
             Self::Local => "local",
+            Self::OpenAiOAuth => "openai_oauth",
         }
     }
 }
@@ -2320,7 +2329,10 @@ pub fn set_segment_speakers(
     segment_id: &str,
     speaker_indexes: &[u32],
 ) -> Result<(), BeaError> {
-    conn.execute("DELETE FROM segment_speakers WHERE segment_id=?1", params![segment_id])?;
+    conn.execute(
+        "DELETE FROM segment_speakers WHERE segment_id=?1",
+        params![segment_id],
+    )?;
     for index in speaker_indexes {
         conn.execute(
             "INSERT OR IGNORE INTO segment_speakers(segment_id,meeting_id,speaker_index) SELECT ?1, meeting_id, ?2 FROM transcript_segments WHERE id=?1",
@@ -2896,7 +2908,10 @@ pub fn inspect_asr_model_package(source: impl AsRef<Path>) -> Result<ModelManife
     let (size_bytes, sha256) = package_fingerprint(source)?;
     let (name, languages) = match id.as_str() {
         "qwen3-asr-0.6b-int8" => ("Qwen3-ASR 0.6B INT8", vec!["en", "fil", "taglish"]),
-        "whisper-compatibility" => ("Bea Standard · Whisper Large-v3-Turbo", vec!["multilingual"]),
+        "whisper-compatibility" => (
+            "Bea Standard · Whisper Large-v3-Turbo",
+            vec!["multilingual"],
+        ),
         _ => (
             "Nemotron 3.5 multilingual 0.6B INT8 · 560ms",
             vec!["multilingual"],
@@ -3284,6 +3299,7 @@ pub fn load_provider(conn: &Connection, id: &str) -> Result<Option<ProviderConfi
                 "openai_compatible" => ProviderKind::OpenAiCompatible,
                 "claude_compatible" => ProviderKind::ClaudeCompatible,
                 "local" => ProviderKind::Local,
+                "openai_oauth" => ProviderKind::OpenAiOAuth,
                 _ => ProviderKind::Local,
             };
             ProviderConfig {
@@ -3307,7 +3323,15 @@ pub fn build_provider_request(provider: &ProviderConfig, request: &LlmRequest) -
             format!("{base}/chat/completions")
         }
         ProviderKind::Local => format!("{base}/v1/chat/completions"),
+        ProviderKind::OpenAiOAuth => format!("{base}/responses"),
     };
+    if provider.kind == ProviderKind::OpenAiOAuth {
+        return ProviderRequest {
+            url,
+            model: request.model.clone(),
+            body: codex_oauth::responses_payload(request),
+        };
+    }
     let mut body = serde_json::json!({
         "model": request.model,
         "messages": [
@@ -3391,7 +3415,9 @@ fn parse_provider_minutes_text(text: &str) -> Result<Minutes, BeaError> {
                 ("action_items", "action"),
                 ("unresolved", "unresolved"),
             ] {
-                if let Some(items) = object.get_mut(key).and_then(serde_json::Value::as_array_mut)
+                if let Some(items) = object
+                    .get_mut(key)
+                    .and_then(serde_json::Value::as_array_mut)
                 {
                     for item in items.iter_mut() {
                         if let Some(item_object) = item.as_object_mut() {
@@ -3609,7 +3635,11 @@ fn summarize_segment_text(text: &str, _kind: &str) -> String {
         return clean;
     }
     // Cut at the first hard sentence boundary, keeping the first sentence.
-    if let Some(pos) = clean.find(". ").or_else(|| clean.find("? ")).or_else(|| clean.find("! ")) {
+    if let Some(pos) = clean
+        .find(". ")
+        .or_else(|| clean.find("? "))
+        .or_else(|| clean.find("! "))
+    {
         if pos >= 25 && pos <= 150 {
             return clean[..=pos].trim().to_string();
         }
@@ -3622,9 +3652,21 @@ fn summarize_segment_text(text: &str, _kind: &str) -> String {
 }
 
 pub fn generate_minutes(title: &str, events: &[LedgerEvent]) -> Minutes {
-    let decisions: Vec<LedgerEvent> = events.iter().filter(|e| e.kind == "decision").cloned().collect();
-    let action_items: Vec<LedgerEvent> = events.iter().filter(|e| e.kind == "action").cloned().collect();
-    let unresolved: Vec<LedgerEvent> = events.iter().filter(|e| e.kind == "unresolved").cloned().collect();
+    let decisions: Vec<LedgerEvent> = events
+        .iter()
+        .filter(|e| e.kind == "decision")
+        .cloned()
+        .collect();
+    let action_items: Vec<LedgerEvent> = events
+        .iter()
+        .filter(|e| e.kind == "action")
+        .cloned()
+        .collect();
+    let unresolved: Vec<LedgerEvent> = events
+        .iter()
+        .filter(|e| e.kind == "unresolved")
+        .cloned()
+        .collect();
 
     let summary = if decisions.is_empty() && action_items.is_empty() && unresolved.is_empty() {
         format!("Meeting discussion for {title}. No formal decisions or action items recorded.")
@@ -3632,18 +3674,32 @@ pub fn generate_minutes(title: &str, events: &[LedgerEvent]) -> Minutes {
         let mut parts = vec![format!("Executive summary for {title}.")];
         if !decisions.is_empty() {
             let decision_count = decisions.len();
-            let noun = if decision_count == 1 { "decision" } else { "decisions" };
+            let noun = if decision_count == 1 {
+                "decision"
+            } else {
+                "decisions"
+            };
             parts.push(format!("{decision_count} key {noun} recorded."));
         }
         if !action_items.is_empty() {
             let action_count = action_items.len();
-            let noun = if action_count == 1 { "action item" } else { "action items" };
+            let noun = if action_count == 1 {
+                "action item"
+            } else {
+                "action items"
+            };
             parts.push(format!("{action_count} {noun} identified."));
         }
         if !unresolved.is_empty() {
             let open_count = unresolved.len();
-            let (noun, verb) = if open_count == 1 { ("item", "remains") } else { ("items", "remain") };
-            parts.push(format!("{open_count} open {noun} {verb} pending further review."));
+            let (noun, verb) = if open_count == 1 {
+                ("item", "remains")
+            } else {
+                ("items", "remain")
+            };
+            parts.push(format!(
+                "{open_count} open {noun} {verb} pending further review."
+            ));
         }
         parts.join(" ")
     };
@@ -3736,7 +3792,13 @@ pub fn export_markdown(minutes: &Minutes) -> String {
         out.push_str("## Agenda\n");
         for item in &minutes.agenda {
             let span = match (item.start_seconds, item.end_seconds) {
-                (Some(start), Some(end)) => format!(" ({:02}:{:02}\u{2013}{:02}:{:02})", start / 60, start % 60, end / 60, end % 60),
+                (Some(start), Some(end)) => format!(
+                    " ({:02}:{:02}\u{2013}{:02}:{:02})",
+                    start / 60,
+                    start % 60,
+                    end / 60,
+                    end % 60
+                ),
                 _ => String::new(),
             };
             out.push_str(&format!("- {}{}\n", item.heading, span));
@@ -3956,7 +4018,11 @@ mod tests {
         let minutes = Minutes {
             title: "Weekly sync".into(),
             summary: "Summary.".into(),
-            agenda: vec![AgendaItem { heading: "Budget review".into(), start_seconds: Some(120), end_seconds: Some(600) }],
+            agenda: vec![AgendaItem {
+                heading: "Budget review".into(),
+                start_seconds: Some(120),
+                end_seconds: Some(600),
+            }],
             decisions: vec![],
             action_items: vec![],
             unresolved: vec![],
@@ -3964,7 +4030,10 @@ mod tests {
         let json = serde_json::to_string(&minutes).unwrap();
         assert!(json.contains("\"agenda\""));
         // Old saved minutes without an agenda still deserialize.
-        let old: Minutes = serde_json::from_str(r#"{"title":"T","summary":"S","decisions":[],"action_items":[],"unresolved":[]}"#).unwrap();
+        let old: Minutes = serde_json::from_str(
+            r#"{"title":"T","summary":"S","decisions":[],"action_items":[],"unresolved":[]}"#,
+        )
+        .unwrap();
         assert!(old.agenda.is_empty());
         let markdown = export_markdown(&minutes);
         assert!(markdown.contains("## Agenda"));
@@ -3984,17 +4053,41 @@ mod tests {
         let dir = tempdir().unwrap();
         let c = open_database(dir.path().join("bea.db")).unwrap();
         let m = create_meeting(&c, "Manual speakers", TranscriptLanguage::English).unwrap();
-        let segment = TranscriptSegment { id: "s1".into(), meeting_id: m.id.clone(), start_seconds: 0, end_seconds: 10, text: "We agree in principle".into(), language_detected: None, language_confidence: None, speaker: Some(0) };
+        let segment = TranscriptSegment {
+            id: "s1".into(),
+            meeting_id: m.id.clone(),
+            start_seconds: 0,
+            end_seconds: 10,
+            text: "We agree in principle".into(),
+            language_detected: None,
+            language_confidence: None,
+            speaker: Some(0),
+        };
         add_segment(&c, &segment).unwrap();
         // Overlap: two speakers on one segment.
         set_segment_speakers(&c, "s1", &[0, 1]).unwrap();
-        assert_eq!(list_segment_speakers(&c, &m.id).unwrap().get("s1").map(Vec::as_slice), Some(&[0u32, 1][..]));
+        assert_eq!(
+            list_segment_speakers(&c, &m.id)
+                .unwrap()
+                .get("s1")
+                .map(Vec::as_slice),
+            Some(&[0u32, 1][..])
+        );
         // Clearing back to the primary speaker removes the overlap row.
         set_segment_speakers(&c, "s1", &[]).unwrap();
-        assert!(list_segment_speakers(&c, &m.id).unwrap().get("s1").is_none());
+        assert!(list_segment_speakers(&c, &m.id)
+            .unwrap()
+            .get("s1")
+            .is_none());
         // Renaming a speaker propagates from speaker_names.
         set_speaker_name(&c, &m.id, 0, "Maria Santos").unwrap();
-        assert_eq!(list_speaker_names(&c, &m.id).unwrap().get(&0).map(String::as_str), Some("Maria Santos"));
+        assert_eq!(
+            list_speaker_names(&c, &m.id)
+                .unwrap()
+                .get(&0)
+                .map(String::as_str),
+            Some("Maria Santos")
+        );
     }
     #[test]
     fn speaker_names_round_trip_per_meeting() {
@@ -4322,6 +4415,14 @@ mod tests {
         assert!(pack.estimated_input_tokens > 0);
         assert_eq!(pack.evidence_count, 1);
         assert_eq!(estimate_tokens("1234"), 1);
+    }
+    #[test]
+    fn local_providers_do_not_require_api_keys_but_cloud_ones_do() {
+        assert!(!ProviderKind::Local.requires_api_key());
+        assert!(ProviderKind::OpenRouter.requires_api_key());
+        assert!(ProviderKind::OpenAiCompatible.requires_api_key());
+        assert!(ProviderKind::ClaudeCompatible.requires_api_key());
+        assert!(ProviderKind::OpenAiOAuth.requires_api_key());
     }
     #[test]
     fn provider_requests_are_openai_compatible_and_keep_credentials_out_of_payload() {
