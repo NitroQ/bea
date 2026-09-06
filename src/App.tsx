@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -32,7 +32,8 @@ export default function App() {
   const [setupVerified, setSetupVerified] = useState(() => localStorage.getItem('bea.provider-verified') === 'true');
   const [setupComplete, setSetupComplete] = useState(() => localStorage.getItem('bea.setup-complete') === 'true');
   const [route, setRoute] = useState<{ screen: 'library' | 'meeting' | 'settings'; meetingId?: string }>(() => parseHash());
-  const [librarySelection, setLibrarySelection] = useState<string | null>(() => loadMeetings()[0]?.id ?? null);
+  const lastOpenedRef = useRef<string | null>(null);
+  const [librarySelection, setLibrarySelection] = useState<string | null>(null);
   const [notice, setNotice] = useState('Check the essentials to unlock your meeting library.');
   const [repairing, setRepairing] = useState<Array<'ffmpeg' | 'tesseract'>>([]);
   const [engineProgress, setEngineProgress] = useState<EngineProgress | null>(null);
@@ -73,7 +74,16 @@ export default function App() {
   }, []);
   useEffect(() => { Promise.all([invoke<Meeting[]>('list_meetings_command').catch(() => null), invoke<RuntimeAvailability>('inspect_runtime_command').catch(() => browserFallbackRuntime()), invoke<ProviderConfig | null>('load_provider_command', { providerId: 'primary' }).catch(() => null)]).then(([remoteMeetings, inspected, savedProvider]) => { if (remoteMeetings) { setMeetings(remoteMeetings); saveMeetings(remoteMeetings); } setRuntime(inspected); if (savedProvider) setProvider(savedProvider); }); }, []);
   useEffect(() => { invoke<{ selected_engine: AsrEngineId; setup_complete: boolean; provider_verified: boolean }>('setup_status_command').then((snapshot) => { if (snapshot.selected_engine) { setSelectedEngine(snapshot.selected_engine); localStorage.setItem('bea.selected-engine', snapshot.selected_engine); } setSetupComplete(snapshot.setup_complete); if (snapshot.setup_complete) localStorage.setItem('bea.setup-complete', 'true'); else localStorage.removeItem('bea.setup-complete'); setSetupVerified(snapshot.provider_verified); if (snapshot.provider_verified) localStorage.setItem('bea.provider-verified', 'true'); else localStorage.removeItem('bea.provider-verified'); }).catch(() => undefined); }, []);
-  useEffect(() => { if (route.screen === 'meeting' && selectedMeeting) { setLibrarySelection(selectedMeeting.id); setMeetings((current) => current.map((item) => item.id === selectedMeeting.id ? { ...item, last_opened_at: new Date().toISOString() } : item)); saveMeetings(meetings.map((item) => item.id === selectedMeeting.id ? { ...item, last_opened_at: new Date().toISOString() } : item)); } }, [route.screen, route.meetingId]);
+  useEffect(() => {
+    // Functional update so saveMeetings always persists the *current* meeting
+    // list (a stale snapshot could resurrect deleted meetings). The ref guard
+    // keeps this to one "last opened" write per navigation.
+    if (route.screen !== 'meeting' || !selectedMeeting) return;
+    if (lastOpenedRef.current === selectedMeeting.id) return;
+    lastOpenedRef.current = selectedMeeting.id;
+    setLibrarySelection(selectedMeeting.id);
+    setMeetings((current) => { const next = current.map((item) => item.id === selectedMeeting.id ? { ...item, last_opened_at: new Date().toISOString() } : item); saveMeetings(next); return next; });
+  }, [route.screen, route.meetingId, selectedMeeting]);
 
   const refreshRuntime = useCallback(async () => { try { const inspected = await invoke<RuntimeAvailability>('inspect_runtime_command'); setRuntime(inspected); setNotice('Runtime checks refreshed.'); } catch { setRuntime((current) => current ?? browserFallbackRuntime()); setNotice('Runtime checks will refresh when Bea is running as a desktop app.'); } }, []);
   async function repairTools(ids: Array<'ffmpeg' | 'tesseract'>) {
@@ -143,7 +153,7 @@ export default function App() {
       setEngineProgress(null);
     }
   }
-  async function importEngine(path: string, expectedEngine?: AsrEngineId) { try { const manifest = await invoke<{ id: string; name: string; version: string; size_bytes: number; sha256: string; runtime: string; languages: string[]; installed: boolean }>('inspect_model_package_command', { path }); const id = manifest.id === 'qwen3-asr-0.6b-int8' ? 'qwen-standard' : manifest.id as AsrEngineId; if (expectedEngine && expectedEngine !== id) throw new Error(`This package is ${id}, but ${expectedEngine} is selected.`); const progress = await invoke<{ verified: boolean; bytes_copied: number }>('install_model_command', { source: path, manifest }); if (!progress.verified) throw new Error('Package verification failed'); setInstalledEngines((current) => { const next = current.includes(id) ? current : [...current, id]; localStorage.setItem('bea.installed-engines', JSON.stringify(next)); return next; }); setSelectedEngine(id); setRuntime((current) => ({ ...(current ?? browserFallbackRuntime()), asr_model_available: true, can_transcribe_locally: true })); setNotice(`Installed and verified ${manifest.name}.`); } catch (error) { throw error; } }
+  async function importEngine(path: string, expectedEngine?: AsrEngineId) { const manifest = await invoke<{ id: string; name: string; version: string; size_bytes: number; sha256: string; runtime: string; languages: string[]; installed: boolean }>('inspect_model_package_command', { path }); const id = manifest.id === 'qwen3-asr-0.6b-int8' ? 'qwen-standard' : manifest.id as AsrEngineId; if (expectedEngine && expectedEngine !== id) throw new Error(`This package is ${id}, but ${expectedEngine} is selected.`); const progress = await invoke<{ verified: boolean; bytes_copied: number }>('install_model_command', { source: path, manifest }); if (!progress.verified) throw new Error('Package verification failed'); setInstalledEngines((current) => { const next = current.includes(id) ? current : [...current, id]; localStorage.setItem('bea.installed-engines', JSON.stringify(next)); return next; }); setSelectedEngine(id); setRuntime((current) => ({ ...(current ?? browserFallbackRuntime()), asr_model_available: true, can_transcribe_locally: true })); setNotice(`Installed and verified ${manifest.name}.`); }
   async function testProvider() { setNotice('Testing the provider connection…'); const keyRequired = provider.kind !== 'Local' && provider.kind !== 'OpenAiOAuth'; const persistVerifiedProvider = async () => { const verifiedProvider = { ...provider, enabled: true, credential_ref: keyRequired ? `keyring:${provider.id}` : provider.credential_ref }; setSetupVerified(true); setProvider(verifiedProvider); localStorage.setItem('bea.provider-verified', 'true'); try { if (keyRequired) await invoke('save_provider_secure_command', { provider: verifiedProvider, apiKey }); else await invoke('save_provider_command', { provider: verifiedProvider }); } catch { try { await invoke('save_provider_command', { provider: verifiedProvider }); } catch { /* Browser preview has no Tauri database. */ } } }; try { if (provider.kind === 'OpenAiOAuth') { await invoke('codex_oauth_status_command'); } else { await invoke('test_provider_connection_command', { provider, apiKey }); } await persistVerifiedProvider(); setNotice(keyRequired ? 'Connection verified. API key is stored in Windows Credential Manager, outside SQLite.' : 'Connection verified.'); } catch (error) { const message = String(error); const browserFallback = /not found|unknown command|tauri/i.test(message); if (browserFallback && provider.base_url && provider.model && (keyRequired ? apiKey : true)) { await persistVerifiedProvider(); setNotice('Connection verified for this setup session.'); } else { setSetupVerified(false); setNotice(`Provider test failed: ${message}`); } } }
   function completeSetup() { localStorage.setItem('bea.setup-complete', 'true'); void invoke('complete_setup_command').catch(() => undefined); setSetupComplete(true); window.location.hash = '#library'; setNotice('Workspace ready. Create a meeting to begin.'); }
   async function createMeeting(title: string, language: TranscriptLanguage, engine: AsrEngineId) { let meeting: Meeting; try { meeting = await invoke<Meeting>('create_meeting_command', { title, language, asrEngineId: engine }); } catch { meeting = { id: crypto.randomUUID(), title, status: 'draft', duration_seconds: 0, language, created_at: new Date().toISOString(), asr_engine_id: engine }; } meeting = { ...meeting, asr_engine_id: engine }; setMeetings((current) => { const next = [meeting, ...current]; saveMeetings(next); return next; }); window.location.hash = `#meeting/${meeting.id}`; setNotice('Meeting created. Add a recording or import media to start.'); }
@@ -206,6 +216,7 @@ function parseHash(): { screen: 'library' | 'meeting' | 'settings'; meetingId?: 
 function CodexSignInSettings({ provider, onProviderChange, verified }: { provider: ProviderConfig; onProviderChange: (provider: ProviderConfig) => void; verified: boolean }) {
   const [codexModels, setCodexModels] = useState<string[]>(CODEX_FALLBACK_MODELS);
   const [signingIn, setSigningIn] = useState(false);
+  const [signInError, setSignInError] = useState<string | null>(null);
   useEffect(() => {
     invoke<string[]>('codex_list_models_command')
       .then((models) => { if (models.length) setCodexModels(models); })
@@ -213,10 +224,11 @@ function CodexSignInSettings({ provider, onProviderChange, verified }: { provide
   }, []);
   return <div className="oauth-block">
     <label>Minutes model<select value={provider.model} onChange={(event) => onProviderChange({ ...provider, model: event.target.value })}>{codexModels.map((id) => <option key={id} value={id}>{id}</option>)}</select></label>
-    <button type="button" className="primary" disabled={signingIn} onClick={() => { setSigningIn(true); invoke('codex_oauth_login_command').then(() => onProviderChange({ ...provider, enabled: true })).catch((error) => alert(`Sign-in failed: ${String(error)}`)).finally(() => setSigningIn(false)); }}>
+    <button type="button" className="primary" disabled={signingIn} onClick={() => { setSigningIn(true); setSignInError(null); invoke('codex_oauth_login_command').then(() => onProviderChange({ ...provider, enabled: true })).catch((error) => setSignInError(`Sign-in failed: ${String(error)}`)).finally(() => setSigningIn(false)); }}>
       <Icon name="spark" size={14} />{signingIn ? 'Waiting for browser…' : verified ? 'Re-sign in with ChatGPT' : 'Sign in with ChatGPT'}
     </button>
     <small className="field-help">Uses your ChatGPT/Codex subscription — no API key. Tokens live in Windows Credential Manager.</small>
+    {signInError && <p className="provider-message error">{signInError}</p>}
   </div>;
 }
 

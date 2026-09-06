@@ -14,8 +14,6 @@ type Props = {
 /// The free-text field is always available so the user can go off-menu.
 export default function ClarificationsWizard({ questions, busy, onAnswered, onSkip }: Props) {
   const [answers, setAnswers] = useState<Record<number, string>>({});
-  const current = 0; // all questions on one scrollable card, simplest v1
-  void current;
   return <div className="clarify-wizard">
     <div className="clarify-heading">
       <span className="page-kicker">Before minutes</span>

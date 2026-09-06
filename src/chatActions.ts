@@ -25,6 +25,20 @@ export const SLASH_HELP = [
 
 export type ClarificationQuestion = { question: string; options: string[] };
 
+/// Parses a trailing `/vision 320, 480` suffix from a chat question. Returns
+/// the question with the suffix stripped and the frame seconds (undefined when
+/// no valid suffix is present), so the chat flow never sends raw suffix text.
+export function parseVisionSuffix(input: string): { question: string; includeFrames: number[] | undefined } {
+  const trimmed = input.trim();
+  const match = trimmed.match(/\s*\/vision\s+([\d\s,]+)\s*$/i);
+  if (!match) return { question: trimmed, includeFrames: undefined };
+  const includeFrames = match[1]
+    .split(',')
+    .map((part) => Number.parseInt(part.trim(), 10))
+    .filter((value) => Number.isFinite(value) && value >= 0);
+  return { question: trimmed.slice(0, match.index).trim(), includeFrames };
+}
+
 /// Parses the JSON the model returns for suggested clarifications. Returns []
 /// for any malformed output so the minutes flow never blocks on a bad reply.
 export function parseClarificationSuggestions(raw: string): ClarificationQuestion[] {
