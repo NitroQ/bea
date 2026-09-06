@@ -2131,7 +2131,7 @@ pub struct ContextPack {
 pub fn open_database(path: impl AsRef<Path>) -> Result<Connection, BeaError> {
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, duration_seconds INTEGER NOT NULL DEFAULT 0, language TEXT NOT NULL DEFAULT 'auto', asr_engine_id TEXT NOT NULL DEFAULT 'qwen-standard'); CREATE TABLE IF NOT EXISTS transcript_segments (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, start_seconds INTEGER NOT NULL, end_seconds INTEGER NOT NULL, text TEXT NOT NULL, language_detected TEXT, language_confidence REAL, speaker INTEGER); CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(meeting_id UNINDEXED, segment_id UNINDEXED, text); CREATE TABLE IF NOT EXISTS recording_chunks (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, start_seconds INTEGER NOT NULL, end_seconds INTEGER NOT NULL, path TEXT NOT NULL, state TEXT NOT NULL, UNIQUE(meeting_id, ordinal)); CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, kind TEXT NOT NULL, state TEXT NOT NULL, progress REAL NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, error TEXT); CREATE TABLE IF NOT EXISTS media_sources (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, path TEXT NOT NULL, kind TEXT NOT NULL, duration_seconds INTEGER, copied INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS model_manifests (id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, runtime TEXT NOT NULL, languages TEXT NOT NULL, installed INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS provider_configs (id TEXT PRIMARY KEY, kind TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL, credential_ref TEXT, enabled INTEGER NOT NULL DEFAULT 1); CREATE TABLE IF NOT EXISTS usage_records (id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, estimated_cost REAL, operation TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS ledger_events (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS minutes (meeting_id TEXT PRIMARY KEY REFERENCES meetings(id) ON DELETE CASCADE, payload TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); ")?;
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS participants (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, name TEXT NOT NULL, role TEXT, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS context_events (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, kind TEXT NOT NULL, payload TEXT NOT NULL, confidence REAL NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS topics (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, label TEXT NOT NULL, summary TEXT, start_seconds INTEGER, end_seconds INTEGER); CREATE TABLE IF NOT EXISTS visual_evidence (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, timestamp_seconds INTEGER NOT NULL, path TEXT NOT NULL, thumbnail_path TEXT, ocr_text TEXT, perceptual_hash TEXT NOT NULL, description TEXT); CREATE TABLE IF NOT EXISTS action_items (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, event_id TEXT, owner TEXT, summary TEXT NOT NULL, due TEXT, status TEXT NOT NULL DEFAULT 'open', FOREIGN KEY(event_id) REFERENCES context_events(id) ON DELETE SET NULL); CREATE TABLE IF NOT EXISTS llm_runs (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, provider_id TEXT, model TEXT NOT NULL, operation TEXT NOT NULL, prompt_version TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, state TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_context_events_meeting ON context_events(meeting_id); CREATE INDEX IF NOT EXISTS idx_visual_evidence_meeting_time ON visual_evidence(meeting_id, timestamp_seconds); CREATE INDEX IF NOT EXISTS idx_action_items_meeting_status ON action_items(meeting_id, status);")?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS participants (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, name TEXT NOT NULL, role TEXT, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS context_events (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, kind TEXT NOT NULL, payload TEXT NOT NULL, confidence REAL NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS topics (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, label TEXT NOT NULL, summary TEXT, start_seconds INTEGER, end_seconds INTEGER); CREATE TABLE IF NOT EXISTS visual_evidence (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, timestamp_seconds INTEGER NOT NULL, path TEXT NOT NULL, thumbnail_path TEXT, ocr_text TEXT, perceptual_hash TEXT NOT NULL, description TEXT); CREATE TABLE IF NOT EXISTS action_items (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, event_id TEXT, owner TEXT, summary TEXT NOT NULL, due TEXT, status TEXT NOT NULL DEFAULT 'open', FOREIGN KEY(event_id) REFERENCES context_events(id) ON DELETE SET NULL); CREATE TABLE IF NOT EXISTS llm_runs (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, provider_id TEXT, model TEXT NOT NULL, operation TEXT NOT NULL, prompt_version TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, state TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_context_events_meeting ON context_events(meeting_id); CREATE INDEX IF NOT EXISTS idx_visual_evidence_meeting_time ON visual_evidence(meeting_id, timestamp_seconds); CREATE INDEX IF NOT EXISTS idx_action_items_meeting_status ON action_items(meeting_id, status); CREATE TABLE IF NOT EXISTS speaker_names (meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, speaker_index INTEGER NOT NULL, name TEXT NOT NULL, UNIQUE(meeting_id, speaker_index));")?;
     // Backward-compatible column migrations: "duplicate column name" is the
     // normal already-migrated case, but any other failure (locked/corrupt DB)
     // must surface instead of silently skipping the migration.
@@ -2255,6 +2255,33 @@ pub fn delete_meeting(conn: &Connection, meeting_id: &str) -> Result<(), BeaErro
         return Err(BeaError::MeetingNotFound(meeting_id.to_string()));
     }
     Ok(())
+}
+
+pub fn set_speaker_name(
+    conn: &Connection,
+    meeting_id: &str,
+    speaker_index: u32,
+    name: &str,
+) -> Result<(), BeaError> {
+    conn.execute(
+        "INSERT INTO speaker_names(meeting_id,speaker_index,name) VALUES (?1,?2,?3)
+         ON CONFLICT(meeting_id,speaker_index) DO UPDATE SET name=excluded.name",
+        params![meeting_id, speaker_index, name.trim()],
+    )?;
+    Ok(())
+}
+
+pub fn list_speaker_names(
+    conn: &Connection,
+    meeting_id: &str,
+) -> Result<std::collections::HashMap<u32, String>, BeaError> {
+    let mut stmt = conn.prepare(
+        "SELECT speaker_index,name FROM speaker_names WHERE meeting_id=?1 ORDER BY speaker_index",
+    )?;
+    let rows = stmt.query_map(params![meeting_id], |row| {
+        Ok((row.get::<_, i64>(0)? as u32, row.get::<_, String>(1)?))
+    })?;
+    Ok(rows.collect::<Result<std::collections::HashMap<_, _>, _>>()?)
 }
 
 /// Update only the speaker label of a persisted segment.
@@ -3794,6 +3821,20 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
+    #[test]
+    fn speaker_names_round_trip_per_meeting() {
+        let dir = tempdir().unwrap();
+        let c = open_database(dir.path().join("bea.db")).unwrap();
+        let m = create_meeting(&c, "VTT import", TranscriptLanguage::English).unwrap();
+        set_speaker_name(&c, &m.id, 0, "Maria Santos").unwrap();
+        set_speaker_name(&c, &m.id, 1, "John Cruz").unwrap();
+        // Upsert overwrites instead of duplicating.
+        set_speaker_name(&c, &m.id, 0, "Maria S.").unwrap();
+        let names = list_speaker_names(&c, &m.id).unwrap();
+        assert_eq!(names.get(&0).map(String::as_str), Some("Maria S."));
+        assert_eq!(names.get(&1).map(String::as_str), Some("John Cruz"));
+        assert_eq!(names.len(), 2);
+    }
     #[test]
     fn chunks_are_bounded_and_five_hours_supported() {
         assert_eq!(chunk_ranges(3600).unwrap().len(), 60);
