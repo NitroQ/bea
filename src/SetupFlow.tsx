@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
-import type { AsrEngineDescriptor, AsrEngineId, ProviderConfig, SetupStatus, SetupTool } from './types';
+import type { AsrEngineDescriptor, AsrEngineId, OpenRouterModelInfo, ProviderConfig, SetupStatus, SetupTool } from './types';
 import { CODEX_FALLBACK_MODELS, DEFAULT_BASE_URLS, LOCAL_PRESETS, providerLabel as kindLabel } from './providerPresets';
 import Icon, { type IconName } from './Icon';
 
@@ -84,7 +84,7 @@ function CodexSignIn({ provider, onProviderChange, verified, message }: { provid
 export default function SetupFlow({ status, provider, apiKey, step, onStep, onSelectEngine, onInstallEngine, onImportEngine, onRepairTools, onProviderChange, onApiKeyChange, onTestProvider, onComplete, notice, engineProgress }: Props) {
   const [openRouterModels, setOpenRouterModels] = useState<{ id: string; name: string }[]>([]);
   useEffect(() => {
-    invoke<{ id: string; name: string }[]>('fetch_openrouter_models_command')
+    invoke<OpenRouterModelInfo[]>('fetch_openrouter_models_command')
       .then(setOpenRouterModels)
       .catch(() => setOpenRouterModels([])); // offline: the input still accepts a typed id
   }, []);

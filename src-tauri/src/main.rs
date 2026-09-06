@@ -1685,6 +1685,8 @@ struct OpenRouterModelInfo {
     id: String,
     name: String,
     context_length: Option<u64>,
+    /// True when OpenRouter reports "image" in the model's input modalities.
+    vision_capable: bool,
 }
 
 #[tauri::command]
@@ -1720,6 +1722,16 @@ async fn fetch_openrouter_models_command() -> Result<Vec<OpenRouterModelInfo>, S
                         context_length: model
                             .get("context_length")
                             .and_then(|value| value.as_u64()),
+                        vision_capable: model
+                            .get("architecture")
+                            .and_then(|value| value.get("input_modalities"))
+                            .and_then(|value| value.as_array())
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .any(|value| value.as_str() == Some("image"))
+                            })
+                            .unwrap_or(false),
                     })
                 })
                 .collect()

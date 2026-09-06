@@ -14,6 +14,7 @@ export type ModelManifest = { id: string; name: string; version: string; size_by
 export type ProviderKind = 'OpenRouter' | 'OpenAiCompatible' | 'ClaudeCompatible' | 'Local' | 'OpenAiOAuth';
 export type LocalServerPreset = 'lm-studio' | 'ollama' | 'llamacpp';
 export type ProviderConfig = { id: string; kind: ProviderKind; base_url: string; model: string; credential_ref?: string | null; enabled: boolean };
+export type OpenRouterModelInfo = { id: string; name: string; context_length?: number | null; vision_capable: boolean };
 export type ToolStatus = 'ready' | 'missing' | 'checking' | 'repairing' | 'error';
 export type SetupTool = { id: 'ffmpeg' | 'tesseract'; name: string; description: string; status: ToolStatus; detail: string };
 export type AsrEngineDescriptor = { id: AsrEngineId; name: string; description: string; languages: string; size: string; status: ToolStatus; recommended?: boolean; detail: string };
