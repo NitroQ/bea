@@ -1740,6 +1740,63 @@ async fn fetch_openrouter_models_command() -> Result<Vec<OpenRouterModelInfo>, S
 }
 
 #[tauri::command]
+fn set_meeting_vision_flag_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    vision_capable: bool,
+) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    bea_core::set_app_setting(
+        &database,
+        &format!("vision_capable:{meeting_id}"),
+        if vision_capable { "true" } else { "false" },
+    )
+    .map_err(command_error)
+}
+
+/// Decides whether the provider model can see images for this meeting. An
+/// explicit per-meeting override wins; otherwise the model id is matched
+/// against a small static list of known vision families. Local servers are
+/// treated as vision-capable only when the model id carries a vision marker.
+fn meeting_vision_capable(
+    database: &rusqlite::Connection,
+    meeting_id: &str,
+    provider_kind: &bea_core::ProviderKind,
+    provider_model: &str,
+) -> bool {
+    if let Ok(Some(flag)) =
+        bea_core::get_app_setting(database, &format!("vision_capable:{meeting_id}"))
+    {
+        return flag == "true";
+    }
+    let model = provider_model.to_ascii_lowercase();
+    if matches!(provider_kind, bea_core::ProviderKind::Local) {
+        return ["vl", "vision", "llava", "minicpm-v", "gemma-3"]
+            .iter()
+            .any(|marker| model.contains(marker));
+    }
+    if matches!(provider_kind, bea_core::ProviderKind::OpenAiOAuth) {
+        return ["gpt-4o", "gpt-4.1", "gpt-5", "o3", "o4"]
+            .iter()
+            .any(|marker| model.contains(marker));
+    }
+    [
+        "gpt-4o",
+        "gpt-4.1",
+        "claude-3",
+        "claude-4",
+        "gemini",
+        "pixtral",
+        "llama-3.2",
+        "qwen2.5-vl",
+        "qwen3-vl",
+        "vl",
+    ]
+    .iter()
+    .any(|marker| model.contains(marker))
+}
+
+#[tauri::command]
 fn inspect_model_package_command(path: String) -> Result<ModelManifest, String> {
     inspect_asr_model_package(path).map_err(command_error)
 }
@@ -2595,6 +2652,7 @@ fn main() {
             remove_model_command,
             discover_provider_models_command,
             fetch_openrouter_models_command,
+            set_meeting_vision_flag_command,
             inspect_model_package_command,
             install_model_command,
             download_model_command,
