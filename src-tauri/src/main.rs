@@ -13,6 +13,7 @@ use bea_core::{
     save_provider, search_transcript, set_app_setting, transcribe_chunks_with_progress,
     transcribe_imported_media_with_progress, update_meeting_title, waveform_peaks, AudioChunkInput,
     CompletedAudioChunk, ContextMode, ExportFormat, FfmpegPipeline, LlmRequest, MediaKind,
+    OcrEngine,
     MediaSource, Meeting, Minutes, ModelInstallProgress, ModelManifest, ProviderConfig,
     RecorderConfig, RuntimeAvailability, SegmentedWavRecorder, TranscriptLanguage,
     TranscriptSegment, UsageRecord,
@@ -400,12 +401,10 @@ fn update_transcript_segment_command(
     Ok(())
 }
 
-#[tauri::command]
-fn list_media_command(
-    state: State<'_, AppState>,
-    meeting_id: String,
+fn list_media_command_inner(
+    database: &rusqlite::Connection,
+    meeting_id: &str,
 ) -> Result<Vec<MediaSource>, String> {
-    let database = open_database(&state.database_path).map_err(command_error)?;
     let mut statement = database
         .prepare("SELECT id,meeting_id,path,kind,duration_seconds,copied FROM media_sources WHERE meeting_id=?1 ORDER BY rowid")
         .map_err(command_error)?;
@@ -426,6 +425,93 @@ fn list_media_command(
         })
         .map_err(command_error)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(command_error)
+}
+
+#[tauri::command]
+fn list_media_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<MediaSource>, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    list_media_command_inner(&database, &meeting_id)
+}
+
+#[derive(serde::Serialize, Clone)]
+struct ExtractedFrame {
+    timestamp_seconds: u64,
+    path: String,
+    ocr_text: Option<String>,
+}
+
+/// Grabs one JPEG per requested timestamp from the meeting's video source.
+/// Always also runs Tesseract OCR on the frame so the caller can fall back to
+/// text when the selected model cannot see images. Frames are cached under
+/// `derived/<meeting_id>/frames/` so repeated requests for the same second
+/// are idempotent.
+#[tauri::command]
+fn extract_frames_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    timestamps: Vec<u64>,
+) -> Result<Vec<ExtractedFrame>, String> {
+    let root = state
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let video = list_media_command_inner(&database, &meeting_id)?
+        .into_iter()
+        .find(|media| matches!(media.kind, MediaKind::Video))
+        .ok_or_else(|| "this meeting has no video source".to_string())?;
+    let ffmpeg = locate_ffmpeg(&root);
+    let tesseract = locate_tesseract(&root);
+    let out_dir = root.join("derived").join(&meeting_id).join("frames");
+    std::fs::create_dir_all(&out_dir).map_err(command_error)?;
+    let ocr_engine = bea_core::TesseractOcrEngine {
+        executable: tesseract,
+        language: "eng".into(),
+    };
+    let mut frames = Vec::new();
+    for ts in timestamps {
+        let path = out_dir.join(format!("frame-{ts:06}.jpg"));
+        if !path.exists() {
+            let args = vec![
+                "-y".into(),
+                "-ss".into(),
+                ts.to_string(),
+                "-i".into(),
+                video.path.to_string_lossy().into_owned(),
+                "-frames:v".into(),
+                "1".into(),
+                "-q:v".into(),
+                "3".into(),
+                "-vf".into(),
+                "scale=1280:-2".into(),
+                path.to_string_lossy().into_owned(),
+            ];
+            bea_core::run_ffmpeg(&ffmpeg, &args).map_err(command_error)?;
+        }
+        let ocr_frame = bea_core::VisualFrame {
+            id: format!("{meeting_id}-{ts}"),
+            timestamp_seconds: ts,
+            path: path.clone(),
+            thumbnail_path: None,
+            perceptual_hash: String::new(),
+            description: None,
+        };
+        let ocr = ocr_engine
+            .extract_text(&ocr_frame)
+            .ok()
+            .map(|result| result.text)
+            .filter(|text| !text.trim().is_empty());
+        frames.push(ExtractedFrame {
+            timestamp_seconds: ts,
+            path: path.to_string_lossy().into_owned(),
+            ocr_text: ocr,
+        });
+    }
+    Ok(frames)
 }
 
 #[tauri::command]
@@ -2618,6 +2704,7 @@ fn main() {
             delete_meeting_command,
             update_transcript_segment_command,
             list_media_command,
+            extract_frames_command,
             waveform_peaks_command,
             repair_runtime_command,
             test_provider_connection_command,
