@@ -131,11 +131,25 @@ pub struct TranscriptSegment {
     pub speaker: Option<u32>,
 }
 
+/// One transcript passage retrieved from a DIFFERENT meeting, injected into
+/// the chat prompt as cross-meeting memory.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryMatch {
+    pub meeting_title: String,
+    pub timestamp_seconds: u64,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Evidence {
     pub start_seconds: u64,
     pub end_seconds: u64,
     pub quote: String,
+    /// Short statement of what this quote proves (e.g. "Confirms the 2.0
+    /// passing grade"). Older persisted evidence has no title; serde default
+    /// keeps those rows loadable.
+    #[serde(default)]
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1638,30 +1652,84 @@ pub struct AudioInputDevice {
     pub is_default: bool,
     pub sample_rate: Option<u32>,
     pub channels: Option<u16>,
+    /// `mic` for capture endpoints, `output` for render endpoints. On Windows
+    /// (WASAPI) a render device passed to an input stream captures the loopback
+    /// mix — i.e. desktop sound.
+    pub kind: &'static str,
+}
+
+fn enumerate_input_devices(host: &cpal::Host, capture: bool, prefix: &str) -> Vec<AudioInputDevice> {
+    let iterator = if capture {
+        host.input_devices()
+    } else {
+        host.output_devices()
+    };
+    let default_name = if capture {
+        host.default_input_device().and_then(|device| device.name().ok())
+    } else {
+        host.default_output_device().and_then(|device| device.name().ok())
+    };
+    let Ok(iterator) = iterator else {
+        return Vec::new();
+    };
+    iterator
+        .enumerate()
+        .filter_map(|(index, device)| {
+            let name = device.name().ok()?;
+            // Render endpoints expose their loopback configuration through
+            // default_input_config on the WASAPI host.
+            let config = device.default_input_config().ok();
+            Some(AudioInputDevice {
+                id: format!("{prefix}-{index}"),
+                is_default: default_name.as_deref() == Some(name.as_str()),
+                name,
+                sample_rate: config.as_ref().map(|value| value.sample_rate().0),
+                channels: config.as_ref().map(|value| value.channels()),
+                kind: if capture { "mic" } else { "output" },
+            })
+        })
+        .collect()
 }
 
 pub fn list_audio_input_devices() -> Result<Vec<AudioInputDevice>, BeaError> {
     let host = cpal::default_host();
-    let default_name = host
-        .default_input_device()
-        .and_then(|device| device.name().ok());
-    let devices = host
-        .input_devices()
-        .map_err(|error| BeaError::MediaProcessing(error.to_string()))?;
-    Ok(devices
-        .enumerate()
-        .filter_map(|(index, device)| {
-            let name = device.name().ok()?;
-            let config = device.default_input_config().ok();
-            Some(AudioInputDevice {
-                id: format!("input-{index}"),
-                is_default: default_name.as_deref() == Some(name.as_str()),
-                name,
-                sample_rate: config.as_ref().map(|value| value.sample_rate().0),
-                channels: config.map(|value| value.channels()),
-            })
-        })
-        .collect())
+    let mut devices = enumerate_input_devices(&host, true, "input");
+    devices.extend(enumerate_input_devices(&host, false, "output"));
+    Ok(devices)
+}
+
+/// Resolves a device id produced by `list_audio_input_devices` ("input-N" or
+/// "output-N") back to a concrete cpal device. `None` yields the default
+/// microphone, keeping the pre-device-picker behaviour.
+pub fn resolve_audio_device(device_id: Option<&str>) -> Result<(cpal::Device, &'static str), BeaError> {
+    let host = cpal::default_host();
+    let Some(device_id) = device_id else {
+        let device = host
+            .default_input_device()
+            .ok_or_else(|| BeaError::MediaProcessing("no default microphone is available".into()))?;
+        return Ok((device, "mic"));
+    };
+    let (kind, index_text) = device_id
+        .split_once('-')
+        .ok_or_else(|| BeaError::MediaProcessing(format!("unknown device id {device_id}")))?;
+    let index: usize = index_text
+        .parse()
+        .map_err(|_| BeaError::MediaProcessing(format!("unknown device id {device_id}")))?;
+    let capture = match kind {
+        "input" => true,
+        "output" => false,
+        _ => return Err(BeaError::MediaProcessing(format!("unknown device id {device_id}"))),
+    };
+    let mut iterator = if capture {
+        host.input_devices()
+    } else {
+        host.output_devices()
+    }
+    .map_err(|error| BeaError::MediaProcessing(error.to_string()))?;
+    let device = iterator
+        .nth(index)
+        .ok_or_else(|| BeaError::MediaProcessing(format!("device {device_id} is no longer available")))?;
+    Ok((device, if capture { "mic" } else { "output" }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1699,6 +1767,162 @@ pub struct SegmentedWavRecorder {
     current_samples: u64,
     total_samples: u64,
     writer: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>,
+}
+
+/// Sums several live audio sources (microphone + desktop loopback) into ONE
+/// master-format sample timeline so a multi-source recording stays a single
+/// chunk sequence for the existing ASR pipeline.
+///
+/// Sources push converted frames tagged with their own delivered-frame count;
+/// the mixer resamples to the master rate/channels, overlap-adds at the
+/// source's master-frame position, and releases the settled prefix (older than
+/// [`SETTLE_FRAMES`]) so slightly-late frames from other sources still land in
+/// the right slot. Pure logic — unit tests drive it with synthetic sources.
+pub struct AudioMixer {
+    master_rate: u32,
+    master_channels: u16,
+    /// Interleaved master-format samples covering `[buffer_start, ...)`.
+    buffer: Vec<f32>,
+    buffer_start: u64,
+}
+
+/// Samples younger than this horizon (in hundredths of a second of master
+/// audio) stay buffered — sources normally deliver within tens of
+/// milliseconds, so the horizon absorbs scheduler jitter while adding no
+/// perceptible latency to the recording.
+const SETTLE_FRAMES_PER_SECOND: u64 = 20; // 0.20 s of audio
+
+impl AudioMixer {
+    pub fn new(master_rate: u32, master_channels: u16) -> Self {
+        Self {
+            master_rate,
+            master_channels,
+            buffer: Vec::new(),
+            buffer_start: 0,
+        }
+    }
+
+    fn settle_horizon(&self) -> u64 {
+        self.master_rate as u64 * self.master_channels as u64 * SETTLE_FRAMES_PER_SECOND / 100
+    }
+
+    /// Pushes one callback's worth of source audio. `source_frames` is how many
+    /// frames the source has delivered BEFORE this batch; `samples` is the new
+    /// batch (interleaved, `src_channels` per frame at `src_rate`).
+    /// Returns the settled master-format i16 samples ready for the recorder.
+    pub fn push(
+        &mut self,
+        source_frames: u64,
+        samples: &[i16],
+        src_rate: u32,
+        src_channels: u16,
+    ) -> Vec<i16> {
+        if samples.is_empty() || src_rate == 0 || src_channels == 0 || self.master_channels == 0 {
+            return Vec::new();
+        }
+        // 1. Convert to master rate/channels as i16.
+        let converted = convert_to_master(samples, src_rate, src_channels, self.master_rate, self.master_channels);
+        if converted.is_empty() {
+            return Vec::new();
+        }
+        // 2. Position of this batch's first master frame.
+        let target = source_frames * self.master_rate as u64 / src_rate as u64 * self.master_channels as u64;
+        if target + converted.len() as u64 <= self.buffer_start {
+            // Older than everything we already flushed — drop.
+            return Vec::new();
+        }
+        // Partially-settled overlap: the prefix older than buffer_start can no
+        // longer land correctly, so it is dropped rather than misaligned.
+        let skip = if target < self.buffer_start {
+            (self.buffer_start - target).min(converted.len() as u64) as usize
+        } else {
+            0
+        };
+        let offset = (target.max(self.buffer_start) - self.buffer_start) as usize;
+        if self.buffer.len() < offset + converted.len() - skip {
+            self.buffer.resize(offset + converted.len() - skip, 0.0);
+        }
+        for (index, value) in converted.iter().skip(skip).enumerate() {
+            self.buffer[offset + index] += f32::from(*value) / f32::from(i16::MAX);
+        }
+        // 3. Release the settled prefix.
+        let horizon = self.settle_horizon();
+        let buffer_end = self.buffer_start + self.buffer.len() as u64;
+        let settle = buffer_end
+            .saturating_sub(horizon)
+            .saturating_sub(self.buffer_start)
+            .min(self.buffer.len() as u64) as usize;
+        let mut released = Vec::with_capacity(settle);
+        for value in self.buffer.drain(..settle) {
+            released.push((value.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+        }
+        self.buffer_start += settle as u64;
+        released
+    }
+
+    /// Flushes everything still buffered (used when recording stops).
+    pub fn drain(&mut self) -> Vec<i16> {
+        let mut released = Vec::with_capacity(self.buffer.len());
+        for value in self.buffer.drain(..) {
+            released.push((value.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+        }
+        self.buffer_start += released.len() as u64;
+        released
+    }
+
+    /// Peak amplitude of the currently buffered (unsettled) master samples,
+    /// normalized to 0.0-1.0. Used for the recording UI's level meter; the
+    /// settled output has already been handed off, so the live tail is what
+    /// best represents "now".
+    pub fn peak_level(&self) -> f32 {
+        self.buffer
+            .iter()
+            .fold(0.0f32, |peak, value| peak.max(value.abs()))
+    }
+}
+
+/// Converts interleaved source samples to the master rate and channel count:
+/// downmix to mono, resample linearly, then map mono onto the master layout.
+fn convert_to_master(
+    samples: &[i16],
+    src_rate: u32,
+    src_channels: u16,
+    master_rate: u32,
+    master_channels: u16,
+) -> Vec<i16> {
+    // Downmix to mono first (ASR-friendly; exotic layouts lose spatial nuance).
+    let channels = src_channels.max(1) as usize;
+    let mono: Vec<f32> = samples
+        .chunks(channels)
+        .map(|frame| {
+            let sum: i32 = frame.iter().map(|sample| *sample as i32).sum();
+            sum as f32 / channels as f32
+        })
+        .collect();
+    let mono_frames = mono.len() as u64;
+    let out_frames = if src_rate == master_rate {
+        mono_frames
+    } else {
+        mono_frames * master_rate as u64 / src_rate as u64
+    };
+    let mut out = Vec::with_capacity((out_frames * master_channels.max(1) as u64) as usize);
+    let step = src_rate as f64 / master_rate as f64;
+    for frame in 0..out_frames {
+        let source_position = frame as f64 * step;
+        let left = source_position.floor() as usize;
+        let right = (left + 1).min(mono.len() - 1);
+        let fraction = source_position - left as f64;
+        let value = if src_rate == master_rate {
+            mono[left as usize]
+        } else {
+            mono[left] * (1.0 - fraction as f32) + mono[right] * fraction as f32
+        };
+        let sample = (value.clamp(-32768.0, 32767.0)) as i16;
+        for _ in 0..master_channels.max(1) {
+            out.push(sample);
+        }
+    }
+    out
 }
 
 impl SegmentedWavRecorder {
@@ -2474,6 +2698,115 @@ pub fn list_transcript(
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Full-text search across every OTHER meeting's transcript, used to give the
+/// chat AI memory of past meetings. Excludes the current meeting and ranks by
+/// FTS relevance. Natural-language questions are split into words joined with
+/// OR so exact phrasing is not required.
+pub fn search_memory(
+    conn: &Connection,
+    exclude_meeting_id: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<MemoryMatch>, BeaError> {
+    let terms: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| token.chars().count() >= 2)
+        .map(|token| fts_quote(token))
+        .collect();
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT m.title, s.start_seconds, s.text FROM transcript_fts f \
+         JOIN transcript_segments s ON s.id = f.segment_id \
+         JOIN meetings m ON m.id = s.meeting_id \
+         WHERE f.meeting_id != ?1 AND f.text MATCH ?2 \
+         ORDER BY rank LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![exclude_meeting_id, terms.join(" OR "), limit as i64],
+        |r| {
+            Ok(MemoryMatch {
+                meeting_title: r.get(0)?,
+                timestamp_seconds: r.get::<_, i64>(1)? as u64,
+                text: r.get(2)?,
+            })
+        },
+    )?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    fn memory_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, duration_seconds INTEGER NOT NULL DEFAULT 0, language TEXT NOT NULL DEFAULT 'auto', asr_engine_id TEXT NOT NULL DEFAULT 'qwen-standard');
+             CREATE TABLE transcript_segments (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, start_seconds INTEGER NOT NULL, end_seconds INTEGER NOT NULL, text TEXT NOT NULL, language_detected TEXT, language_confidence REAL, speaker INTEGER);
+             CREATE VIRTUAL TABLE transcript_fts USING fts5(meeting_id UNINDEXED, segment_id UNINDEXED, text);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_meeting(conn: &Connection, id: &str, title: &str) {
+        conn.execute(
+            "INSERT INTO meetings(id,title,status,created_at) VALUES (?1,?2,'ready','2026-01-01T00:00:00Z')",
+            params![id, title],
+        )
+        .unwrap();
+    }
+
+    fn insert_segment(conn: &Connection, id: &str, meeting_id: &str, start: i64, text: &str) {
+        conn.execute(
+            "INSERT INTO transcript_segments(id,meeting_id,start_seconds,end_seconds,text) VALUES (?1,?2,?3,?4,?5)",
+            params![id, meeting_id, start, start + 10, text],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transcript_fts(meeting_id,segment_id,text) VALUES (?1,?2,?3)",
+            params![meeting_id, id, text],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn only_matches_other_meetings() {
+        let conn = memory_db();
+        insert_meeting(&conn, "m1", "Current meeting");
+        insert_meeting(&conn, "m2", "Budget review");
+        insert_segment(&conn, "s1", "m1", 0, "budget was approved today");
+        insert_segment(&conn, "s2", "m2", 30, "budget was approved last week");
+        let matches = search_memory(&conn, "m1", "budget approved", 5).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].meeting_title, "Budget review");
+        assert_eq!(matches[0].timestamp_seconds, 30);
+    }
+
+    #[test]
+    fn empty_query_returns_nothing() {
+        let conn = memory_db();
+        insert_meeting(&conn, "m1", "Current meeting");
+        insert_meeting(&conn, "m2", "Other");
+        insert_segment(&conn, "s1", "m2", 0, "some transcript text");
+        assert!(search_memory(&conn, "m1", "   ", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn orders_by_fts_rank() {
+        let conn = memory_db();
+        insert_meeting(&conn, "m1", "Current meeting");
+        insert_meeting(&conn, "m2", "Kickoff");
+        insert_segment(&conn, "s1", "m2", 0, "kickoff planning kickoff kickoff");
+        insert_segment(&conn, "s2", "m2", 60, "kickoff once");
+        let matches = search_memory(&conn, "m1", "kickoff", 5).unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].timestamp_seconds, 0);
+    }
 }
 
 pub fn chunk_ranges(duration_seconds: u64) -> Result<Vec<(u64, u64)>, BeaError> {
@@ -3473,10 +3806,11 @@ pub async fn call_provider_messages(
     if !status.is_success() {
         return Err(BeaError::ProviderRequest(format!("HTTP {status}")));
     }
-    let payload: serde_json::Value = response
-        .json()
+    let raw = response
+        .text()
         .await
         .map_err(|e| BeaError::ProviderRequest(e.to_string()))?;
+    let payload: serde_json::Value = parse_provider_payload(&raw)?;
     if provider.kind == ProviderKind::OpenAiOAuth {
         return Ok(codex_oauth::responses_output_text(&payload).unwrap_or_default());
     }
@@ -3485,6 +3819,27 @@ pub async fn call_provider_messages(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string())
+}
+
+/// Parses a provider JSON body. reqwest's `.json()` reports every malformed
+/// body as the opaque "error decoding response body"; parsing the raw text
+/// here surfaces a snippet of what the endpoint actually returned (HTML error
+/// page, compressed bytes, empty body) so the failure is diagnosable.
+pub fn parse_provider_payload(raw: &str) -> Result<serde_json::Value, BeaError> {
+    serde_json::from_str(raw).map_err(|error| {
+        BeaError::ProviderRequest(format!(
+            "response was not valid JSON ({error}); body started with: {:?}",
+            body_snippet(raw)
+        ))
+    })
+}
+
+/// First 200 characters of a raw response body on one line, for error messages.
+fn body_snippet(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .take(200)
+        .collect()
 }
 
 pub fn parse_provider_minutes(response: &serde_json::Value) -> Result<Minutes, BeaError> {
@@ -3565,13 +3920,21 @@ fn parse_provider_minutes_text(text: &str) -> Result<Minutes, BeaError> {
     ))
 }
 
-/// Sends only the packed text/image request supplied by the caller. The API key is passed at
-/// the effect boundary and is never persisted in `ProviderConfig`, SQLite, or a request body.
-pub async fn call_provider(
+/// Maximum number of correction round-trips when a provider's minutes reply
+/// fails to parse. Each round sends the broken reply back with the schema and
+/// asks the model to return valid JSON, so a truncated or fenced response can
+/// be salvaged without user intervention.
+const MINUTES_PARSE_RETRIES: usize = 3;
+
+/// Sends one LlmRequest to the provider and returns the raw JSON payload.
+/// Shared by minutes generation, chat, and the parse-repair loop. Reads the
+/// raw body as text first so a malformed body surfaces with a snippet instead
+/// of reqwest's opaque "error decoding response body".
+async fn send_provider_request(
     provider: &ProviderConfig,
     request: &LlmRequest,
     api_key: Option<&str>,
-) -> Result<Minutes, BeaError> {
+) -> Result<serde_json::Value, BeaError> {
     let prepared = build_provider_request(provider, request);
     // Bounded request so a stalled provider endpoint can never freeze minutes
     // generation the way a hung ASR decode used to freeze transcription.
@@ -3594,19 +3957,142 @@ pub async fn call_provider(
     if !status.is_success() {
         return Err(BeaError::ProviderRequest(format!("HTTP {status}")));
     }
-    let payload = response
-        .json::<serde_json::Value>()
+    let raw = response
+        .text()
         .await
         .map_err(|error| BeaError::ProviderRequest(error.to_string()))?;
-    // The OAuth (Codex) backend speaks the Responses API: unwrap the message
-    // output_text first, then parse minutes from it like any other text.
+    parse_provider_payload(&raw)
+}
+
+/// Unwraps the assistant reply of a provider payload: Responses-API
+/// output_text for the OAuth backend, chat-completions `content` otherwise.
+/// Reasoning models that answer with `content: null` fall back to
+/// `message.reasoning` so the text is still usable for repair rounds.
+fn reply_text(provider: &ProviderConfig, payload: &serde_json::Value) -> String {
     if provider.kind == ProviderKind::OpenAiOAuth {
-        let text = codex_oauth::responses_output_text(&payload).ok_or_else(|| {
+        return codex_oauth::responses_output_text(payload).unwrap_or_default();
+    }
+    let message = payload.pointer("/choices/0/message");
+    let content = message
+        .and_then(|m| m.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !content.trim().is_empty() {
+        return content.to_string();
+    }
+    message
+        .and_then(|m| m.get("reasoning"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Parses minutes out of a provider payload, using each API's native reply
+/// shape. Shared by the first attempt and every repair round.
+fn minutes_from_payload(
+    provider: &ProviderConfig,
+    payload: &serde_json::Value,
+) -> Result<Minutes, BeaError> {
+    if provider.kind == ProviderKind::OpenAiOAuth {
+        let text = codex_oauth::responses_output_text(payload).ok_or_else(|| {
             BeaError::InvalidModelOutput("responses payload had no message output_text".into())
         })?;
         return parse_provider_minutes_text(&text);
     }
-    parse_provider_minutes(&payload)
+    parse_provider_minutes(payload)
+}
+
+/// Builds the follow-up request that asks the model to repair its own
+/// malformed minutes JSON. Pure so the prompt contract is unit-testable.
+fn minutes_correction_request(original: &LlmRequest, broken: &str, parse_error: &str) -> LlmRequest {
+    LlmRequest {
+        model: original.model.clone(),
+        system: "You repair malformed JSON meeting minutes. Reply with ONLY the corrected JSON object matching the schema — no markdown fences, no commentary, no explanations.".to_string(),
+        user: format!(
+            "The reply below was supposed to be meeting-minutes JSON matching this schema:\n{}\n\nIt failed to parse: {parse_error}\n\nReturn ONLY the corrected JSON object.\n\nBroken reply:\n{broken}",
+            original.json_schema
+        ),
+        json_schema: original.json_schema.clone(),
+        max_output_tokens: original.max_output_tokens,
+    }
+}
+
+/// Final minutes-parse failure with the tail of the model's reply attached,
+/// so the Settings error shows what the provider actually returned instead of
+/// an undiagnosable "no usable minutes JSON".
+fn failed_minutes_error(error: BeaError, broken: &str) -> BeaError {
+    let detail = match &error {
+        BeaError::InvalidModelOutput(message) => message.clone(),
+        other => other.to_string(),
+    };
+    if broken.trim().is_empty() {
+        return BeaError::InvalidModelOutput(format!(
+            "{detail}; the provider reply contained no text (content and reasoning were both empty — the model likely spent its whole token budget on hidden reasoning)"
+        ));
+    }
+    BeaError::InvalidModelOutput(format!(
+        "{detail}; last model reply started with: {:?}",
+        body_snippet(broken)
+    ))
+}
+
+/// Sends a broken minutes reply back to the provider for repair, up to
+/// `MINUTES_PARSE_RETRIES` times. Returns the last parse error (with the
+/// broken reply attached) when the model never produces a schema-valid reply.
+pub async fn repair_minutes_reply(
+    provider: &ProviderConfig,
+    original: &LlmRequest,
+    api_key: Option<&str>,
+    mut broken: String,
+    mut last_error: BeaError,
+) -> Result<Minutes, BeaError> {
+    for _ in 0..MINUTES_PARSE_RETRIES {
+        let correction = minutes_correction_request(original, &broken, &last_error.to_string());
+        // A transport failure during repair (rejected parameter, rate limit,
+        // timeout) must not mask the root parse error: stop repairing and
+        // surface the original failure with the broken reply attached.
+        let payload = match send_provider_request(provider, &correction, api_key).await {
+            Ok(payload) => payload,
+            Err(_) => break,
+        };
+        let text = reply_text(provider, &payload);
+        if text.trim().is_empty() {
+            // Nothing usable came back (e.g. no message output at all):
+            // further rounds would ask the model to repair emptiness.
+            break;
+        }
+        match minutes_from_payload(provider, &payload) {
+            Ok(minutes) => return Ok(minutes),
+            Err(error) => {
+                last_error = error;
+                broken = text;
+            }
+        }
+    }
+    Err(failed_minutes_error(last_error, &broken))
+}
+
+/// Sends only the packed text/image request supplied by the caller. The API key is passed at
+/// the effect boundary and is never persisted in `ProviderConfig`, SQLite, or a request body.
+pub async fn call_provider(
+    provider: &ProviderConfig,
+    request: &LlmRequest,
+    api_key: Option<&str>,
+) -> Result<Minutes, BeaError> {
+    let payload = send_provider_request(provider, request, api_key).await?;
+    match minutes_from_payload(provider, &payload) {
+        Ok(minutes) => Ok(minutes),
+        Err(error) => {
+            // Give the model a bounded number of chances to repair its own
+            // malformed JSON before surfacing the failure to the user.
+            let broken = reply_text(provider, &payload);
+            if broken.trim().is_empty() {
+                // Repairs cannot fix an empty reply; say so explicitly.
+                return Err(failed_minutes_error(error, ""));
+            }
+            repair_minutes_reply(provider, request, api_key, broken, error).await
+        }
+    }
 }
 
 /// Like `call_provider` but returns the assistant's free-text reply instead of
@@ -3616,36 +4102,8 @@ pub async fn call_provider_text(
     request: &LlmRequest,
     api_key: Option<&str>,
 ) -> Result<String, BeaError> {
-    let prepared = build_provider_request(provider, request);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|error| BeaError::ProviderRequest(error.to_string()))?;
-    let mut request_builder = client.post(prepared.url).json(&prepared.body);
-    if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
-        request_builder = request_builder.bearer_auth(key);
-    }
-    let response = request_builder
-        .send()
-        .await
-        .map_err(|error| BeaError::ProviderRequest(error.to_string()))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(BeaError::ProviderRequest(format!("HTTP {status}")));
-    }
-    let payload = response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|error| BeaError::ProviderRequest(error.to_string()))?;
-    if provider.kind == ProviderKind::OpenAiOAuth {
-        return Ok(codex_oauth::responses_output_text(&payload).unwrap_or_default());
-    }
-    Ok(payload
-        .pointer("/choices/0/message/content")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default()
-        .to_string())
+    let payload = send_provider_request(provider, request, api_key).await?;
+    Ok(reply_text(provider, &payload))
 }
 
 pub fn record_usage(conn: &Connection, usage: &UsageRecord) -> Result<(), BeaError> {
@@ -3723,6 +4181,7 @@ pub fn extract_ledger_events(segments: &[TranscriptSegment]) -> Vec<LedgerEvent>
                 start_seconds: segment.start_seconds,
                 end_seconds: segment.end_seconds,
                 quote: trimmed.to_string(),
+                title: summarize_segment_text(trimmed, kind),
             }],
         });
     }
@@ -3854,15 +4313,47 @@ pub fn generate_minutes(title: &str, events: &[LedgerEvent]) -> Minutes {
         parts.join(" ")
     };
 
+    // Offline / heuristic agenda: one item per ledger source so the Agenda
+    // section is never empty when the AI path is unavailable.
+    let mut agenda: Vec<AgendaItem> = decisions
+        .iter()
+        .map(|d| AgendaItem {
+            heading: short_agenda_heading(&d.summary),
+            start_seconds: d.evidence.first().map(|e| e.start_seconds),
+            end_seconds: d.evidence.first().map(|e| e.end_seconds),
+        })
+        .collect();
+    for item in action_items.iter().chain(unresolved.iter()) {
+        agenda.push(AgendaItem {
+            heading: short_agenda_heading(&item.summary),
+            start_seconds: item.evidence.first().map(|e| e.start_seconds),
+            end_seconds: item.evidence.first().map(|e| e.end_seconds),
+        });
+    }
+    agenda.truncate(8);
+
     Minutes {
         title: title.to_string(),
         summary,
-        agenda: Vec::new(),
+        agenda,
         visual_observations: Vec::new(),
         decisions,
         action_items,
         unresolved,
     }
+}
+
+/// Derives a short agenda heading from a ledger summary (first clause, ≤60 chars).
+fn short_agenda_heading(summary: &str) -> String {
+    let first_clause = summary
+        .split(|c: char| c == ';' || c == ',' || c == '.' || c == '—')
+        .find(|s| !s.trim().is_empty())
+        .unwrap_or(summary);
+    let mut heading: String = first_clause.trim().chars().take(60).collect();
+    if heading.len() < first_clause.trim().len() {
+        heading.push('…');
+    }
+    heading
 }
 
 pub fn save_ledger_events(
@@ -4419,7 +4910,7 @@ mod tests {
                 owner: None,
                 due: None,
                 confidence: 0.85,
-                evidence: vec![Evidence { start_seconds: 10, end_seconds: 20, quote: "q".into() }],
+                evidence: vec![Evidence { start_seconds: 10, end_seconds: 20, quote: "q".into(), title: String::new() }],
             },
             LedgerEvent {
                 kind: "action".into(),
@@ -4427,7 +4918,7 @@ mod tests {
                 owner: None,
                 due: None,
                 confidence: 0.8,
-                evidence: vec![Evidence { start_seconds: 30, end_seconds: 40, quote: "q".into() }],
+                evidence: vec![Evidence { start_seconds: 30, end_seconds: 40, quote: "q".into(), title: String::new() }],
             },
         ];
         let minutes = generate_minutes("Council", &events);
@@ -4695,6 +5186,7 @@ mod tests {
                 start_seconds: 1,
                 end_seconds: 2,
                 quote: "source quote".into(),
+                title: "What the quote proves".into(),
             }],
         };
         let pack = pack_context_mode(&[event], 100, ContextMode::Balanced);
@@ -4730,6 +5222,59 @@ mod tests {
         // The chat/completions-only body keys must be absent.
         assert!(prepared.body.get("messages").is_none());
         assert!(prepared.body.get("response_format").is_none());
+    }
+    #[test]
+    fn minutes_correction_request_carries_schema_error_and_broken_reply() {
+        let original = LlmRequest {
+            model: "test-model".into(),
+            system: "secretary".into(),
+            user: "events".into(),
+            json_schema: r#"{"type":"object"}"#.into(),
+            max_output_tokens: 500,
+        };
+        let correction =
+            minutes_correction_request(&original, "{\"title\":", "EOF while parsing an object");
+        assert_eq!(correction.model, "test-model");
+        assert_eq!(correction.max_output_tokens, 500);
+        assert_eq!(correction.json_schema, original.json_schema);
+        assert!(correction.user.contains("{\"title\":"));
+        assert!(correction.user.contains("EOF while parsing an object"));
+        assert!(correction.user.contains(r#"{"type":"object"}"#));
+        assert!(correction.system.contains("ONLY the corrected JSON"));
+    }
+    #[test]
+    fn failed_minutes_error_attaches_reply_snippet() {
+        let error = BeaError::InvalidModelOutput(
+            "provider response contained no usable minutes JSON".into(),
+        );
+        let wrapped = failed_minutes_error(error, "Sorry, I cannot output JSON today.");
+        let message = wrapped.to_string();
+        assert!(message.contains("no usable minutes JSON"));
+        assert!(message.contains("Sorry, I cannot output JSON"));
+        // The empty-reply case names the empty content explicitly instead.
+        let error = BeaError::InvalidModelOutput("provider response contained no usable minutes JSON".into());
+        let message = failed_minutes_error(error, "  ").to_string();
+        assert!(message.contains("contained no text"));
+    }
+    #[test]
+    fn reply_text_prefers_content_and_falls_back_to_reasoning() {
+        let mut provider = ProviderConfig {
+            id: "p".into(),
+            kind: ProviderKind::OpenRouter,
+            base_url: "https://x/v1".into(),
+            model: "m".into(),
+            credential_ref: None,
+            enabled: true,
+        };
+        let content = serde_json::json!({"choices":[{"message":{"content":"hello"}}]});
+        assert_eq!(reply_text(&provider, &content), "hello");
+        let reasoning_only = serde_json::json!({"choices":[{"message":{"content":null,"reasoning":"thinking..."}}]});
+        assert_eq!(reply_text(&provider, &reasoning_only), "thinking...");
+        provider.kind = ProviderKind::OpenAiOAuth;
+        let oauth_payload = serde_json::json!({
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}]
+        });
+        assert_eq!(reply_text(&provider, &oauth_payload), "hi");
     }
     #[test]
     fn provider_kinds_round_trip_through_the_database() {
@@ -4813,6 +5358,19 @@ mod tests {
         save_provider(&db, &provider).unwrap();
         assert_eq!(load_provider(&db, "openrouter").unwrap(), Some(provider));
         assert!(parse_provider_minutes(&serde_json::json!({})).is_err());
+    }
+    #[test]
+    fn provider_payload_parse_error_surfaces_body_snippet() {
+        let message = parse_provider_payload("<html>502 Bad Gateway</html>")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("not valid JSON"));
+        assert!(message.contains("<html>502 Bad Gateway</html>"));
+        // Long bodies are truncated to 200 characters in the message.
+        let long_body = "x".repeat(400);
+        let message = parse_provider_payload(&long_body).unwrap_err().to_string();
+        assert!(message.contains(&"x".repeat(200)));
+        assert!(!message.contains(&"x".repeat(201)));
     }
     #[derive(Clone)]
     struct FakeAsr;
@@ -5671,5 +6229,70 @@ mod tests {
         let peaks = waveform_peaks(&path, 64).unwrap();
         assert_eq!(peaks.len(), 64);
         assert!(peaks.iter().all(|peak| (0.0..=1.0).contains(peak)));
+    }
+
+    // ---- AudioMixer (multi-source recording) ----
+
+    fn mono_constant(length: usize, value: i16) -> Vec<i16> {
+        vec![value; length]
+    }
+
+    #[test]
+    fn mixer_sums_two_sources_into_one_timeline() {
+        // Master 16 kHz mono; two sources at 16 kHz. The 0.2 s settle horizon
+        // (3200 samples) keeps everything buffered until the timeline extends
+        // past it. A delivers 1000-frame batches of 1000, B one late batch of
+        // 500 → overlapping samples must sum to 1500.
+        let mut mixer = AudioMixer::new(16_000, 1);
+        let mut released: Vec<i16> = Vec::new();
+        released.extend(mixer.push(0, &mono_constant(1000, 1000), 16_000, 1));
+        released.extend(mixer.push(0, &mono_constant(1000, 500), 16_000, 1));
+        for batch in 1..4usize {
+            released.extend(mixer.push((batch * 1000) as u64, &mono_constant(1000, 1000), 16_000, 1));
+        }
+        // Buffer end 4000 minus horizon 3200 → exactly 800 samples settle.
+        assert_eq!(released.len(), 800);
+        assert!(released.iter().all(|sample| *sample == 1500), "sources must sum sample-by-sample, including B's late batch");
+    }
+
+    #[test]
+    fn mixer_resamples_off_rate_source() {
+        // 8 kHz source into a 16 kHz master: each 1000-frame batch becomes
+        // 2000 master samples at the same wall-clock position.
+        let mut mixer = AudioMixer::new(16_000, 1);
+        let mut released: Vec<i16> = Vec::new();
+        for batch in 0..3usize {
+            released.extend(mixer.push((batch * 1000) as u64, &mono_constant(1000, 2000), 8_000, 1));
+        }
+        // 3 batches × 2000 = 6000 buffered; settle 6000 − 3200 = 2800.
+        assert_eq!(released.len(), 2800);
+        assert_eq!(released.len() % 2, 0, "8 kHz → 16 kHz produces even sample counts");
+        assert!(released.iter().all(|sample| *sample == 2000), "resampled DC must keep its value");
+    }
+
+    #[test]
+    fn mixer_drain_flushes_everything() {
+        let mut mixer = AudioMixer::new(16_000, 1);
+        let _ = mixer.push(0, &mono_constant(500, 800), 16_000, 1);
+        let drained = mixer.drain();
+        assert_eq!(drained.len(), 500);
+        assert!(drained.iter().all(|sample| *sample == 800));
+        // A second drain is empty; a late frame from before the flush is dropped.
+        assert!(mixer.drain().is_empty());
+        assert!(mixer.push(0, &mono_constant(10, 800), 16_000, 1).is_empty());
+    }
+
+    #[test]
+    fn mixer_downmixes_stereo_source_to_mono_master() {
+        // Stereo 2-channel source (L=400, R=800 → avg 600) into mono master.
+        let mut mixer = AudioMixer::new(16_000, 1);
+        let stereo: Vec<i16> = (0..500).flat_map(|_| [400i16, 800i16]).collect();
+        let mut released: Vec<i16> = Vec::new();
+        for batch in 0..9usize {
+            released.extend(mixer.push((batch * 500) as u64, &stereo, 16_000, 2));
+        }
+        // 9 batches × 500 = 4500 buffered; settle 4500 − 3200 = 1300.
+        assert_eq!(released.len(), 1300);
+        assert!(released.iter().all(|sample| *sample == 600));
     }
 }

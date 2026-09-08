@@ -73,7 +73,7 @@ export function UpdateSettingsSection() {
         : "Checking happens automatically every 6 hours.";
 
   return (
-    <section className="settings-section">
+    <section className="settings-section" style={{ gridColumn: "1 / -1" }}>
       <div className="settings-section-title">
         <div>
           <h2>Updates</h2>

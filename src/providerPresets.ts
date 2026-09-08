@@ -15,8 +15,20 @@ export const DEFAULT_BASE_URLS: Record<ProviderKind, string> = {
 };
 
 // Static fallback for the Codex backend; codex_list_models_command refreshes
-// this from the account's real catalog when it responds.
-export const CODEX_FALLBACK_MODELS = ['gpt-5.1-codex', 'gpt-5.1-codex-mini', 'gpt-5.1'];
+// this from the account's real catalog when it responds. Kept in sync with
+// the models the ChatGPT/Codex backend currently serves — older slugs
+// (gpt-5.1-codex etc.) now answer HTTP 400 "model is not supported when
+// using Codex with a ChatGPT account".
+export const CODEX_FALLBACK_MODELS = [
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+  'gpt-5.5',
+  'gpt-5.4',
+  'gpt-5.4-mini',
+  'gpt-5.3-codex',
+  'gpt-5.3-codex-spark',
+];
 
 export const presetBaseUrl = (kind: ProviderKind, preset: LocalServerPreset): string =>
   kind === 'Local'

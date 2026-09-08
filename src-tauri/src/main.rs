@@ -35,24 +35,38 @@ struct AppState {
     /// not race through the download/rename staging paths. Tokio mutex because
     /// downloads await while holding it.
     speaker_models_lock: tauri::async_runtime::Mutex<()>,
+    /// Meeting ids whose in-flight minutes generation the user cancelled
+    /// (wizard "Close"). Checked at the generation checkpoints so a cancelled
+    /// run never overwrites saved minutes.
+    cancelled_minutes: Mutex<std::collections::HashSet<String>>,
 }
 
 enum RecorderCommand {
     Pause(mpsc::SyncSender<Result<(), String>>),
     Resume(mpsc::SyncSender<Result<(), String>>),
     Stop(mpsc::SyncSender<Result<Vec<CompletedAudioChunk>, String>>),
+    /// Meters the live input level without touching the recording.
+    Level(mpsc::SyncSender<f32>),
 }
 
 const MEETING_SECRETARY_SYSTEM_PROMPT: &str = r#"You are an expert meeting secretary. From the transcript events below, produce strict JSON meeting minutes in English.
 Rules:
 - summary: a 2-4 sentence executive summary of the whole meeting.
 - decisions / action_items / unresolved: exactly one entry per distinct point; merge duplicates. Each entry's summary must be a self-contained, third-person, present-tense statement of the outcome or task (e.g. "The passing grade is set to 2.0 effective AY 2026-2027", "Revise the 2-day loss list before Friday") — never a question, never a verbatim or near-verbatim transcript line, and never in the speaker's voice. Include the owner and deadline in the summary when the transcript names them.
-- agenda: the meeting's topics in the order they were discussed, each as a short noun-phrase heading (e.g. "Q3 budget review"); attach start_seconds/end_seconds from the transcript when the topic's discussion span is identifiable. Infer topics from how the conversation shifts even when no written agenda exists — every meeting that discussed distinct subjects has an agenda. Return an empty array only when the whole meeting is a single informal topic.
+- agenda: the meeting's topics in the order they were discussed, each as a short noun-phrase heading (e.g. "Q3 budget review"); attach start_seconds/end_seconds from the transcript when the topic's discussion span is identifiable. Infer topics from how the conversation shifts even when no written agenda exists — every meeting that discussed distinct subjects has an agenda. ALWAYS return at least 1 agenda item when the transcript contains any discussion; the empty array is reserved for transcripts that contain no discussion at all.
+- title: a short, specific meeting title derived from the actual content (e.g. "Faculty Council — BPEP Policy Orientation"). Use the meeting's main subject, not a generic label like "Meeting Minutes". When a PREVIOUS AGENDA or existing title context is provided, prefer refining it over replacing it.
 - Every item's summary must be ONE concise, capitalized, grammatical headline sentence in English (example: "Admission limits remain at the discretion of the Dean"). NEVER copy raw transcript speech as a summary.
 - Every item's evidence: list the EXACT original quotes with the start_seconds/end_seconds taken from the matching input event. Do not paraphrase quotes or invent timestamps.
+- Every evidence item's title: one short clause stating WHAT the quote proves (e.g. "Confirms the 2.0 removal-exam passing grade", "Shows Maria owns the CHED submission"). This is the label readers see first.
 - Exclude procedural noise (motions to approve past minutes, roll call, greetings, filler) from action items and decisions.
 - If a Participants legend or custom format is provided in the system prompt, use real participant names instead of "Speaker N" and follow the custom format's structure while still returning the same JSON schema.
 - visual_observations: when visual context (frame images or OCR text of video frames) is provided, add one short observation string per notable thing seen on the frames (e.g. "Slide at 320s shows the Q3 budget table"). Omit the array or return [] when no visual context is provided."#;
+
+/// JSON schema sent with minutes requests so providers with structured output
+/// return parseable minutes. Shared by minutes generation and the
+/// `validate_minutes_model_command` preflight, which must exercise the exact
+/// same contract the real generation path uses.
+const MINUTES_JSON_SCHEMA: &str = r#"{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"agenda":{"type":"array","items":{"type":"object","properties":{"heading":{"type":"string"},"start_seconds":{"type":"number"},"end_seconds":{"type":"number"}},"required":["heading"]}},"visual_observations":{"type":"array","items":{"type":"string"}},"decisions":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"action_items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"unresolved":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}}},"required":["title","summary","decisions","action_items","unresolved"]}"#;
 
 fn language_from_code(code: &str) -> TranscriptLanguage {
     match code {
@@ -192,6 +206,132 @@ mod context_payload_tests {
     }
 }
 
+/// Builds the cross-meeting memory block injected into the chat system
+/// prompt: an index of all other meetings (title + date) plus FTS-matched
+/// transcript passages relevant to the question. Empty when there are no
+/// other meetings, so the prompt stays unchanged.
+fn build_memory_block(
+    database: &rusqlite::Connection,
+    exclude_meeting_id: &str,
+    question: &str,
+) -> Result<String, String> {
+    let mut statement = database
+        .prepare("SELECT title, created_at FROM meetings WHERE id != ?1 ORDER BY created_at DESC LIMIT 15")
+        .map_err(command_error)?;
+    let meetings = statement
+        .query_map(rusqlite::params![exclude_meeting_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(command_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(command_error)?;
+    if meetings.is_empty() {
+        return Ok(String::new());
+    }
+    let mut block = format!(
+        "\n\n=== MEMORY: OTHER MEETINGS ({} recorded) ===\nThe user may reference earlier meetings. This index lists them:\n",
+        meetings.len()
+    );
+    for (title, created_at) in &meetings {
+        let date = created_at.get(..10).unwrap_or(created_at);
+        block.push_str(&format!("- {title} (recorded {date})\n"));
+    }
+    let matches = bea_core::search_memory(database, exclude_meeting_id, question, 12)
+        .map_err(command_error)?;
+    if !matches.is_empty() {
+        block.push_str("\nRelevant passages found in other meetings' transcripts:\n");
+        for entry in matches {
+            if block.len() > 4000 {
+                break;
+            }
+            block.push_str(&format!(
+                "[{}] [{:02}:{:02}] {}\n",
+                entry.meeting_title,
+                entry.timestamp_seconds / 60,
+                entry.timestamp_seconds % 60,
+                entry.text.trim()
+            ));
+        }
+    }
+    block.push_str("If the question references an earlier meeting, use this memory. Otherwise ignore it.");
+    Ok(block)
+}
+
+#[cfg(test)]
+mod memory_block_tests {
+    use super::build_memory_block;
+
+    fn memory_db() -> rusqlite::Connection {
+        let database = rusqlite::Connection::open_in_memory().unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, duration_seconds INTEGER NOT NULL DEFAULT 0, language TEXT NOT NULL DEFAULT 'auto', asr_engine_id TEXT NOT NULL DEFAULT 'qwen-standard');
+                 CREATE TABLE transcript_segments (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, start_seconds INTEGER NOT NULL, end_seconds INTEGER NOT NULL, text TEXT NOT NULL, language_detected TEXT, language_confidence REAL, speaker INTEGER);
+                 CREATE VIRTUAL TABLE transcript_fts USING fts5(meeting_id UNINDEXED, segment_id UNINDEXED, text);",
+            )
+            .unwrap();
+        database
+    }
+
+    fn insert_meeting(database: &rusqlite::Connection, id: &str, title: &str) {
+        database
+            .execute(
+                "INSERT INTO meetings(id,title,status,created_at) VALUES (?1,?2,'ready','2026-03-05T10:00:00Z')",
+                rusqlite::params![id, title],
+            )
+            .unwrap();
+    }
+
+    fn insert_segment(database: &rusqlite::Connection, id: &str, meeting_id: &str, text: &str) {
+        database
+            .execute(
+                "INSERT INTO transcript_segments(id,meeting_id,start_seconds,end_seconds,text) VALUES (?1,?2,0,10,?3)",
+                rusqlite::params![id, meeting_id, text],
+            )
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO transcript_fts(meeting_id,segment_id,text) VALUES (?1,?2,?3)",
+                rusqlite::params![meeting_id, id, text],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn empty_when_no_other_meetings() {
+        let database = memory_db();
+        insert_meeting(&database, "m1", "Only meeting");
+        assert!(
+            build_memory_block(&database, "m1", "anything")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn lists_meetings_and_passages() {
+        let database = memory_db();
+        insert_meeting(&database, "m1", "Current meeting");
+        insert_meeting(&database, "m2", "Budget review");
+        insert_segment(&database, "s1", "m2", "budget was approved last week");
+        let block = build_memory_block(&database, "m1", "budget approved").unwrap();
+        assert!(block.contains("=== MEMORY: OTHER MEETINGS (1 recorded) ==="));
+        assert!(block.contains("- Budget review (recorded 2026-03-05)"));
+        assert!(block.contains("[Budget review] [00:00] budget was approved last week"));
+        assert!(block.contains("Otherwise ignore it."));
+    }
+
+    #[test]
+    fn index_only_when_no_passage_matches() {
+        let database = memory_db();
+        insert_meeting(&database, "m1", "Current meeting");
+        insert_meeting(&database, "m2", "Kickoff");
+        let block = build_memory_block(&database, "m1", "something unrelated xyzzy").unwrap();
+        assert!(block.contains("- Kickoff (recorded 2026-03-05)"));
+        assert!(!block.contains("Relevant passages"));
+    }
+}
+
 fn locate_tesseract(root: &std::path::Path) -> PathBuf {
     let mut candidates = Vec::new();
     if let Ok(executable) = std::env::current_exe() {
@@ -317,10 +457,14 @@ fn locate_ffmpeg(root: &std::path::Path) -> PathBuf {
     root.join("bin").join("ffmpeg.exe")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_input_stream(
     device: &cpal::Device,
     supported: &cpal::SupportedStreamConfig,
     recorder: Arc<Mutex<SegmentedWavRecorder>>,
+    mixer: Arc<Mutex<bea_core::AudioMixer>>,
+    source_frames: Arc<Mutex<HashMap<&'static str, u64>>>,
+    source_key: &'static str,
     stream_error: Arc<Mutex<Option<String>>>,
 ) -> Result<cpal::Stream, String> {
     let config = supported.config();
@@ -332,16 +476,42 @@ fn build_input_stream(
             *slot = Some(error.to_string());
         }
     };
+    // Every sample batch is resampled/downmixed into the master format, summed
+    // into the shared mixer at the source's own timeline position, and only the
+    // settled prefix reaches the recorder — so mic + desktop loopback produce
+    // ONE aligned chunk sequence for the ASR pipeline.
+    let master_channels = config.channels;
+    let master_rate = config.sample_rate.0;
+    let build = move |data: &[i16]| -> Option<Vec<i16>> {
+        if data.is_empty() {
+            return None;
+        }
+        let channels = master_channels.max(1) as usize;
+        let delivered = data.len() / channels;
+        let before = source_frames
+            .lock()
+            .map(|mut slots| {
+                let previous = *slots.get(source_key).unwrap_or(&0);
+                slots.insert(source_key, previous + delivered as u64);
+                previous
+            })
+            .unwrap_or(0);
+        let mut mixer = mixer.lock().ok()?;
+        let settled = mixer.push(before, data, master_rate, master_channels);
+        (!settled.is_empty()).then_some(settled)
+    };
     match supported.sample_format() {
         cpal::SampleFormat::F32 => device.build_input_stream(
             &config,
             move |data: &[f32], _| {
-                if let Ok(mut recorder) = recorder.lock() {
-                    let samples: Vec<i16> = data
-                        .iter()
-                        .map(|sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-                        .collect();
-                    let _ = recorder.push_samples(&samples);
+                let samples: Vec<i16> = data
+                    .iter()
+                    .map(|sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                    .collect();
+                if let Some(settled) = build(&samples) {
+                    if let Ok(mut recorder) = recorder.lock() {
+                        let _ = recorder.push_samples(&settled);
+                    }
                 }
             },
             error_callback,
@@ -350,8 +520,10 @@ fn build_input_stream(
         cpal::SampleFormat::I16 => device.build_input_stream(
             &config,
             move |data: &[i16], _| {
-                if let Ok(mut recorder) = recorder.lock() {
-                    let _ = recorder.push_samples(data);
+                if let Some(settled) = build(data) {
+                    if let Ok(mut recorder) = recorder.lock() {
+                        let _ = recorder.push_samples(&settled);
+                    }
                 }
             },
             error_callback,
@@ -360,12 +532,14 @@ fn build_input_stream(
         cpal::SampleFormat::U16 => device.build_input_stream(
             &config,
             move |data: &[u16], _| {
-                if let Ok(mut recorder) = recorder.lock() {
-                    let samples: Vec<i16> = data
-                        .iter()
-                        .map(|sample| (*sample as i32 - 32768) as i16)
-                        .collect();
-                    let _ = recorder.push_samples(&samples);
+                let samples: Vec<i16> = data
+                    .iter()
+                    .map(|sample| (*sample as i32 - 32768) as i16)
+                    .collect();
+                if let Some(settled) = build(&samples) {
+                    if let Ok(mut recorder) = recorder.lock() {
+                        let _ = recorder.push_samples(&settled);
+                    }
                 }
             },
             error_callback,
@@ -379,19 +553,43 @@ fn build_input_stream(
 fn spawn_recorder(
     root: PathBuf,
     ready: mpsc::SyncSender<Result<(), String>>,
+    device_ids: Vec<String>,
 ) -> Sender<RecorderCommand> {
     let (commands, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let result = (|| -> Result<(), String> {
-            let device = cpal::default_host()
-                .default_input_device()
-                .ok_or_else(|| "no default microphone is available".to_string())?;
-            let supported = device.default_input_config().map_err(command_error)?;
+            let host = cpal::default_host();
+            // One entry per requested source; no ids → the default microphone.
+            let sources: Vec<(cpal::Device, &str)> = if device_ids.is_empty() {
+                let device = host
+                    .default_input_device()
+                    .ok_or_else(|| "no default microphone is available".to_string())?;
+                vec![(device, "mic")]
+            } else {
+                device_ids
+                    .iter()
+                    .map(|id| {
+                        bea_core::resolve_audio_device(Some(id))
+                            .map_err(command_error)
+                            .map(|(device, kind)| (device, kind))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+            };
+            // Master format: the first source's native configuration. Every
+            // source is converted (downmix/resample) into this shape, so the
+            // recorder and the downstream ASR pipeline see one consistent
+            // timeline.
+            let master_config = sources
+                .first()
+                .and_then(|(device, _)| device.default_input_config().ok())
+                .ok_or_else(|| "no usable audio configuration for the selected devices".to_string())?;
+            let master_rate = master_config.sample_rate().0;
+            let master_channels = master_config.channels();
             let mut recorder = SegmentedWavRecorder::new(
                 root,
                 RecorderConfig {
-                    sample_rate: supported.sample_rate().0,
-                    channels: supported.channels(),
+                    sample_rate: master_rate,
+                    channels: master_channels,
                     // Whisper-family engines only process the first 30 s of an
                     // input; keep recorded chunks under that ceiling.
                     chunk_seconds: 28,
@@ -402,9 +600,27 @@ fn spawn_recorder(
             recorder.start().map_err(command_error)?;
             let recorder = Arc::new(Mutex::new(recorder));
             let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-            let stream =
-                build_input_stream(&device, &supported, Arc::clone(&recorder), Arc::clone(&stream_error))?;
-            stream.play().map_err(command_error)?;
+            let mixer: Arc<Mutex<bea_core::AudioMixer>> = Arc::new(Mutex::new(bea_core::AudioMixer::new(
+                master_rate,
+                master_channels,
+            )));
+            let source_frames: Arc<Mutex<HashMap<&'static str, u64>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+            let mut streams = Vec::new();
+            for (device, kind) in &sources {
+                let supported = device.default_input_config().map_err(command_error)?;
+                let stream = build_input_stream(
+                    device,
+                    &supported,
+                    Arc::clone(&recorder),
+                    Arc::clone(&mixer),
+                    Arc::clone(&source_frames),
+                    if *kind == "output" { "output" } else { "mic" },
+                    Arc::clone(&stream_error),
+                )?;
+                stream.play().map_err(command_error)?;
+                streams.push(stream);
+            }
             ready
                 .send(Ok(()))
                 .map_err(|_| "recording startup acknowledgement failed".to_string())?;
@@ -424,11 +640,30 @@ fn spawn_recorder(
                             .and_then(|mut value| value.resume().map_err(command_error));
                         let _ = reply.send(result);
                     }
-                    RecorderCommand::Stop(reply) => {
-                        let result = recorder
+                    RecorderCommand::Level(reply) => {
+                        // Peak level of the live master buffer, 0.0-1.0.
+                        let level = mixer
                             .lock()
-                            .map_err(|_| "recorder lock poisoned".to_string())
-                            .and_then(|mut value| value.stop().map_err(command_error));
+                            .ok()
+                            .map(|mixer| mixer.peak_level())
+                            .unwrap_or(0.0);
+                        let _ = reply.send(level);
+                    }
+                    RecorderCommand::Stop(reply) => {
+                        let result = (|| -> Result<Vec<CompletedAudioChunk>, String> {
+                            // Flush the mixer's unsettled tail first so the
+                            // last fraction of a second is not lost, then stop
+                            // the recorder to finalize the final chunk.
+                            let tail = mixer
+                                .lock()
+                                .map_err(|_| "mixer lock poisoned".to_string())?
+                                .drain();
+                            let mut recorder = recorder
+                                .lock()
+                                .map_err(|_| "recorder lock poisoned".to_string())?;
+                            recorder.push_samples(&tail).map_err(command_error)?;
+                            recorder.stop().map_err(command_error)
+                        })();
                         // A stream error mid-recording invalidates the audio:
                         // report it instead of handing back partial data.
                         let stream_error = stream_error
@@ -446,7 +681,7 @@ fn spawn_recorder(
                     }
                 }
             }
-            drop(stream);
+            drop(streams);
             Ok(())
         })();
         if let Err(error) = result {
@@ -493,6 +728,48 @@ fn rename_meeting_command(
 fn delete_meeting_command(state: State<'_, AppState>, meeting_id: String) -> Result<(), String> {
     let database = open_database(&state.database_path).map_err(command_error)?;
     delete_meeting(&database, &meeting_id).map_err(command_error)
+}
+
+/// Wipes every piece of user data: the SQLite database (meetings, transcripts,
+/// minutes, chat notes, speakers, usage), generated/derived media, recordings,
+/// and the ChatGPT sign-in token file. Downloaded engines and local tools are
+/// kept — they are program assets, not user data. The database file is
+/// recreated empty on the next command.
+#[tauri::command]
+fn delete_all_data_command(state: State<'_, AppState>) -> Result<(), String> {
+    let root = state
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    // Best-effort: remove every stored credential we know about so a
+    // "delete all" really leaves nothing sensitive behind.
+    if let Ok(entry) = Entry::new("bea-provider", CODEX_KEYRING_ID) {
+        let _ = entry.delete_credential();
+    }
+    if let Ok(entry) = Entry::new("bea-provider", "primary") {
+        let _ = entry.delete_credential();
+    }
+    if let Ok(token_path) = codex_token_path() {
+        let _ = std::fs::remove_file(token_path);
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let database_path = PathBuf::from(format!(
+            "{}{suffix}",
+            state.database_path.to_string_lossy()
+        ));
+        if database_path.exists() {
+            std::fs::remove_file(&database_path)
+                .map_err(|error| format!("could not delete the database: {error}"))?;
+        }
+    }
+    for directory in ["derived", "recordings", "media"] {
+        let target = root.join(directory);
+        if target.exists() {
+            std::fs::remove_dir_all(&target)
+                .map_err(|error| format!("could not delete {directory}: {error}"))?;
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -765,6 +1042,19 @@ fn gather_visual_context(
     Ok((frames, ocr_block))
 }
 
+/// Decodes a `data:image/...;base64,<payload>` URL into raw bytes. Used for
+/// chat attachments pasted or uploaded in the UI.
+fn decode_data_url(data_url: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let payload = data_url
+        .split_once(',')
+        .map(|(_, payload)| payload)
+        .ok_or("image payload must be a data URL")?;
+    base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .map_err(|error| format!("image data was not valid base64: {error}"))
+}
+
 #[tauri::command]
 fn waveform_peaks_command(path: String, peak_count: Option<usize>) -> Result<Vec<f32>, String> {
     waveform_peaks(path, peak_count.unwrap_or(256)).map_err(command_error)
@@ -858,7 +1148,50 @@ async fn test_provider_connection_command(
     if !response.status().is_success() {
         return Err(format!("provider returned HTTP {}", response.status()));
     }
+    // A 200 with a non-JSON body (HTML error page, empty body, compressed
+    // bytes) must fail here, not later during minutes generation.
+    let raw = response.text().await.map_err(command_error)?;
+    let payload: serde_json::Value = serde_json::from_str(&raw).map_err(|_| {
+        format!(
+            "provider response was not valid JSON; body started with: {:?}",
+            raw.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).take(160).collect::<String>()
+        )
+    })?;
+    if payload.get("choices").and_then(serde_json::Value::as_array).is_none() {
+        return Err(format!(
+            "provider response had no choices[] — check the model id and endpoint; body: {:?}",
+            raw.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).take(160).collect::<String>()
+        ));
+    }
     Ok(())
+}
+
+/// Preflight for minutes models: runs the real pipeline (Responses/chat
+/// translation, minutes JSON schema, minutes parser) against a tiny synthetic
+/// transcript, so a model that cannot produce usable minutes JSON is rejected
+/// at selection time instead of after a full meeting.
+#[tauri::command]
+async fn validate_minutes_model_command(
+    provider: ProviderConfig,
+    api_key: String,
+) -> Result<(), String> {
+    if provider.base_url.trim().is_empty() || provider.model.trim().is_empty() {
+        return Err("provider URL and model are required".into());
+    }
+    if api_key.trim().is_empty() && provider.kind.requires_api_key() {
+        return Err("an API key is required for the minutes validation".into());
+    }
+    let request = LlmRequest {
+        model: provider.model.clone(),
+        system: MEETING_SECRETARY_SYSTEM_PROMPT.to_string(),
+        user: r#"[{"start_seconds":0,"end_seconds":14,"speaker":1,"text":"We decided to ship the beta build on Friday."},{"start_seconds":14,"end_seconds":30,"speaker":2,"text":"I will prepare the release notes by Thursday. The budget review is still unresolved."}]"#.into(),
+        json_schema: MINUTES_JSON_SCHEMA.into(),
+        max_output_tokens: 900,
+    };
+    bea_core::call_provider(&provider, &request, Some(&api_key))
+        .await
+        .map(|_| ())
+        .map_err(command_error)
 }
 
 #[tauri::command]
@@ -915,19 +1248,62 @@ fn keyring_secret(provider: &ProviderConfig) -> Option<String> {
 const CODEX_KEYRING_ID: &str = "codex-oauth";
 const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
+/// OAuth tokens live in a user-profile JSON file instead of Windows
+/// Credential Manager: the credential blob is capped at 2560 bytes (UTF-16),
+/// and a single ChatGPT access token alone can exceed that, which made every
+/// sign-in fail with "longer than platform limit of 2560 chars". Same
+/// approach as the Codex CLI's own auth.json — outside the project database,
+/// readable only by the current user.
+fn codex_token_path() -> Result<PathBuf, String> {
+    let base = if let Ok(app_dir) = std::env::var("BEA_APP_DATA") {
+        PathBuf::from(app_dir)
+    } else {
+        let appdata = std::env::var("APPDATA")
+            .map_err(|_| "APPDATA is not set; cannot resolve the token storage path".to_string())?;
+        PathBuf::from(appdata).join("com.bea.meetingassistant")
+    };
+    std::fs::create_dir_all(&base).map_err(command_error)?;
+    Ok(base.join("codex-auth.json"))
+}
+
 fn load_codex_tokens() -> Option<bea_core::codex_oauth::CodexTokens> {
-    let raw = Entry::new("bea-provider", CODEX_KEYRING_ID)
-        .ok()?
-        .get_password()
-        .ok()?;
-    serde_json::from_str(&raw).ok()
+    // Preferred store: the user-profile token file.
+    if let Ok(path) = codex_token_path() {
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            if let Ok(tokens) = serde_json::from_str(&raw) {
+                return Some(tokens);
+            }
+        }
+    }
+    // Legacy store: the original Windows Credential Manager entry. One-way
+    // migration keeps users who signed in before the switch signed in.
+    let raw = Entry::new("bea-provider", CODEX_KEYRING_ID).ok()?.get_password().ok()?;
+    let tokens: bea_core::codex_oauth::CodexTokens = serde_json::from_str(&raw).ok()?;
+    if let (Ok(path), Ok(serialized)) =
+        (codex_token_path(), serde_json::to_string(&tokens))
+    {
+        if std::fs::write(&path, serialized).is_ok() {
+            if let Ok(entry) = Entry::new("bea-provider", CODEX_KEYRING_ID) {
+                let _ = entry.delete_credential();
+            }
+        }
+    }
+    Some(tokens)
 }
 
 fn store_codex_tokens(tokens: &bea_core::codex_oauth::CodexTokens) -> Result<(), String> {
-    let entry = Entry::new("bea-provider", CODEX_KEYRING_ID).map_err(command_error)?;
-    entry
-        .set_password(&serde_json::to_string(tokens).map_err(command_error)?)
-        .map_err(command_error)
+    let path = codex_token_path()?;
+    let serialized = serde_json::to_string(tokens).map_err(command_error)?;
+    // Atomic write: a crash mid-write must not corrupt the only token copy.
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, serialized).map_err(command_error)?;
+    std::fs::rename(&temporary, &path).map_err(command_error)?;
+    // Remove any oversized legacy Credential Manager entry; it can never be
+    // read successfully and only leaves stale tokens behind.
+    if let Ok(entry) = Entry::new("bea-provider", CODEX_KEYRING_ID) {
+        let _ = entry.delete_credential();
+    }
+    Ok(())
 }
 
 async fn exchange_codex_code(
@@ -1055,9 +1431,13 @@ async fn codex_oauth_login_command() -> Result<(), String> {
         bea_core::codex_oauth::authorize_url(&verifier),
         state
     );
-    // Open the default browser on the Windows host.
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", &url])
+    // Open the default browser on the Windows host. `cmd /C start` treats the
+    // URL's `&` characters as command separators — the browser then only ever
+    // sees `?response_type=code` and auth.openai.com answers with
+    // missing_required_parameter. rundll32's FileProtocolHandler passes the
+    // URL through untouched (verified with a local callback-server probe).
+    std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", &url])
         .spawn()
         .map_err(|e| format!("could not open the browser: {e}"))?;
     let code = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
@@ -1097,16 +1477,22 @@ fn codex_oauth_sign_out_command() -> Result<(), String> {
 
 #[tauri::command]
 async fn codex_list_models_command() -> Result<Vec<String>, String> {
+    // Mirrors what the Codex CLI sends when it lists models: bearer token,
+    // the account header, and a client_version query. Without the account
+    // header the backend answers with an empty/generic catalog.
+    let tokens = load_codex_tokens()
+        .ok_or("no ChatGPT sign-in — click Sign in with ChatGPT first")?;
     let token = fresh_codex_access_token().await?;
-    let response = http_client()
+    let mut request = http_client()
         .get(format!(
-            "{}/models",
+            "{}/models?client_version=0.149.0",
             bea_core::codex_oauth::CHATGPT_API_BASE
         ))
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(command_error)?;
+        .bearer_auth(token);
+    if !tokens.account_id.trim().is_empty() {
+        request = request.header("ChatGPT-Account-Id", tokens.account_id.trim());
+    }
+    let response = request.send().await.map_err(command_error)?;
     // The Codex backend may not publish a catalog; an empty list tells the
     // UI to fall back to the static model list.
     if !response.status().is_success() {
@@ -1151,6 +1537,10 @@ async fn generate_minutes_command(
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<Minutes, String> {
+    // A fresh run clears any stale cancellation flag from a previous attempt.
+    if let Ok(mut cancelled) = state.cancelled_minutes.lock() {
+        cancelled.remove(&meeting_id);
+    }
     let database = open_database(&state.database_path).map_err(command_error)?;
     let meeting = list_meetings(&database)
         .map_err(command_error)?
@@ -1188,6 +1578,15 @@ async fn generate_minutes_command(
                 let mut meeting_context =
                     bea_core::build_meeting_context(&speaker_names, custom_format.as_deref());
                 meeting_context.push_str(&format!("\n=== USER CLARIFICATIONS & CONTEXT (treat as authoritative) ===\n{user_notes}\n"));
+                // Prefill agenda on regenerate: if minutes already exist, surface
+                // their agenda so the model preserves/extends it instead of
+                // returning an empty list.
+                if let Ok(Some(previous)) = bea_core::load_minutes(&database, &meeting_id) {
+                    if !previous.agenda.is_empty() {
+                        let prev_headings = previous.agenda.iter().map(|a| format!("- {}", a.heading)).collect::<Vec<_>>().join("\n");
+                        meeting_context.push_str(&format!("\n=== PREVIOUS AGENDA (prefill — keep, refine, or extend; do not discard without reason) ===\n{prev_headings}\n"));
+                    }
+                }
                 // Visual context: when the meeting has a video, the AI pulls
                 // frames itself — evenly spaced across the video (vision
                 // models see the images; text-only models get their OCR text).
@@ -1240,15 +1639,28 @@ async fn generate_minutes_command(
                     model: effective_model,
                     system: format!("{}\n{}", MEETING_SECRETARY_SYSTEM_PROMPT, meeting_context),
                     user: serde_json::to_string(&pack.events).map_err(command_error)?,
-                    json_schema: r#"{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"agenda":{"type":"array","items":{"type":"object","properties":{"heading":{"type":"string"},"start_seconds":{"type":"number"},"end_seconds":{"type":"number"}},"required":["heading"]}},"visual_observations":{"type":"array","items":{"type":"string"}},"decisions":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"action_items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"unresolved":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}}},"required":["title","summary","decisions","action_items","unresolved"]}"#.into(),
-                    max_output_tokens: 4_000,
+                    json_schema: MINUTES_JSON_SCHEMA.into(),
+                    max_output_tokens: 8_000,
                 };
+                // Cancellation checkpoint: the wizard's Close stops the run
+                // before the (possibly long) provider request is even sent.
+                let was_cancelled = || {
+                    state
+                        .cancelled_minutes
+                        .lock()
+                        .map(|set| set.contains(&meeting_id))
+                        .unwrap_or(false)
+                };
+                if was_cancelled() {
+                    return Err("cancelled: minutes generation was closed before it finished".into());
+                }
                 let remote_result = if vision_images.is_empty() {
                     call_provider(&provider, &request, Some(&api_key)).await
                 } else {
                     // Vision path: send the frame images inline and parse the
-                    // minutes JSON out of the free-text reply.
-                    bea_core::call_provider_messages(
+                    // minutes JSON out of the free-text reply. A malformed
+                    // reply goes back for bounded self-repair before failing.
+                    match bea_core::call_provider_messages(
                         &provider,
                         &request.system,
                         &request.user,
@@ -1257,10 +1669,30 @@ async fn generate_minutes_command(
                         Some(&api_key),
                     )
                     .await
-                    .and_then(|text| bea_core::parse_minutes_json(&text))
+                    {
+                        Ok(text) => match bea_core::parse_minutes_json(&text) {
+                            Ok(minutes) => Ok(minutes),
+                            Err(error) => {
+                                bea_core::repair_minutes_reply(
+                                    &provider,
+                                    &request,
+                                    Some(&api_key),
+                                    text,
+                                    error,
+                                )
+                                .await
+                            }
+                        },
+                        Err(error) => Err(error),
+                    }
                 };
                 match remote_result {
                     Ok(remote_minutes) => {
+                        // The reply arrived after the user closed the wizard:
+                        // discard it instead of saving half-wanted minutes.
+                        if was_cancelled() {
+                            return Err("cancelled: minutes generation was closed before it finished".into());
+                        }
                         let output_tokens = estimate_tokens(
                             &serde_json::to_string(&remote_minutes).unwrap_or_default(),
                         ) as u64;
@@ -1292,8 +1724,32 @@ async fn generate_minutes_command(
             }
         }
     }
+    // Final checkpoint before persistence — the local-heuristic path reaches
+    // this too when no provider is configured.
+    if state
+        .cancelled_minutes
+        .lock()
+        .map(|set| set.contains(&meeting_id))
+        .unwrap_or(false)
+    {
+        return Err("cancelled: minutes generation was closed before it finished".into());
+    }
     save_minutes(&database, &meeting_id, &minutes).map_err(command_error)?;
     Ok(minutes)
+}
+
+/// Marks an in-flight minutes generation as cancelled. The next checkpoint in
+/// `generate_minutes_command` (before the provider request, after the reply,
+/// and before saving) aborts the run, so nothing overwrites the saved minutes.
+#[tauri::command]
+fn cancel_minutes_generation_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<(), String> {
+    if let Ok(mut cancelled) = state.cancelled_minutes.lock() {
+        cancelled.insert(meeting_id);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1458,6 +1914,17 @@ fn delete_context_event_command(
     Ok(())
 }
 
+/// Wipes every meeting's AI memory (chat Q&A history + clarify/context notes).
+/// Transcripts, minutes, and meetings are kept. Returns the removed row count.
+#[tauri::command]
+fn clear_ai_memory_command(state: State<'_, AppState>) -> Result<usize, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let removed = database
+        .execute("DELETE FROM context_events", [])
+        .map_err(command_error)?;
+    Ok(removed)
+}
+
 #[tauri::command]
 fn apply_mass_correction_command(
     state: State<'_, AppState>,
@@ -1504,6 +1971,7 @@ async fn chat_command(
     state: State<'_, AppState>,
     meeting_id: String,
     question: String,
+    images: Option<Vec<String>>,
 ) -> Result<serde_json::Value, String> {
     if question.trim().is_empty() {
         return Err("a question is required".into());
@@ -1619,6 +2087,69 @@ async fn chat_command(
             }
         }
     }
+    // User-attached images (pasted or uploaded in the Chat panel). Vision
+    // models receive the actual image; text-only models get a local Tesseract
+    // OCR pass instead so the content still reaches the model.
+    let attachments = images.unwrap_or_default();
+    if !attachments.is_empty() {
+        let root = state
+            .database_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        let safe_meeting_id = sanitize_meeting_id(&meeting_id)?;
+        let dir = root
+            .join("derived")
+            .join(&safe_meeting_id)
+            .join("chat-images");
+        std::fs::create_dir_all(&dir).map_err(command_error)?;
+        let vision = meeting_vision_capable(
+            &database,
+            &meeting_id,
+            &provider.kind,
+            &provider.model,
+        );
+        let engine = bea_core::TesseractOcrEngine {
+            executable: locate_tesseract(&root),
+            language: "eng".into(),
+        };
+        let stamp = chrono::Utc::now().timestamp_millis();
+        let mut ocr_parts: Vec<String> = Vec::new();
+        for (index, data_url) in attachments.iter().enumerate() {
+            let bytes = decode_data_url(data_url)?;
+            let path = dir.join(format!("attach-{stamp}-{}.png", index + 1));
+            std::fs::write(&path, &bytes).map_err(command_error)?;
+            if vision {
+                vision_images.push((path, String::new()));
+            } else {
+                let frame = bea_core::VisualFrame {
+                    id: format!("{meeting_id}-chat-{stamp}-{}", index + 1),
+                    timestamp_seconds: 0,
+                    path: path.clone(),
+                    thumbnail_path: None,
+                    perceptual_hash: String::new(),
+                    description: None,
+                };
+                if let Ok(result) = engine.extract_text(&frame) {
+                    let text = result.text.trim();
+                    if !text.is_empty() {
+                        ocr_parts.push(format!("[attached image {}]\n{}", index + 1, text));
+                    }
+                }
+            }
+        }
+        if vision {
+            frames_used += attachments.len();
+            mode = "vision".into();
+        } else if !ocr_parts.is_empty() {
+            frames_used += attachments.len();
+            mode = "ocr".into();
+            ocr_block.push_str(&format!(
+                "\n\n=== ATTACHED IMAGES (OCR text read locally with Tesseract) ===\n{}\n",
+                ocr_parts.join("\n---\n")
+            ));
+        }
+    }
     let system = format!(
         "You are Bea, an assistant answering questions about one meeting.\n{meeting_context}\nAnswer using ONLY the transcript, notes, and any visual context below. Cite speaker names and timestamps. If the answer is not in the material, say so plainly.\n\n=== MEETING NOTES (user-added clarifications/context) ===\n{}\n\n=== MEETING LEDGER ===\n{}\n\n=== FULL TRANSCRIPT ===\n{raw_transcript}{ocr_block}",
         list_context_events_payload(&database, &meeting_id)?,
@@ -1648,11 +2179,16 @@ async fn chat_command(
         .map_err(command_error)?
     };
     // Persist the Q&A pair so it survives restarts and feeds future minutes.
+    let asked = if attachments.is_empty() {
+        question.trim().to_string()
+    } else {
+        format!("{} [{} image{} attached]", question.trim(), attachments.len(), if attachments.len() == 1 { "" } else { "s" })
+    };
     add_context_event_command_inner(
         &database,
         &meeting_id,
         "chat",
-        &format!("Q: {}\nA: {}", question.trim(), answer),
+        &format!("Q: {}\nA: {}", asked, answer),
     )?;
     Ok(serde_json::json!({
         "answer": answer,
@@ -1918,6 +2454,11 @@ fn set_segment_speakers_command(
     speaker_indexes: Vec<u32>,
 ) -> Result<(), String> {
     let database = open_database(&state.database_path).map_err(command_error)?;
+    // An empty selection means "no speaker at all": clear the primary label
+    // too, not just the overlap rows.
+    if speaker_indexes.is_empty() {
+        bea_core::update_segment_speaker(&database, &segment_id, None).map_err(command_error)?;
+    }
     bea_core::set_segment_speakers(&database, &segment_id, &speaker_indexes).map_err(command_error)
 }
 
@@ -2385,6 +2926,30 @@ struct OpenRouterModelInfo {
     context_length: Option<u64>,
     /// True when OpenRouter reports "image" in the model's input modalities.
     vision_capable: bool,
+    /// True when OpenRouter reports "audio" in the model's input modalities.
+    audio_capable: bool,
+    /// True when OpenRouter reports "file" in the model's input modalities.
+    file_capable: bool,
+}
+
+fn openrouter_input_modalities(
+    model: &serde_json::Value,
+) -> (bool, bool, bool) {
+    // (vision, audio, file) — derived from OpenRouter's architecture
+    // input_modalities array on each model entry.
+    let modalities = model
+        .get("architecture")
+        .and_then(|value| value.get("input_modalities"))
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let has = |name: &str| modalities.iter().any(|value| value == &name);
+    (has("image"), has("audio"), has("file"))
 }
 
 #[tauri::command]
@@ -2420,16 +2985,18 @@ async fn fetch_openrouter_models_command() -> Result<Vec<OpenRouterModelInfo>, S
                         context_length: model
                             .get("context_length")
                             .and_then(|value| value.as_u64()),
-                        vision_capable: model
-                            .get("architecture")
-                            .and_then(|value| value.get("input_modalities"))
-                            .and_then(|value| value.as_array())
-                            .map(|values| {
-                                values
-                                    .iter()
-                                    .any(|value| value.as_str() == Some("image"))
-                            })
-                            .unwrap_or(false),
+                        vision_capable: {
+                            let (vision, _, _) = openrouter_input_modalities(model);
+                            vision
+                        },
+                        audio_capable: {
+                            let (_, audio, _) = openrouter_input_modalities(model);
+                            audio
+                        },
+                        file_capable: {
+                            let (_, _, file) = openrouter_input_modalities(model);
+                            file
+                        },
                     })
                 })
                 .collect()
@@ -3080,8 +3647,37 @@ fn list_audio_input_devices_command() -> Result<Vec<bea_core::AudioInputDevice>,
     list_audio_input_devices().map_err(command_error)
 }
 
+/// Live input level (0.0-1.0) of the meeting's active recorder, for the
+/// recording UI's meter. Errors as "recording not found" when idle.
 #[tauri::command]
-fn start_recording_command(state: State<'_, AppState>, meeting_id: String) -> Result<(), String> {
+fn recording_level_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<f32, String> {
+    let sender = {
+        let recorders = state
+            .recorders
+            .lock()
+            .map_err(|_| "recorder state lock poisoned".to_string())?;
+        recorders
+            .get(&meeting_id)
+            .ok_or_else(|| "recording not found".to_string())?
+            .clone()
+    };
+    let (tx, rx) = mpsc::sync_channel(1);
+    sender
+        .send(RecorderCommand::Level(tx))
+        .map_err(command_error)?;
+    rx.recv_timeout(std::time::Duration::from_secs(2))
+        .map_err(|_| "recording thread stopped or timed out".to_string())
+}
+
+#[tauri::command]
+fn start_recording_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    device_ids: Option<Vec<String>>,
+) -> Result<(), String> {
     // Meeting ids reach filesystem paths here (recordings/<id>); sanitize.
     let meeting_id = sanitize_meeting_id(&meeting_id)?;
     let database = open_database(&state.database_path).map_err(command_error)?;
@@ -3104,7 +3700,7 @@ fn start_recording_command(state: State<'_, AppState>, meeting_id: String) -> Re
     }
     bea_core::start_recording(&database, &meeting_id, &root).map_err(command_error)?;
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-    let commands = spawn_recorder(root, ready_tx);
+    let commands = spawn_recorder(root, ready_tx, device_ids.unwrap_or_default());
     ready_rx
         .recv()
         .map_err(|_| "recording thread stopped during startup".to_string())??;
@@ -3380,6 +3976,7 @@ fn main() {
                 database_path: data_dir.join("bea.db"),
                 recorders: Mutex::new(HashMap::new()),
                 speaker_models_lock: tauri::async_runtime::Mutex::new(()),
+                cancelled_minutes: Mutex::new(std::collections::HashSet::new()),
             });
             bea_core::updater::spawn_scheduled_checks(app.handle().clone());
             Ok(())
@@ -3393,6 +3990,8 @@ fn main() {
             list_meetings_command,
             rename_meeting_command,
             delete_meeting_command,
+            delete_all_data_command,
+            cancel_minutes_generation_command,
             update_transcript_segment_command,
             list_media_command,
             extract_frames_command,
@@ -3400,6 +3999,7 @@ fn main() {
             waveform_peaks_command,
             repair_runtime_command,
             test_provider_connection_command,
+            validate_minutes_model_command,
             search_transcript_command,
             list_transcript_command,
             load_minutes_command,
@@ -3416,6 +4016,7 @@ fn main() {
             add_context_event_command,
             list_context_events_command,
             delete_context_event_command,
+            clear_ai_memory_command,
             apply_mass_correction_command,
             chat_command,
             save_custom_minutes_format_command,
@@ -3449,6 +4050,7 @@ fn main() {
             codex_oauth_sign_out_command,
             codex_list_models_command,
             list_audio_input_devices_command,
+            recording_level_command,
             start_recording_command,
             pause_recording_command,
             resume_recording_command,
