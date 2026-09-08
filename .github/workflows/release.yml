@@ -1,0 +1,49 @@
+name: release
+
+# Publishes signed installers + latest.json on a vX.Y tag push.
+# Tag pattern matches only two-digit tags: v1.0, v1.1, ... (v1.0.1 rejected).
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build and sign Tauri bundles
+        run: npx tauri build --target x86_64-pc-windows-msvc
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Generate updater manifest
+        run: node scripts/latest-json.mjs "${{ github.ref_name }}"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            latest.json
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.sig
+            src-tauri/target/release/bundle/msi/*.msi
+          fail_on_unmatched_files: true

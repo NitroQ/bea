@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Rust / Cargo build output
+src-tauri/target/
+
+# Tauri generated schemas
+src-tauri/gen/schemas/
+
+# Sidecar binaries (downloaded/built locally: ffmpeg, ffprobe, tesseract)
+src-tauri/binaries/
+
+# Downloaded assets & toolchains (models, tesseract build deps, test recordings)
+files/
+
+# Logs
+*.log
+
+# Local tool state
+.hermes/
+.trae/
+
+# Personal notes
+IDEA.md
+
+# Local Windows scripts
+scripts/*.ps1
+scripts/regenerate_minutes.py
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
