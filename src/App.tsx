@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import type { AsrEngineDescriptor, AsrEngineId, Meeting, Minutes, OpenRouterModelInfo, ProviderConfig, RuntimeAvailability, SetupStatus, TranscriptLanguage, TranscriptSegment } from './types';
+import { REASONING_EFFORTS } from './types';
 import { CODEX_FALLBACK_MODELS, DEFAULT_BASE_URLS, LOCAL_PRESETS } from './providerPresets';
 import { loadMeetings, saveMeetings } from './meetingStore';
 import SetupFlow, { type EngineProgress } from './SetupFlow';
@@ -14,7 +15,7 @@ import BeaAvatar from './BeaAvatar';
 import { UpdateSettingsSection } from './UpdateSettings';
 import './styles.css';
 
-const initialProvider: ProviderConfig = { id: 'primary', kind: 'OpenRouter', base_url: 'https://openrouter.ai/api/v1', model: '', credential_ref: null, enabled: false };
+const initialProvider: ProviderConfig = { id: 'primary', kind: 'OpenRouter', base_url: 'https://openrouter.ai/api/v1', model: '', credential_ref: null, enabled: false, reasoning_effort: 'off' };
 export const initialEngines: AsrEngineDescriptor[] = [
   { id: 'whisper-compatibility', name: 'Bea Standard · Whisper', description: 'Broad language coverage and reliable Taglish transcription.', languages: '99 languages · EN · FIL · Taglish', size: 'Turbo · 1.6 GB', status: 'missing', recommended: true, detail: 'sherpa-onnx · local' },
   { id: 'qwen-standard', name: 'Qwen ASR', description: 'Fast local transcription for English, Filipino, and Taglish.', languages: 'EN · FIL · Taglish', size: '0.6B · 1.2 GB', status: 'missing', detail: 'sherpa-onnx · INT8' },
@@ -346,6 +347,14 @@ function SettingsScreen({ status, provider, apiKey, onBack, onRefresh, onRepair,
                 ariaLabel="Default AI model"
               />
               <small className="field-help">Default model for minutes and chat. Badges show Visual / Audio / File input support from the provider catalog. A meeting can override it in its Chat tab.</small>
+            </label>
+          )}
+          {provider.kind !== 'OpenAiOAuth' && provider.kind !== 'ClaudeCompatible' && (
+            <label>Reasoning
+              <select value={provider.reasoning_effort ?? 'off'} onChange={(event) => onProviderChange({ ...provider, reasoning_effort: event.target.value as ProviderConfig['reasoning_effort'] })}>
+                {REASONING_EFFORTS.map((option) => <option key={option.id} value={option.id} title={option.hint}>{option.label}</option>)}
+              </select>
+              <small className="field-help">Default thinking effort for minutes and chat. Off is fastest; higher efforts think longer (each attempt waits up to 200s, up to 3 attempts). A meeting can override it in its Chat tab.</small>
             </label>
           )}
           {provider.kind !== 'OpenAiOAuth' && <label>Base URL<input value={provider.base_url} onChange={(event) => onProviderChange({ ...provider, base_url: event.target.value })} placeholder="https://…" /></label>}

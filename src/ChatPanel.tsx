@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { SLASH_COMMANDS, SLASH_HELP } from './chatActions';
 import ModelSelect from './ModelSelect';
 import type { OpenRouterModelInfo } from './types';
+import { REASONING_EFFORTS, normalizeReasoningEffort } from './types';
 import Icon from './Icon';
 import BeaAvatar from './BeaAvatar';
 
@@ -14,6 +15,9 @@ type Props = {
   meetingModel: string;
   modelOptions: string[];
   openRouterModels?: OpenRouterModelInfo[];
+  /// Per-meeting reasoning override; empty string means "use the Settings default".
+  meetingReasoning: string;
+  onReasoningChange: (reasoning: string) => void;
   /// Whether the selected model accepts images (null = unknown → no warning).
   visionCapable?: boolean | null;
   onModelChange: (model: string) => void;
@@ -32,7 +36,7 @@ export function modelLooksVisionCapable(modelId: string, catalog: OpenRouterMode
   return ['gpt-4o', 'gpt-4.1', 'gpt-5', 'o3', 'o4', 'claude-3', 'claude-4', 'gemini', 'pixtral', 'llava', 'vl', 'vision'].some((marker) => id.includes(marker));
 }
 
-export default function ChatPanel({ messages, busy, hasCustomFormat, meetingModel, modelOptions, openRouterModels = [], visionCapable = null, onModelChange, onSend, onOpenCustomFormat }: Props) {
+export default function ChatPanel({ messages, busy, hasCustomFormat, meetingModel, modelOptions, openRouterModels = [], meetingReasoning, onReasoningChange, visionCapable = null, onModelChange, onSend, onOpenCustomFormat }: Props) {
   const [input, setInput] = useState('');
   const [menuOpen, setMenuOpen] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -112,6 +116,12 @@ export default function ChatPanel({ messages, busy, hasCustomFormat, meetingMode
           includeDefaultOption
           ariaLabel="Model for this meeting"
         />
+      </div>
+      <div className="chat-reasoning-select" title="Thinking effort for this meeting — leave on Default to use Settings">
+        <select value={meetingReasoning.trim() === '' ? '' : normalizeReasoningEffort(meetingReasoning)} onChange={(event) => onReasoningChange(event.target.value)} aria-label="Reasoning effort for this meeting">
+          <option value="">Reasoning: Default</option>
+          {REASONING_EFFORTS.map((option) => <option key={option.id} value={option.id} title={option.hint}>Reasoning: {option.label}</option>)}
+        </select>
       </div>
       <button type="button" className="secondary small" onClick={() => fileRef.current?.click()} title="Attach images for the model as reference">
         <Icon name="image" size={14} />Attach

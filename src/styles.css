@@ -480,6 +480,9 @@ select option { background: #0e151d; color: var(--text); }
 
 .chat-model-select { display: inline-flex; align-items: center; }
 .chat-model-select select { min-width: 180px; max-width: 240px; min-height: 32px; font-size: 11px; padding: 0 28px 0 10px; background: var(--surface-3); border: 1px solid var(--line); border-radius: 6px; }
+.chat-reasoning-select { display: inline-flex; align-items: center; position: relative; }
+.chat-reasoning-select::after { content: '▾'; position: absolute; right: 10px; color: var(--quiet); font-size: 10px; pointer-events: none; }
+.chat-reasoning-select select { min-height: 32px; font-size: 11px; padding: 0 26px 0 10px; background: var(--surface-3); border: 1px solid var(--line); border-radius: 6px; color: var(--muted); appearance: none; }
 .chat-command-menu { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 30; display: grid; min-width: 320px; padding: 6px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-2); box-shadow: 0 10px 26px #00000055; }
 
 .chat-command-menu button { display: flex; align-items: baseline; gap: 10px; min-height: 32px; padding: 6px 9px; border: 0; border-radius: 6px; background: transparent; color: var(--text); text-align: left; font-size: 12px; }

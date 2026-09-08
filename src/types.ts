@@ -13,7 +13,19 @@ export type RuntimeAvailability = { asr_model_available: boolean; ffmpeg_availab
 export type ModelManifest = { id: string; name: string; version: string; size_bytes: number; sha256: string; runtime: string; languages: string[]; installed: boolean };
 export type ProviderKind = 'OpenRouter' | 'OpenAiCompatible' | 'ClaudeCompatible' | 'Local' | 'OpenAiOAuth';
 export type LocalServerPreset = 'lm-studio' | 'ollama' | 'llamacpp';
-export type ProviderConfig = { id: string; kind: ProviderKind; base_url: string; model: string; credential_ref?: string | null; enabled: boolean };
+/// Reasoning effort for the model: 'off' disables thinking (default, previous
+/// behavior); low/medium/high enable it with that effort. Stored on the
+/// provider (Settings default) with an optional per-meeting override.
+export type ReasoningEffort = 'off' | 'low' | 'medium' | 'high';
+export const REASONING_EFFORTS: Array<{ id: ReasoningEffort; label: string; hint: string }> = [
+  { id: 'off', label: 'Off', hint: 'No thinking — fastest, JSON lands directly in the reply' },
+  { id: 'low', label: 'Low', hint: 'Light thinking for simple meetings' },
+  { id: 'medium', label: 'Medium', hint: 'Balanced thinking for typical meetings' },
+  { id: 'high', label: 'High', hint: 'Deep thinking for complex meetings — slower, up to 200s per attempt' },
+];
+export const normalizeReasoningEffort = (value: string): ReasoningEffort =>
+  value === 'low' || value === 'medium' || value === 'high' ? value : 'off';
+export type ProviderConfig = { id: string; kind: ProviderKind; base_url: string; model: string; credential_ref?: string | null; enabled: boolean; reasoning_effort: ReasoningEffort };
 export type OpenRouterModelInfo = { id: string; name: string; context_length?: number | null; vision_capable: boolean; audio_capable: boolean; file_capable: boolean };
 export type ToolStatus = 'ready' | 'missing' | 'checking' | 'repairing' | 'error';
 export type SetupTool = { id: 'ffmpeg' | 'tesseract'; name: string; description: string; status: ToolStatus; detail: string };

@@ -322,6 +322,81 @@ impl ProviderKind {
         }
     }
 }
+
+/// Default reasoning effort: thinking disabled, matching the behavior before
+/// the setting existed.
+pub fn default_reasoning_effort() -> String {
+    "off".to_string()
+}
+
+/// How long a single provider HTTP request may take before it is abandoned.
+/// Slow hosted models (large context, high reasoning effort) can take minutes
+/// to produce minutes JSON; the timeout is generous so they are not cut off.
+pub const PROVIDER_TIMEOUT_SECS: u64 = 200;
+/// Time allowed to establish the connection; a stalled handshake fails fast
+/// and goes to the retry loop instead of burning the whole request budget.
+pub const PROVIDER_CONNECT_TIMEOUT_SECS: u64 = 15;
+/// Total transport attempts per provider request (the first try plus retries).
+/// Retries cover transient failures only (timeouts, connection errors, HTTP
+/// 429/5xx); authentication and client errors fail immediately.
+pub const PROVIDER_MAX_ATTEMPTS: usize = 3;
+
+/// Normalizes a free-form reasoning setting to the canonical set
+/// "off" | "low" | "medium" | "high". Unknown or empty values fall back to
+/// "off" so a typo can never produce a provider-rejected payload.
+pub fn normalize_reasoning_effort(value: &str) -> &'static str {
+    match value.trim().to_lowercase().as_str() {
+        "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        _ => "off",
+    }
+}
+
+/// Resolves the reasoning effort for one LLM call: the per-meeting override
+/// when set (chat tab picker), otherwise the provider default from Settings.
+pub fn effective_reasoning_effort(
+    meeting_override: Option<&str>,
+    provider_default: &str,
+) -> String {
+    match meeting_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => normalize_reasoning_effort(value).to_string(),
+        None => normalize_reasoning_effort(provider_default).to_string(),
+    }
+}
+
+/// The `reasoning` object for chat-completions bodies. "off" disables
+/// thinking (previous behavior); any other level enables it with that effort.
+pub fn reasoning_body_value(effort: &str) -> serde_json::Value {
+    match normalize_reasoning_effort(effort) {
+        "off" => serde_json::json!({"enabled": false}),
+        level => serde_json::json!({"enabled": true, "effort": level}),
+    }
+}
+
+/// Adds the `reasoning` key to a chat-completions body. OpenRouter keeps the
+/// explicit `enabled` flag for "off" (its documented contract and the
+/// pre-existing behavior); OpenAi-compatible and Local endpoints only receive
+/// the key when thinking is actually enabled, because strict servers (e.g.
+/// OpenAI's official API) reject unknown top-level parameters and previously
+/// worked without the key at all. Claude-compatible proxies use their own
+/// thinking contract, so the key is left untouched for them.
+fn attach_chat_reasoning(body: &mut serde_json::Value, kind: &ProviderKind, effort: &str) {
+    match kind {
+        ProviderKind::OpenRouter => {
+            body["reasoning"] = reasoning_body_value(effort);
+        }
+        ProviderKind::OpenAiCompatible | ProviderKind::Local => {
+            if normalize_reasoning_effort(effort) != "off" {
+                body["reasoning"] = reasoning_body_value(effort);
+            }
+        }
+        ProviderKind::ClaudeCompatible | ProviderKind::OpenAiOAuth => {}
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderConfig {
     pub id: String,
@@ -330,6 +405,12 @@ pub struct ProviderConfig {
     pub model: String,
     pub credential_ref: Option<String>,
     pub enabled: bool,
+    /// Reasoning effort for the model: "off" | "low" | "medium" | "high".
+    /// "off" preserves the previous behavior (thinking disabled where the
+    /// provider supports it). Serde-defaulted so saved configs from older
+    /// builds still deserialize.
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UsageRecord {
@@ -348,6 +429,10 @@ pub struct LlmRequest {
     pub user: String,
     pub json_schema: String,
     pub max_output_tokens: u32,
+    /// Reasoning effort carried from the resolved provider/meeting setting.
+    /// Serde-defaulted so older callers/tests without the field keep working.
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderRequest {
@@ -2405,6 +2490,16 @@ pub fn open_database(path: impl AsRef<Path>) -> Result<Connection, BeaError> {
             return Err(BeaError::Database(error));
         }
     }
+    // Reasoning-effort setting for the AI provider ("off" preserves the
+    // pre-setting behavior). Old databases gain the column with the default.
+    if let Err(error) = conn.execute(
+        "ALTER TABLE provider_configs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'off'",
+        [],
+    ) {
+        if !error.to_string().contains("duplicate column name") {
+            return Err(BeaError::Database(error));
+        }
+    }
     Ok(conn)
 }
 
@@ -3566,7 +3661,7 @@ pub fn extract_model_archive(source: &Path, destination: &Path) -> Result<(), Be
 }
 
 pub fn save_provider(conn: &Connection, provider: &ProviderConfig) -> Result<(), BeaError> {
-    conn.execute("INSERT OR REPLACE INTO provider_configs(id,kind,base_url,model,credential_ref,enabled) VALUES (?1,?2,?3,?4,?5,?6)", params![provider.id,provider.kind.as_str(),provider.base_url,provider.model,provider.credential_ref,provider.enabled])?;
+    conn.execute("INSERT OR REPLACE INTO provider_configs(id,kind,base_url,model,credential_ref,enabled,reasoning_effort) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![provider.id,provider.kind.as_str(),provider.base_url,provider.model,provider.credential_ref,provider.enabled,normalize_reasoning_effort(&provider.reasoning_effort)])?;
     Ok(())
 }
 
@@ -3620,9 +3715,9 @@ pub fn waveform_peaks(
 }
 
 pub fn load_provider(conn: &Connection, id: &str) -> Result<Option<ProviderConfig>, BeaError> {
-    let row: Option<(String, String, String, String, Option<String>, bool)> = conn
+    let row: Option<(String, String, String, String, Option<String>, bool, Option<String>)> = conn
         .query_row(
-            "SELECT id,kind,base_url,model,credential_ref,enabled FROM provider_configs WHERE id=?1",
+            "SELECT id,kind,base_url,model,credential_ref,enabled,reasoning_effort FROM provider_configs WHERE id=?1",
             params![id],
             |row| {
                 Ok((
@@ -3632,12 +3727,13 @@ pub fn load_provider(conn: &Connection, id: &str) -> Result<Option<ProviderConfi
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )
         .optional()?;
     Ok(
-        row.map(|(id, kind, base_url, model, credential_ref, enabled)| {
+        row.map(|(id, kind, base_url, model, credential_ref, enabled, reasoning_effort)| {
             let kind = match kind.as_str() {
                 "openrouter" => ProviderKind::OpenRouter,
                 "openai_compatible" => ProviderKind::OpenAiCompatible,
@@ -3653,6 +3749,9 @@ pub fn load_provider(conn: &Connection, id: &str) -> Result<Option<ProviderConfi
                 model,
                 credential_ref,
                 enabled,
+                reasoning_effort: reasoning_effort
+                    .map(|value| normalize_reasoning_effort(&value).to_string())
+                    .unwrap_or_else(default_reasoning_effort),
             }
         }),
     )
@@ -3690,13 +3789,10 @@ pub fn build_provider_request(provider: &ProviderConfig, request: &LlmRequest) -
     if !request.json_schema.trim().is_empty() {
         body["response_format"] = serde_json::json!({"type": "json_schema", "json_schema": {"name": "bea_minutes", "strict": true, "schema": serde_json::from_str::<serde_json::Value>(&request.json_schema).unwrap_or_else(|_| serde_json::json!({"type": "object"}))}});
     }
-    // Reasoning models (e.g. qwen3 on OpenRouter) burn the whole output budget
-    // on `message.reasoning` and return `content: null`, which makes minutes
-    // generation silently fall back to the local extractor. Disable thinking
-    // for OpenRouter-hosted models so the JSON actually arrives in `content`.
-    if provider.kind == ProviderKind::OpenRouter {
-        body["reasoning"] = serde_json::json!({"enabled": false});
-    }
+    // Reasoning effort comes from Settings (provider default) with an optional
+    // per-meeting override in the chat tab; both ride on the request. See
+    // `attach_chat_reasoning` for the per-kind contract.
+    attach_chat_reasoning(&mut body, &provider.kind, &request.reasoning_effort);
     ProviderRequest {
         url,
         model: request.model.clone(),
@@ -3716,6 +3812,7 @@ pub fn build_multimodal_body(
     user_text: &str,
     images: &[(PathBuf, String)], // (frame path, ocr_text) pairs
     max_tokens: u32,
+    reasoning_effort: &str,
 ) -> serde_json::Value {
     if images.is_empty() {
         if provider.kind == ProviderKind::OpenAiOAuth {
@@ -3725,10 +3822,11 @@ pub fn build_multimodal_body(
                 user: user_text.to_string(),
                 json_schema: String::new(),
                 max_output_tokens: max_tokens,
+                reasoning_effort: reasoning_effort.to_string(),
             };
             return codex_oauth::responses_payload(&request);
         }
-        return serde_json::json!({
+        let mut body = serde_json::json!({
             "model": provider.model,
             "messages": [
                 {"role": "system", "content": system},
@@ -3736,6 +3834,8 @@ pub fn build_multimodal_body(
             ],
             "max_tokens": max_tokens,
         });
+        attach_chat_reasoning(&mut body, &provider.kind, reasoning_effort);
+        return body;
     }
     if provider.kind == ProviderKind::OpenAiOAuth {
         let request = LlmRequest {
@@ -3744,6 +3844,7 @@ pub fn build_multimodal_body(
             user: user_text.to_string(),
             json_schema: String::new(),
             max_output_tokens: max_tokens,
+            reasoning_effort: reasoning_effort.to_string(),
         };
         return codex_oauth::responses_payload_multimodal(&request, images);
     }
@@ -3759,14 +3860,16 @@ pub fn build_multimodal_body(
             "image_url": {"url": format!("data:image/jpeg;base64,{b64}")}
         }));
     }
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": provider.model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": parts}
         ],
         "max_tokens": max_tokens,
-    })
+    });
+    attach_chat_reasoning(&mut body, &provider.kind, reasoning_effort);
+    body
 }
 
 /// Sends a multimodal (text+frame images) chat completion and returns free
@@ -3779,6 +3882,7 @@ pub async fn call_provider_messages(
     user_text: &str,
     images: &[(PathBuf, String)],
     max_output_tokens: u32,
+    reasoning_effort: &str,
     api_key: Option<&str>,
 ) -> Result<String, BeaError> {
     let base = provider.base_url.trim_end_matches('/');
@@ -3789,28 +3893,10 @@ pub async fn call_provider_messages(
         ProviderKind::Local => format!("{base}/v1/chat/completions"),
         ProviderKind::OpenAiOAuth => format!("{base}/responses"),
     };
-    let body = build_multimodal_body(provider, system, user_text, images, max_output_tokens);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
-        .build()
-        .map_err(|e| BeaError::ProviderRequest(e.to_string()))?;
-    let mut builder = client.post(url).json(&body);
-    if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
-        builder = builder.bearer_auth(key);
-    }
-    let response = builder
-        .send()
-        .await
-        .map_err(|e| BeaError::ProviderRequest(e.to_string()))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(BeaError::ProviderRequest(format!("HTTP {status}")));
-    }
-    let raw = response
-        .text()
-        .await
-        .map_err(|e| BeaError::ProviderRequest(e.to_string()))?;
-    let payload: serde_json::Value = parse_provider_payload(&raw)?;
+    let body =
+        build_multimodal_body(provider, system, user_text, images, max_output_tokens, reasoning_effort);
+    // Same 200 s budget and transient-failure retries as the text path above.
+    let payload: serde_json::Value = post_provider_json(url, &body, api_key).await?;
     if provider.kind == ProviderKind::OpenAiOAuth {
         return Ok(codex_oauth::responses_output_text(&payload).unwrap_or_default());
     }
@@ -3936,32 +4022,79 @@ async fn send_provider_request(
     api_key: Option<&str>,
 ) -> Result<serde_json::Value, BeaError> {
     let prepared = build_provider_request(provider, request);
-    // Bounded request so a stalled provider endpoint can never freeze minutes
-    // generation the way a hung ASR decode used to freeze transcription.
+    post_provider_json(prepared.url, &prepared.body, api_key).await
+}
+
+/// POSTs a JSON body to a provider endpoint and returns the parsed payload,
+/// retrying transient failures up to `PROVIDER_MAX_ATTEMPTS` times with a
+/// short backoff so a slow or briefly-overloaded model does not fail the whole
+/// minutes/chat run. Every attempt waits up to `PROVIDER_TIMEOUT_SECS`, so a
+/// slow model still has room to finish without freezing the app forever the
+/// way a hung ASR decode used to freeze transcription.
+async fn post_provider_json(
+    url: String,
+    body: &serde_json::Value,
+    api_key: Option<&str>,
+) -> Result<serde_json::Value, BeaError> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(PROVIDER_TIMEOUT_SECS))
+        .connect_timeout(std::time::Duration::from_secs(
+            PROVIDER_CONNECT_TIMEOUT_SECS,
+        ))
         .build()
         .map_err(|error| BeaError::ProviderRequest(error.to_string()))?;
-    let mut request_builder = client.post(prepared.url).json(&prepared.body);
-    if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
-        request_builder = request_builder.bearer_auth(key);
+    let mut last_error: Option<BeaError> = None;
+    for attempt in 0..PROVIDER_MAX_ATTEMPTS {
+        if attempt > 0 {
+            // Linear backoff (1s, then 2s) so a briefly-overloaded endpoint
+            // gets a moment to recover; bounded so retries stay fast.
+            tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
+        }
+        let mut request_builder = client.post(url.clone()).json(body);
+        if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
+            request_builder = request_builder.bearer_auth(key);
+        }
+        let response = match request_builder.send().await {
+            Ok(response) => response,
+            Err(error)
+                if (error.is_timeout() || error.is_connect() || error.is_body())
+                    && attempt + 1 < PROVIDER_MAX_ATTEMPTS =>
+            {
+                last_error = Some(BeaError::ProviderRequest(error.to_string()));
+                continue;
+            }
+            Err(error) => return Err(BeaError::ProviderRequest(error.to_string())),
+        };
+        let status = response.status();
+        // Check status BEFORE parsing so non-JSON error bodies (HTML error
+        // pages, proxies) report "HTTP 500" instead of a confusing serde
+        // failure. Rate limits and server errors are worth a retry; other
+        // client errors (bad key, unknown model) would fail identically.
+        if !status.is_success() {
+            let error = BeaError::ProviderRequest(format!("HTTP {status}"));
+            if (status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+                && attempt + 1 < PROVIDER_MAX_ATTEMPTS
+            {
+                last_error = Some(error);
+                continue;
+            }
+            return Err(error);
+        }
+        let raw = match response.text().await {
+            Ok(raw) => raw,
+            Err(error) if attempt + 1 < PROVIDER_MAX_ATTEMPTS => {
+                last_error = Some(BeaError::ProviderRequest(error.to_string()));
+                continue;
+            }
+            Err(error) => return Err(BeaError::ProviderRequest(error.to_string())),
+        };
+        // A 200 with an unparseable body is treated as persistent (an HTML
+        // error page or wrong endpoint returns the same page on retry), so it
+        // surfaces immediately instead of burning the remaining attempts.
+        return parse_provider_payload(&raw);
     }
-    let response = request_builder
-        .send()
-        .await
-        .map_err(|error| BeaError::ProviderRequest(error.to_string()))?;
-    let status = response.status();
-    // Check status BEFORE parsing so non-JSON error bodies (HTML error pages,
-    // proxies) report "HTTP 500" instead of a confusing serde failure.
-    if !status.is_success() {
-        return Err(BeaError::ProviderRequest(format!("HTTP {status}")));
-    }
-    let raw = response
-        .text()
-        .await
-        .map_err(|error| BeaError::ProviderRequest(error.to_string()))?;
-    parse_provider_payload(&raw)
+    Err(last_error
+        .unwrap_or_else(|| BeaError::ProviderRequest("provider request failed".into())))
 }
 
 /// Unwraps the assistant reply of a provider payload: Responses-API
@@ -4014,6 +4147,7 @@ fn minutes_correction_request(original: &LlmRequest, broken: &str, parse_error: 
         ),
         json_schema: original.json_schema.clone(),
         max_output_tokens: original.max_output_tokens,
+        reasoning_effort: original.reasoning_effort.clone(),
     }
 }
 
@@ -4725,6 +4859,7 @@ mod tests {
             model: "openai/gpt-4o-mini".into(),
             credential_ref: None,
             enabled: true,
+            reasoning_effort: "off".into(),
         };
         let dir = tempdir().unwrap();
         let frame = dir.path().join("frame1.jpg");
@@ -4736,6 +4871,7 @@ mod tests {
             "user question",
             &images,
             1_000,
+            "off",
         );
         // Vision path: user content is an array with a text part and an image_url part.
         let content = body["messages"][1]["content"].as_array().unwrap();
@@ -4745,6 +4881,19 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("data:image/jpeg;base64,"));
+        // Vision bodies follow the same reasoning contract as the text path.
+        let thinking = build_multimodal_body(
+            &provider,
+            "system prompt",
+            "user question",
+            &images,
+            1_000,
+            "medium",
+        );
+        assert_eq!(
+            thinking["reasoning"],
+            serde_json::json!({"enabled": true, "effort": "medium"})
+        );
         // Responses-API path for OpenAiOAuth builds input_image parts instead.
         let oauth = ProviderConfig {
             kind: ProviderKind::OpenAiOAuth,
@@ -4752,14 +4901,14 @@ mod tests {
             ..provider.clone()
         };
         let responses_body =
-            build_multimodal_body(&oauth, "system prompt", "user question", &images, 1_000);
+            build_multimodal_body(&oauth, "system prompt", "user question", &images, 1_000, "off");
         let input = responses_body["input"][0]["content"].as_array().unwrap();
         assert_eq!(input[0]["type"], "input_text");
         assert_eq!(input[1]["type"], "input_image");
         // OCR fallback path: no images sent; the caller embeds the OCR text in
         // the user text, which travels as a plain string.
         let user_text = "=== VISUAL CONTEXT (OCR) ===\nslide showing Q3 budget\n\nuser question";
-        let fallback = build_multimodal_body(&provider, "system", user_text, &[], 1_000);
+        let fallback = build_multimodal_body(&provider, "system", user_text, &[], 1_000, "off");
         assert!(fallback["messages"][1]["content"].as_str().unwrap().contains("slide showing Q3 budget"));
     }
     #[test]
@@ -5203,6 +5352,7 @@ mod tests {
             model: "gpt-5.1-codex".into(),
             credential_ref: None,
             enabled: true,
+            reasoning_effort: "off".into(),
         };
         let prepared = build_provider_request(
             &provider,
@@ -5212,6 +5362,7 @@ mod tests {
                 user: "usr".into(),
                 json_schema: String::new(),
                 max_output_tokens: 100,
+                reasoning_effort: "off".into(),
             },
         );
         assert_eq!(
@@ -5231,6 +5382,7 @@ mod tests {
             user: "events".into(),
             json_schema: r#"{"type":"object"}"#.into(),
             max_output_tokens: 500,
+            reasoning_effort: "off".into(),
         };
         let correction =
             minutes_correction_request(&original, "{\"title\":", "EOF while parsing an object");
@@ -5241,6 +5393,102 @@ mod tests {
         assert!(correction.user.contains("EOF while parsing an object"));
         assert!(correction.user.contains(r#"{"type":"object"}"#));
         assert!(correction.system.contains("ONLY the corrected JSON"));
+    }
+    #[test]
+    fn reasoning_effort_normalizes_and_resolves_with_meeting_override() {
+        assert_eq!(normalize_reasoning_effort(""), "off");
+        assert_eq!(normalize_reasoning_effort("bogus"), "off");
+        assert_eq!(normalize_reasoning_effort(" Low "), "low");
+        assert_eq!(normalize_reasoning_effort("MEDIUM"), "medium");
+        assert_eq!(normalize_reasoning_effort("high"), "high");
+        assert_eq!(
+            effective_reasoning_effort(None, "medium"),
+            "medium".to_string()
+        );
+        assert_eq!(
+            effective_reasoning_effort(Some(""), "medium"),
+            "medium".to_string()
+        );
+        assert_eq!(
+            effective_reasoning_effort(Some("high"), "off"),
+            "high".to_string()
+        );
+        // A typo in the override can never leak into a request body.
+        assert_eq!(
+            effective_reasoning_effort(Some("ultra"), "low"),
+            "off".to_string()
+        );
+    }
+    #[test]
+    fn reasoning_body_value_disables_thinking_only_when_off() {
+        assert_eq!(
+            reasoning_body_value("off"),
+            serde_json::json!({"enabled": false})
+        );
+        assert_eq!(
+            reasoning_body_value("medium"),
+            serde_json::json!({"enabled": true, "effort": "medium"})
+        );
+        assert_eq!(
+            reasoning_body_value("nonsense"),
+            serde_json::json!({"enabled": false})
+        );
+    }
+    #[test]
+    fn provider_transport_budget_is_200s_with_three_attempts() {
+        assert_eq!(PROVIDER_TIMEOUT_SECS, 200);
+        assert_eq!(PROVIDER_MAX_ATTEMPTS, 3);
+    }
+    #[test]
+    fn request_body_carries_reasoning_effort_except_for_claude_proxies() {
+        let base = ProviderConfig {
+            id: "p".into(),
+            kind: ProviderKind::OpenRouter,
+            base_url: "https://x/v1".into(),
+            model: "m".into(),
+            credential_ref: None,
+            enabled: true,
+            reasoning_effort: "high".into(),
+        };
+        let request = LlmRequest {
+            model: "m".into(),
+            system: "s".into(),
+            user: "u".into(),
+            json_schema: String::new(),
+            max_output_tokens: 10,
+            reasoning_effort: "high".into(),
+        };
+        let body = build_provider_request(&base, &request).body;
+        assert_eq!(body["reasoning"], serde_json::json!({"enabled": true, "effort": "high"}));
+        let off = LlmRequest {
+            reasoning_effort: "off".into(),
+            ..request.clone()
+        };
+        let body = build_provider_request(&base, &off).body;
+        assert_eq!(body["reasoning"], serde_json::json!({"enabled": false}));
+        let claude = ProviderConfig {
+            kind: ProviderKind::ClaudeCompatible,
+            ..base.clone()
+        };
+        let body = build_provider_request(&claude, &request).body;
+        assert!(body.get("reasoning").is_none());
+        // Strict OpenAI-compatible endpoints reject unknown top-level params,
+        // so "off" omits the key entirely (the pre-feature behavior); Local
+        // follows the same contract. Non-off levels still ride the request.
+        let compatible = ProviderConfig {
+            kind: ProviderKind::OpenAiCompatible,
+            ..base.clone()
+        };
+        let body = build_provider_request(&compatible, &off).body;
+        assert!(body.get("reasoning").is_none());
+        let body = build_provider_request(&compatible, &request).body;
+        assert_eq!(body["reasoning"], serde_json::json!({"enabled": true, "effort": "high"}));
+        let local = ProviderConfig {
+            kind: ProviderKind::Local,
+            ..base.clone()
+        };
+        let body = build_provider_request(&local, &off).body;
+        assert!(body.get("reasoning").is_none());
     }
     #[test]
     fn failed_minutes_error_attaches_reply_snippet() {
@@ -5265,6 +5513,7 @@ mod tests {
             model: "m".into(),
             credential_ref: None,
             enabled: true,
+            reasoning_effort: "off".into(),
         };
         let content = serde_json::json!({"choices":[{"message":{"content":"hello"}}]});
         assert_eq!(reply_text(&provider, &content), "hello");
@@ -5294,6 +5543,7 @@ mod tests {
                 model: "m".into(),
                 credential_ref: None,
                 enabled: true,
+                reasoning_effort: "off".into(),
             };
             save_provider(&c, &provider).unwrap();
             assert_eq!(load_provider(&c, &provider.id).unwrap(), Some(provider));
@@ -5316,6 +5566,7 @@ mod tests {
             model: "model".into(),
             credential_ref: Some("BEA_OPENROUTER_KEY".into()),
             enabled: true,
+            reasoning_effort: "off".into(),
         };
         let request = build_provider_request(
             &provider,
@@ -5325,6 +5576,7 @@ mod tests {
                 user: "user".into(),
                 json_schema: r#"{"type":"object"}"#.into(),
                 max_output_tokens: 100,
+                reasoning_effort: "off".into(),
             },
         );
         assert_eq!(request.url, "https://openrouter.ai/api/v1/chat/completions");
@@ -5336,6 +5588,7 @@ mod tests {
             model: "claude-sonnet".into(),
             credential_ref: Some("keyring:claude-proxy".into()),
             enabled: true,
+            reasoning_effort: "off".into(),
         };
         assert_eq!(
             build_provider_request(
@@ -5346,6 +5599,7 @@ mod tests {
                     user: "user".into(),
                     json_schema: r#"{"type":"object"}"#.into(),
                     max_output_tokens: 100,
+                    reasoning_effort: "off".into(),
                 }
             )
             .url,
@@ -5711,6 +5965,7 @@ mod tests {
             model: "local".into(),
             credential_ref: None,
             enabled: true,
+            reasoning_effort: "off".into(),
         };
         let unavailable = inspect_runtime(
             dir.path().join("qwen"),

@@ -81,12 +81,14 @@ fn command_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-/// Shared HTTP client with a 120 s timeout. Requests without a timeout used to
+/// Shared HTTP client with a 200 s timeout. Requests without a timeout used to
 /// hang the command forever when a provider stalled; the OpenRouter catalog
 /// call keeps its own shorter 30 s timeout.
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(
+            bea_core::PROVIDER_TIMEOUT_SECS,
+        ))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -1187,6 +1189,8 @@ async fn validate_minutes_model_command(
         user: r#"[{"start_seconds":0,"end_seconds":14,"speaker":1,"text":"We decided to ship the beta build on Friday."},{"start_seconds":14,"end_seconds":30,"speaker":2,"text":"I will prepare the release notes by Thursday. The budget review is still unresolved."}]"#.into(),
         json_schema: MINUTES_JSON_SCHEMA.into(),
         max_output_tokens: 900,
+        reasoning_effort: bea_core::normalize_reasoning_effort(&provider.reasoning_effort)
+            .to_string(),
     };
     bea_core::call_provider(&provider, &request, Some(&api_key))
         .await
@@ -1635,12 +1639,15 @@ async fn generate_minutes_command(
                 let pack = bea_core::pack_context_mode(&events, 12_000, ContextMode::Balanced);
                 let effective_model =
                     effective_meeting_model(&database, &meeting_id, &provider.model);
+                let effective_reasoning =
+                    effective_meeting_reasoning(&database, &meeting_id, &provider.reasoning_effort);
                 let request = LlmRequest {
                     model: effective_model,
                     system: format!("{}\n{}", MEETING_SECRETARY_SYSTEM_PROMPT, meeting_context),
                     user: serde_json::to_string(&pack.events).map_err(command_error)?,
                     json_schema: MINUTES_JSON_SCHEMA.into(),
                     max_output_tokens: 8_000,
+                    reasoning_effort: effective_reasoning,
                 };
                 // Cancellation checkpoint: the wizard's Close stops the run
                 // before the (possibly long) provider request is even sent.
@@ -1666,6 +1673,7 @@ async fn generate_minutes_command(
                         &request.user,
                         &vision_images,
                         request.max_output_tokens,
+                        &request.reasoning_effort,
                         Some(&api_key),
                     )
                     .await
@@ -1774,6 +1782,8 @@ async fn modify_minutes_command(
     let context = list_context_events_payload(&database, &meeting_id)?;
     let effective_model =
         effective_meeting_model(&database, &meeting_id, &provider.model);
+    let effective_reasoning =
+        effective_meeting_reasoning(&database, &meeting_id, &provider.reasoning_effort);
 
     let system = format!(
         "{}\n\nThe user reviewed the minutes below and asks for a change. Apply EXACTLY the requested change, keep everything else verbatim (including timestamps and evidence quotes), and return the complete updated JSON matching the schema.\n\nUser instruction: {instruction}\n\nContext notes (clarifications and facts to honor):\n{context}",
@@ -1785,6 +1795,7 @@ async fn modify_minutes_command(
         user: serde_json::to_string(&current).map_err(command_error)?,
         json_schema: r#"{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"agenda":{"type":"array","items":{"type":"object","properties":{"heading":{"type":"string"},"start_seconds":{"type":"number"},"end_seconds":{"type":"number"}},"required":["heading"]}},"visual_observations":{"type":"array","items":{"type":"string"}},"decisions":{"type":"array"},"action_items":{"type":"array"},"unresolved":{"type":"array"}},"required":["title","summary","decisions","action_items"]}"#.to_string(),
         max_output_tokens: 4096,
+        reasoning_effort: effective_reasoning,
     };
     let text = bea_core::call_provider_text(&provider, &request, Some(&api_key))
         .await
@@ -2155,6 +2166,8 @@ async fn chat_command(
         list_context_events_payload(&database, &meeting_id)?,
         serde_json::to_string(&pack.events).map_err(command_error)?
     );
+    let effective_reasoning =
+        effective_meeting_reasoning(&database, &meeting_id, &provider.reasoning_effort);
     let answer = if vision_images.is_empty() {
         let request = bea_core::LlmRequest {
             model: effective_meeting_model(&database, &meeting_id, &provider.model),
@@ -2162,17 +2175,20 @@ async fn chat_command(
             user: question.trim().to_string(),
             json_schema: String::new(),
             max_output_tokens: 1_500,
+            reasoning_effort: effective_reasoning,
         };
         bea_core::call_provider_text(&provider, &request, Some(&api_key))
             .await
             .map_err(command_error)?
     } else {
+        // Vision path resolves the same effort as the text path above.
         bea_core::call_provider_messages(
             &provider,
             &system,
             question.trim(),
             &vision_images,
             1_500,
+            &effective_reasoning,
             Some(&api_key),
         )
         .await
@@ -2281,6 +2297,11 @@ async fn resolve_correction_command(
         user: instruction.trim().to_string(),
         json_schema: String::new(),
         max_output_tokens: 900,
+        reasoning_effort: effective_meeting_reasoning(
+            &database,
+            &meeting_id,
+            &provider.reasoning_effort,
+        ),
     };
     let raw = bea_core::call_provider_text(&provider, &request, Some(&api_key))
         .await
@@ -2375,6 +2396,8 @@ async fn suggest_clarifications_command(
         user: "List the clarifying questions.".into(),
         json_schema: String::new(),
         max_output_tokens: 900,
+        reasoning_effort: bea_core::normalize_reasoning_effort(&provider.reasoning_effort)
+            .to_string(),
     };
     let raw = bea_core::call_provider_text(&provider, &request, Some(&api_key))
         .await
@@ -3103,6 +3126,60 @@ fn get_meeting_model_command(
     Ok(bea_core::get_app_setting(
         &database,
         &format!("meeting_model:{meeting_id}"),
+    )
+    .map_err(command_error)?
+    .unwrap_or_default())
+}
+
+/// Resolves the reasoning effort a meeting's LLM calls should use: the
+/// per-meeting override when set (chat tab reasoning picker), otherwise the
+/// provider default from Settings. Mirrors `effective_meeting_model`.
+fn effective_meeting_reasoning(
+    database: &rusqlite::Connection,
+    meeting_id: &str,
+    provider_default: &str,
+) -> String {
+    let meeting_override =
+        bea_core::get_app_setting(database, &format!("meeting_reasoning:{meeting_id}"))
+            .ok()
+            .flatten();
+    bea_core::effective_reasoning_effort(meeting_override.as_deref(), provider_default)
+}
+
+#[tauri::command]
+fn set_meeting_reasoning_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    reasoning: String,
+) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    // Empty (the Chat tab's "Default") clears the override so the provider
+    // default from Settings applies again; levels are normalized so a typo
+    // can never leak into a request body.
+    let effort = if reasoning.trim().is_empty() {
+        String::new()
+    } else {
+        bea_core::normalize_reasoning_effort(&reasoning).to_string()
+    };
+    bea_core::set_app_setting(
+        &database,
+        &format!("meeting_reasoning:{meeting_id}"),
+        &effort,
+    )
+    .map_err(command_error)
+}
+
+/// Returns the meeting's reasoning override; empty string means "use the
+/// provider default".
+#[tauri::command]
+fn get_meeting_reasoning_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<String, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    Ok(bea_core::get_app_setting(
+        &database,
+        &format!("meeting_reasoning:{meeting_id}"),
     )
     .map_err(command_error)?
     .unwrap_or_default())
@@ -4035,6 +4112,8 @@ fn main() {
             set_meeting_vision_flag_command,
             set_meeting_model_command,
             get_meeting_model_command,
+            set_meeting_reasoning_command,
+            get_meeting_reasoning_command,
             resolve_correction_command,
             inspect_model_package_command,
             install_model_command,

@@ -9,7 +9,7 @@
  * to the internal X.Y.Z version as X.Y.0 (release tags are two digits).
  * Invoked by .github/workflows/release.yml on tag push.
  */
-import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const [tag, notes = `Release ${tag}`] = process.argv.slice(2);
@@ -20,7 +20,12 @@ if (!/^v\d+\.\d+$/.test(tag ?? "")) {
 
 const version = `${tag.slice(1)}.0`; // v1.0 -> 1.0.0 (updater needs full semver)
 const repo = "NitroQ/bea";
-const bundleDir = "src-tauri/target/release/bundle/nsis";
+// `tauri build --target <triple>` nests output under target/<triple>/; a
+// triple-less build lands in target/release directly. Support both.
+const targetRoot = existsSync("src-tauri/target/x86_64-pc-windows-msvc/release/bundle")
+  ? "src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
+  : "src-tauri/target/release/bundle";
+const bundleDir = `${targetRoot}/nsis`;
 const base = `https://github.com/${repo}/releases/download/${tag}`;
 
 const sigPath = readdirSync(bundleDir).find((f) => f.endsWith(".exe.sig"));

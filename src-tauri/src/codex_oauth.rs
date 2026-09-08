@@ -114,6 +114,14 @@ pub fn responses_payload(request: &LlmRequest) -> serde_json::Value {
             });
         }
     }
+    // Reasoning effort rides the Responses API `reasoning` key. "off" omits
+    // it (previous behavior); low/medium/high map to the matching effort.
+    match crate::normalize_reasoning_effort(&request.reasoning_effort) {
+        "off" => {}
+        level => {
+            body["reasoning"] = serde_json::json!({"effort": level});
+        }
+    }
     body
 }
 
@@ -136,14 +144,22 @@ pub fn responses_payload_multimodal(
             "image_url": format!("data:image/jpeg;base64,{b64}")
         }));
     }
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": request.model,
         "instructions": request.system,
         "input": [
             {"role": "user", "content": parts}
         ],
         "max_output_tokens": request.max_output_tokens,
-    })
+    });
+    // Same reasoning contract as `responses_payload`: omitted when "off".
+    match crate::normalize_reasoning_effort(&request.reasoning_effort) {
+        "off" => {}
+        level => {
+            body["reasoning"] = serde_json::json!({"effort": level});
+        }
+    }
+    body
 }
 
 /// Extracts the assistant message text from a Responses API payload.
@@ -236,6 +252,7 @@ mod tests {
             user: "usr".into(),
             json_schema: String::new(),
             max_output_tokens: 500,
+            reasoning_effort: "off".into(),
         });
         assert_eq!(body["model"], "gpt-5.1-codex");
         assert_eq!(body["instructions"], "sys");
@@ -259,10 +276,32 @@ mod tests {
             user: "usr".into(),
             json_schema: r#"{"type":"object","properties":{"title":{"type":"string"}}}"#.into(),
             max_output_tokens: 500,
+            reasoning_effort: "off".into(),
         });
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(body["text"]["format"]["name"], "bea_minutes");
         assert_eq!(body["text"]["format"]["schema"]["type"], "object");
+    }
+
+    #[test]
+    fn codex_payload_omits_reasoning_when_off_and_sets_effort_otherwise() {
+        let base = LlmRequest {
+            model: "gpt-5.1-codex".into(),
+            system: "sys".into(),
+            user: "usr".into(),
+            json_schema: String::new(),
+            max_output_tokens: 500,
+            reasoning_effort: "off".into(),
+        };
+        assert!(responses_payload(&base).get("reasoning").is_none());
+        let thinking = LlmRequest {
+            reasoning_effort: "low".into(),
+            ..base
+        };
+        assert_eq!(
+            responses_payload(&thinking)["reasoning"],
+            serde_json::json!({"effort": "low"})
+        );
     }
 
     #[test]
