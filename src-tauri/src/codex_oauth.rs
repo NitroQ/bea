@@ -49,8 +49,11 @@ pub fn pkce_challenge(verifier: &str) -> String {
 }
 
 pub fn authorize_url(verifier: &str) -> String {
+    // Mirrors the current Codex CLI authorize URL (see codex-rs/login/src/server.rs:build_authorize_url).
+    // Required params: offline_access + api.connectors scopes, id_token org flag, simplified-flow flag,
+    // and originator. Without them auth.openai.com returns missing_required_parameter.
     format!(
-        "{AUTH_ISSUER}/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI_ENCODED}&scope=openid%20profile%20email&code_challenge={}&code_challenge_method=S256",
+        "{AUTH_ISSUER}/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI_ENCODED}&scope=openid%20profile%20email%20offline_access%20api.connectors.read%20api.connectors.invoke&code_challenge={}&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=codex_cli_rs",
         pkce_challenge(verifier)
     )
 }
@@ -188,6 +191,11 @@ mod tests {
         assert!(url.contains("code_challenge="));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("scope=openid"));
+        // Required by current Hydra config — missing this yields missing_required_parameter
+        assert!(url.contains("offline_access"));
+        assert!(url.contains("id_token_add_organizations=true"));
+        assert!(url.contains("codex_cli_simplified_flow=true"));
+        assert!(url.contains("originator=codex_cli_rs"));
     }
 
     #[test]
