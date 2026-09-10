@@ -1,4 +1,19 @@
+<div align="center">
+
+<img src="docs/screenshots/bea-icon.png" width="96" alt="Bea icon" />
+
 # Bea — Attentive Meeting Assistant
+
+**Record it. Transcribe it locally. Ask it anything — across every meeting.**
+
+![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
+![Built with](https://img.shields.io/badge/built%20with-Tauri%202%20%2B%20Rust%20%2B%20React-orange)
+![Tests](https://img.shields.io/badge/tests-43%20frontend%20%2B%20108%20backend-brightgreen)
+![License](https://img.shields.io/badge/license-private-lightgrey)
+
+<img src="docs/screenshots/library.png" width="820" alt="Bea meeting library" />
+
+</div>
 
 Bea is a local-first Windows desktop meeting assistant built with React, Vite, Tauri 2, Rust, SQLite, and sherpa-onnx. It guides a user through a verified first-run setup, then provides a project-oriented meeting library and a focused workspace for recordings, transcripts, minutes, evidence, and media.
 
@@ -19,6 +34,26 @@ The product is designed for reviewable meeting records rather than a full multit
 - Local servers are tested and discovered keylessly; pick a preset (LM Studio `:1234/v1`, Ollama `:11434/v1`, llama.cpp `:8080/v1`) and Bea lists the server's loaded models.
 - ChatGPT sign-in uses OAuth PKCE in your browser; tokens are refreshed automatically and stored in Windows Credential Manager alongside API keys.
 - Stores provider secrets in Windows Credential Manager; SQLite stores only a credential reference.
+- **Ask across meetings** — chat questions pull relevant passages from every other meeting's transcript (local FTS5 memory) and cite them with speaker names and timestamps.
+- Keeps itself current — Bea checks GitHub Releases every 6 hours and installs updates only with your confirmation.
+
+## Screenshots
+
+**Chat with cross-meeting memory** — asked in one meeting, Bea finds and cites the answer from another meeting's transcript:
+
+<img src="docs/screenshots/chat-memory.png" width="820" alt="Chat panel answering with passages cited from another meeting" />
+
+**Timestamped transcripts with named speakers:**
+
+<img src="docs/screenshots/transcript.png" width="820" alt="Transcript view with speakers and timestamps" />
+
+**Every meeting is a workspace** — overview, transcript, minutes, evidence, and media:
+
+<img src="docs/screenshots/meeting-overview.png" width="820" alt="Meeting workspace overview" />
+
+**Verified setup at a glance** — runtime tools, transcription engines, provider health:
+
+<img src="docs/screenshots/settings.png" width="820" alt="Settings with provider verification" />
 
 ## Product flow
 
