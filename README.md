@@ -9,7 +9,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
 ![Built with](https://img.shields.io/badge/built%20with-Tauri%202%20%2B%20Rust%20%2B%20React-orange)
 ![Tests](https://img.shields.io/badge/tests-43%20frontend%20%2B%20108%20backend-brightgreen)
-![License](https://img.shields.io/badge/license-private-lightgrey)
+![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
 
 <img src="docs/screenshots/library.png" width="820" alt="Bea meeting library" />
 
@@ -284,3 +284,13 @@ scripts/                     Runtime/model/microphone/build helper scripts
 ## Data and privacy notes
 
 Bea is local-first. Recordings, imported media, transcripts, evidence, and minutes are stored in the local app-data project. Provider requests are explicit and reviewable. API keys are stored through Windows Credential Manager and are not written to SQLite, transcript text, logs, or exported minutes.
+
+## License
+
+Bea is licensed under the **[GNU Affero General Public License v3.0](LICENSE)** (AGPL-3.0).
+
+- You are free to use, study, modify, and redistribute Bea.
+- If you run a modified version as a network service, you must offer its source to the users of that service (Section 13).
+- Derivative works must remain AGPL-3.0.
+
+If you need a different licensing arrangement for internal or commercial deployment, contact the project maintainer.
