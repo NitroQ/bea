@@ -19,6 +19,39 @@ Bea is a local-first Windows desktop meeting assistant built with React, Vite, T
 
 The product is designed for reviewable meeting records rather than a full multitrack editor. Audio and video remain local. Bea creates timestamped transcript segments, links decisions and action items back to evidence, and optionally uses a configured OpenAI-compatible provider to generate structured minutes.
 
+## Install
+
+Download the latest installer from **[github.com/NitroQ/bea/releases](https://github.com/NitroQ/bea/releases/tag/v0.2.0)**:
+
+| File | Use it when |
+|---|---|
+| `Bea_*_x64-setup.exe` | Recommended for most users — per-user install, includes the auto-updater |
+| `Bea_*_x64_en-US.msi` | Per-machine install (all users of the PC) or IT/Intune deployment |
+
+1. Run `Bea_0.2.0_x64-setup.exe`.
+2. If Windows SmartScreen shows **"Windows protected your PC"**, click **More info → Run anyway**. (The installer is signed with Bea's update key but not yet with an Authenticode certificate, so SmartScreen asks for confirmation on first launch.)
+3. Follow the guided setup: Bea verifies FFmpeg/FFprobe and OCR, installs a transcription engine, and connects your AI provider.
+
+Once installed, Bea keeps itself current: it checks GitHub Releases every 6 hours and installs updates only after you confirm.
+
+### Installing on Intune-managed PCs (unsigned-package restrictions)
+
+On locked-down corporate machines, per-user SmartScreen prompts may be disabled entirely. Have your IT team deploy Bea through **Intune** — management-service deployments install silently in machine context and are the supported way to distribute internal packages that lack Authenticode signing:
+
+1. **Distribute the MSI as a Windows app (Win32 or LOB):**
+   - Upload `Bea_0.2.0_x64_en-US.msi` in [Intune admin center](https://intune.microsoft.com) → *Apps → Windows*.
+   - Install command: `msiexec /i Bea_0.2.0_x64_en-US.msi /qn /norestart`
+   - Uninstall command: `msiexec /x {ProductCode} /qn` (or `msiexec /x Bea_0.2.0_x64_en-US.msi /qn`)
+2. **Detection rule:** file `C:\Program Files\Bea\bea.exe` exists, version `0.2.0.0`.
+3. **If AppLocker/WDAC blocks unsigned binaries**, ask IT to allow-list the package — either as a hash rule using the official SHA256 digests, or by re-signing the installers with the organization's code-signing certificate (the cleanest long-term option):
+
+   ```text
+   Bea_0.2.0_x64-setup.exe  SHA256: CB9A7D2CBBDCFE8C10AB4230DFF23CD98C92E6E53FE53AAEA0D12F172CD8C785
+   Bea_0.2.0_x64_en-US.msi  SHA256: 6C695FC21BD37BA7709255484B385DCF117E3B6A09FC692D1520725AE7EB4987
+   ```
+
+4. Users then install Bea from **Company Portal**, and the auto-updater keeps it current. If the tenant blocks unsigned auto-updates as well, IT can re-deploy new versions through Intune; the in-app update notice will point users to the release.
+
 ## What Bea does
 
 - Detects and repairs the local media/OCR runtime.
@@ -122,7 +155,7 @@ During development, Bea also detects `ffmpeg.exe` and `ffprobe.exe` beside the r
 - One verified local ASR engine package.
 - A provider URL, model, and API key for first-run completion. Existing local meetings remain available during later network failures.
 
-## Install and run from source
+## Run from source (development)
 
 ```powershell
 cd C:\laragon\www\Bea
