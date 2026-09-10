@@ -61,16 +61,24 @@ export function UpdateSettingsSection() {
   async function install() {
     if (!state.info) return;
     dispatch((current) => reduceUpdateState(current, { type: "install-start" }));
-    await invoke("install_update_command").catch((error) => setNotice(`Update failed: ${String(error)}`));
+    try {
+      await invoke("install_update_command");
+    } catch (error) {
+      // A failed install must be visible — the status line is the only
+      // notice channel this section has, so use it instead of console-only.
+      dispatch((current) => reduceUpdateState(current, { type: "error", message: `Install failed: ${String(error)}` }));
+    }
   }
 
   const statusLine = state.status === "available" && state.info
     ? `Update v${state.info.version} is ready to install.`
     : state.status === "installing"
       ? "Downloading and installing…"
-      : lastChecked
-        ? `You're up to date (checked ${lastChecked}).`
-        : "Checking happens automatically every 6 hours.";
+      : state.message
+        ? state.message
+        : lastChecked
+          ? `You're up to date (checked ${lastChecked}).`
+          : "Checking happens automatically every 6 hours.";
 
   return (
     <section className="settings-section" style={{ gridColumn: "1 / -1" }}>
@@ -104,9 +112,4 @@ export function UpdateSettingsSection() {
       </div>
     </section>
   );
-}
-
-function setNotice(message: string) {
-  // Settings has no notice prop; surface failures via the status line instead.
-  console.warn(message);
 }

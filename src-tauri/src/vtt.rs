@@ -43,6 +43,39 @@ fn strip_speaker_tag(text: &str) -> (Option<String>, String) {
     (None, trimmed.to_string())
 }
 
+/// Removes inline VTT markup (`</v>`, `<i>`, `<c.color>`, …) that Teams leaves
+/// inside cue text, then collapses the runs of whitespace the removals leave
+/// behind. A lone `<` that is not a tag shape (e.g. "1 < 2") survives — a tag
+/// must open with a letter or slash and hold only tag-like characters.
+fn strip_inline_tags(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if let Some(close) = text[i..].find('>') {
+                let tag = &text[i + 1..i + close];
+                let opens_like_tag = tag
+                    .chars()
+                    .next()
+                    .is_some_and(|first| first.is_ascii_alphabetic() || first == '/');
+                let tag_shaped = !tag.is_empty()
+                    && tag
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '/' | '-'));
+                if opens_like_tag && tag_shaped {
+                    i += close + 1;
+                    continue;
+                }
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub fn parse_vtt(input: &str) -> Result<Vec<VttCue>, BeaError> {
     if !input.trim_start().starts_with("WEBVTT") {
         return Err(BeaError::UnsupportedMedia(
@@ -55,7 +88,7 @@ pub fn parse_vtt(input: &str) -> Result<Vec<VttCue>, BeaError> {
         let line = line.trim_end_matches('\r').trim().to_string();
         if line.is_empty() {
             if let Some((start, end, speaker, text_lines)) = current.take() {
-                let text = text_lines.join(" ").trim().to_string();
+                let text = strip_inline_tags(&text_lines.join(" "));
                 if !text.is_empty() {
                     cues.push(VttCue {
                         start_seconds: start,
@@ -104,7 +137,7 @@ pub fn parse_vtt(input: &str) -> Result<Vec<VttCue>, BeaError> {
         }
     }
     if let Some((start, end, speaker, text_lines)) = current.take() {
-        let text = text_lines.join(" ").trim().to_string();
+        let text = strip_inline_tags(&text_lines.join(" "));
         if !text.is_empty() {
             cues.push(VttCue {
                 start_seconds: start,
@@ -146,5 +179,19 @@ mod tests {
     #[test]
     fn rejects_non_vtt_input() {
         assert!(parse_vtt("not a vtt").is_err());
+    }
+
+    #[test]
+    fn strips_inline_markup_and_normalizes_spacing() {
+        // Teams VTT cues close their <v> tags mid-line and carry <i>/<c>
+        // markup; the transcript must read as plain prose with single spaces.
+        let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\n<v Maria>Hello <i>everyone</i>, welcome</v>\n\n00:00:04.000 --> 00:00:06.000\n<v John>  spaced   out  text  </v>\n";
+        let cues = parse_vtt(vtt).unwrap();
+        assert_eq!(cues[0].text, "Hello everyone, welcome");
+        assert_eq!(cues[0].speaker.as_deref(), Some("Maria"));
+        assert_eq!(cues[1].text, "spaced out text");
+        // A lone "<" that is not a tag must survive.
+        let math = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n1 < 2 but 3 > 2\n";
+        assert_eq!(parse_vtt(math).unwrap()[0].text, "1 < 2 but 3 > 2");
     }
 }

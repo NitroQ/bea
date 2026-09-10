@@ -68,6 +68,13 @@ Rules:
 /// same contract the real generation path uses.
 const MINUTES_JSON_SCHEMA: &str = r#"{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"agenda":{"type":"array","items":{"type":"object","properties":{"heading":{"type":"string"},"start_seconds":{"type":"number"},"end_seconds":{"type":"number"}},"required":["heading"]}},"visual_observations":{"type":"array","items":{"type":"string"}},"decisions":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"action_items":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}},"unresolved":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string"},"summary":{"type":"string"},"confidence":{"type":"number"},"evidence":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"start_seconds":{"type":"number"},"end_seconds":{"type":"number"},"quote":{"type":"string"}},"required":["start_seconds","end_seconds","quote"]}}},"required":["summary","evidence"]}}},"required":["title","summary","decisions","action_items","unresolved"]}"#;
 
+/// Output-token budget for minutes requests. It is a cap, not a target — the
+/// model stops when the JSON is complete — so a generous ceiling costs nothing
+/// on short meetings while preventing truncation on long ones. Providers that
+/// reject a cap above their model's limit get an automatic 8,000-token retry
+/// (see `call_provider`).
+const MINUTES_MAX_OUTPUT_TOKENS: u32 = 32_000;
+
 fn language_from_code(code: &str) -> TranscriptLanguage {
     match code {
         "en" => TranscriptLanguage::English,
@@ -79,6 +86,23 @@ fn language_from_code(code: &str) -> TranscriptLanguage {
 
 fn command_error(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+/// Records a failed transcription run durably: the meeting flips to `failed`
+/// and the reason is stored on the row (the UI's "Needs attention" panel reads
+/// it), plus the latest transcription job keeps the error for diagnostics.
+/// Best-effort job update — a missing job row must not hide the meeting state.
+fn record_transcription_failure(
+    database_path: &std::path::Path,
+    meeting_id: &str,
+    error: &str,
+) -> Result<(), String> {
+    let database = open_database(database_path).map_err(command_error)?;
+    let _ = database.execute(
+        "UPDATE jobs SET state='failed',error=?2 WHERE id=(SELECT id FROM jobs WHERE meeting_id=?1 AND kind='transcription' ORDER BY rowid DESC LIMIT 1)",
+        rusqlite::params![meeting_id, error],
+    );
+    bea_core::mark_meeting_failed(&database, meeting_id, error).map_err(command_error)
 }
 
 /// Shared HTTP client with a 200 s timeout. Requests without a timeout used to
@@ -110,6 +134,14 @@ fn sanitize_meeting_id(id: &str) -> Result<String, String> {
         return Err(format!("unsafe meeting id: {id:?}"));
     }
     Ok(id.to_string())
+}
+
+/// Composes the minutes-failure guidance sentence. Trims any trailing
+/// sentence period off the provider error first, so the guidance never
+/// renders a double ".." ("…fallback.. Fix the provider…").
+fn minutes_failure_message(provider_error: &str) -> String {
+    let trimmed = provider_error.trim_end_matches(['.', ' ']);
+    format!("AI minutes failed: {trimmed}. Fix the provider in Settings, or disable it to use local heuristic minutes.")
 }
 
 /// Resolves the playback source path against the meeting's registered media
@@ -331,6 +363,79 @@ mod memory_block_tests {
         let block = build_memory_block(&database, "m1", "something unrelated xyzzy").unwrap();
         assert!(block.contains("- Kickoff (recorded 2026-03-05)"));
         assert!(!block.contains("Relevant passages"));
+    }
+}
+
+#[cfg(test)]
+mod chat_prompt_tests {
+    use super::{build_memory_block, chat_system_prompt};
+
+    #[test]
+    fn chat_system_prompt_carries_the_memory_block() {
+        let prompt = chat_system_prompt(
+            "CTXPROMPT",
+            "NOTESBLOCK",
+            "LEDGERBLOCK",
+            "TRANSCRIPTBODY",
+            "",
+            "\n\n=== MEMORY: OTHER MEETINGS (1 recorded) ===\n- Kickoff (recorded 2026-03-05)\n",
+        );
+        assert!(prompt.starts_with("You are Bea,"));
+        assert!(prompt.contains("CTXPROMPT"));
+        assert!(prompt.contains("=== MEETING NOTES (user-added clarifications/context) ===\nNOTESBLOCK"));
+        assert!(prompt.contains("=== MEETING LEDGER ===\nLEDGERBLOCK"));
+        assert!(prompt.contains("=== FULL TRANSCRIPT ===\nTRANSCRIPTBODY"));
+        // The cross-meeting memory must ride in the same prompt.
+        assert!(prompt.contains("=== MEMORY: OTHER MEETINGS (1 recorded) ==="));
+    }
+
+    #[test]
+    fn chat_system_prompt_stays_unchanged_without_memory() {
+        let prompt = chat_system_prompt("CTX", "NOTES", "LEDGER", "TRANSCRIPT", "", "");
+        assert!(!prompt.contains("MEMORY"));
+        assert!(prompt.ends_with("TRANSCRIPT"));
+    }
+
+    #[test]
+    fn chat_memory_block_flows_from_the_database_into_the_prompt() {
+        // Mirrors the chat_command wiring: build_memory_block(db, id, question)
+        // feeds chat_system_prompt so FTS passages from other meetings actually
+        // reach the model.
+        let database = rusqlite::Connection::open_in_memory().unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, duration_seconds INTEGER NOT NULL DEFAULT 0, language TEXT NOT NULL DEFAULT 'auto', asr_engine_id TEXT NOT NULL DEFAULT 'qwen-standard');
+                 CREATE TABLE transcript_segments (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, start_seconds INTEGER NOT NULL, end_seconds INTEGER NOT NULL, text TEXT NOT NULL, language_detected TEXT, language_confidence REAL, speaker INTEGER);
+                 CREATE VIRTUAL TABLE transcript_fts USING fts5(meeting_id UNINDEXED, segment_id UNINDEXED, text);",
+            )
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO meetings(id,title,status,created_at) VALUES ('m1','Current','ready','2026-03-05T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO meetings(id,title,status,created_at) VALUES ('m2','Budget review','ready','2026-03-04T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO transcript_segments(id,meeting_id,start_seconds,end_seconds,text) VALUES ('s1','m2',0,10,'budget was approved last week')",
+                [],
+            )
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO transcript_fts(meeting_id,segment_id,text) VALUES ('m2','s1','budget was approved last week')",
+                [],
+            )
+            .unwrap();
+        let memory = build_memory_block(&database, "m1", "who approved the budget?").unwrap();
+        let prompt = chat_system_prompt("CTX", "NOTES", "LEDGER", "TRANSCRIPT", "", &memory);
+        assert!(prompt.contains("[Budget review] [00:00] budget was approved last week"));
     }
 }
 
@@ -809,6 +914,18 @@ fn update_transcript_segment_command(
     Ok(())
 }
 
+#[tauri::command]
+fn delete_transcript_segments_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    segment_ids: Vec<String>,
+) -> Result<usize, String> {
+    let meeting_id = sanitize_meeting_id(&meeting_id)?;
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let refs: Vec<&str> = segment_ids.iter().map(String::as_str).collect();
+    bea_core::delete_transcript_segments(&database, &meeting_id, &refs).map_err(command_error)
+}
+
 fn list_media_command_inner(
     database: &rusqlite::Connection,
     meeting_id: &str,
@@ -1188,7 +1305,10 @@ async fn validate_minutes_model_command(
         system: MEETING_SECRETARY_SYSTEM_PROMPT.to_string(),
         user: r#"[{"start_seconds":0,"end_seconds":14,"speaker":1,"text":"We decided to ship the beta build on Friday."},{"start_seconds":14,"end_seconds":30,"speaker":2,"text":"I will prepare the release notes by Thursday. The budget review is still unresolved."}]"#.into(),
         json_schema: MINUTES_JSON_SCHEMA.into(),
-        max_output_tokens: 900,
+        // Mirror the production minutes budget: models that pretty-print
+        // (ignoring the schema's intent) need far more tokens than a compact
+        // reply, and a truncated reply is unparseable.
+        max_output_tokens: 8_000,
         reasoning_effort: bea_core::normalize_reasoning_effort(&provider.reasoning_effort)
             .to_string(),
     };
@@ -1450,13 +1570,38 @@ async fn codex_oauth_login_command() -> Result<(), String> {
         let (mut stream, _) = listener.accept().map_err(|e| e.to_string())?;
         let mut buffer = [0u8; 4096];
         let read = stream.read(&mut buffer).map_err(|e| e.to_string())?;
-        let _ = stream.write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body style='font-family:sans-serif'><h2>Bea is connected.</h2>You can close this tab.</body></html>",
-        );
         // Request line: GET /auth/callback?code=...&state=... HTTP/1.1
         let request = String::from_utf8_lossy(&buffer[..read]).to_string();
         let line = request.lines().next().unwrap_or_default();
-        parse_oauth_callback(line, &state)
+        let outcome = parse_oauth_callback(line, &state);
+        // The page the user sees must state the truth: a failed callback
+        // (state mismatch, missing code) renders the error variant instead of
+        // a blanket "connected".
+        let (status, html) = match &outcome {
+            Ok(_) => (
+                "HTTP/1.1 200 OK\r\n",
+                bea_core::codex_oauth::callback_page_html(
+                    true,
+                    "You're connected",
+                    "Bea is now signed in to your ChatGPT account.",
+                ),
+            ),
+            Err(error) => (
+                "HTTP/1.1 400 Bad Request\r\n",
+                bea_core::codex_oauth::callback_page_html(
+                    false,
+                    "Sign-in didn't finish",
+                    &format!("{error}."),
+                ),
+            ),
+        };
+        let _ = stream.write_all(
+            format!(
+                "{status}Content-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{html}"
+            )
+            .as_bytes(),
+        );
+        outcome
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -1646,7 +1791,7 @@ async fn generate_minutes_command(
                     system: format!("{}\n{}", MEETING_SECRETARY_SYSTEM_PROMPT, meeting_context),
                     user: serde_json::to_string(&pack.events).map_err(command_error)?,
                     json_schema: MINUTES_JSON_SCHEMA.into(),
-                    max_output_tokens: 8_000,
+                    max_output_tokens: MINUTES_MAX_OUTPUT_TOKENS,
                     reasoning_effort: effective_reasoning,
                 };
                 // Cancellation checkpoint: the wizard's Close stops the run
@@ -1675,6 +1820,7 @@ async fn generate_minutes_command(
                         request.max_output_tokens,
                         &request.reasoning_effort,
                         Some(&api_key),
+                        &request.model,
                     )
                     .await
                     {
@@ -1724,9 +1870,7 @@ async fn generate_minutes_command(
                         // transcript lines posing as summaries) — surface the
                         // failure so the user can fix the provider instead of
                         // mistaking fallback output for real AI minutes.
-                        return Err(format!(
-                            "AI minutes failed: {provider_error}. Fix the provider in Settings, or disable it to use local heuristic minutes."
-                        ));
+                        return Err(minutes_failure_message(&provider_error.to_string()));
                     }
                 }
             }
@@ -1977,6 +2121,22 @@ fn apply_mass_correction_command(
     Ok(changed)
 }
 
+/// Assembles the chat system prompt. `memory_block` comes from
+/// `build_memory_block` (empty when there are no other meetings) so questions
+/// referencing earlier meetings get the index + FTS passages injected.
+fn chat_system_prompt(
+    meeting_context: &str,
+    notes: &str,
+    ledger: &str,
+    raw_transcript: &str,
+    ocr_block: &str,
+    memory_block: &str,
+) -> String {
+    format!(
+        "You are Bea, an assistant answering questions about one meeting.\n{meeting_context}\nAnswer using ONLY the transcript, notes, memory of other meetings, and any visual context below. Cite speaker names and timestamps. If the answer is not in the material, say so plainly.\n\n=== MEETING NOTES (user-added clarifications/context) ===\n{notes}\n\n=== MEETING LEDGER ===\n{ledger}\n\n=== FULL TRANSCRIPT ===\n{raw_transcript}{ocr_block}{memory_block}"
+    )
+}
+
 #[tauri::command]
 async fn chat_command(
     state: State<'_, AppState>,
@@ -2161,16 +2321,25 @@ async fn chat_command(
             ));
         }
     }
-    let system = format!(
-        "You are Bea, an assistant answering questions about one meeting.\n{meeting_context}\nAnswer using ONLY the transcript, notes, and any visual context below. Cite speaker names and timestamps. If the answer is not in the material, say so plainly.\n\n=== MEETING NOTES (user-added clarifications/context) ===\n{}\n\n=== MEETING LEDGER ===\n{}\n\n=== FULL TRANSCRIPT ===\n{raw_transcript}{ocr_block}",
-        list_context_events_payload(&database, &meeting_id)?,
-        serde_json::to_string(&pack.events).map_err(command_error)?
+    // Cross-meeting memory: index of every other meeting plus FTS-matched
+    // transcript passages relevant to this question (empty without others).
+    let memory_block = build_memory_block(&database, &meeting_id, question.trim())?;
+    let notes = list_context_events_payload(&database, &meeting_id)?;
+    let ledger = serde_json::to_string(&pack.events).map_err(command_error)?;
+    let system = chat_system_prompt(
+        &meeting_context,
+        &notes,
+        &ledger,
+        &raw_transcript,
+        &ocr_block,
+        &memory_block,
     );
     let effective_reasoning =
         effective_meeting_reasoning(&database, &meeting_id, &provider.reasoning_effort);
+    let effective_model = effective_meeting_model(&database, &meeting_id, &provider.model);
     let answer = if vision_images.is_empty() {
         let request = bea_core::LlmRequest {
-            model: effective_meeting_model(&database, &meeting_id, &provider.model),
+            model: effective_model,
             system,
             user: question.trim().to_string(),
             json_schema: String::new(),
@@ -2190,6 +2359,7 @@ async fn chat_command(
             1_500,
             &effective_reasoning,
             Some(&api_key),
+            &effective_model,
         )
         .await
         .map_err(command_error)?
@@ -2637,7 +2807,7 @@ async fn process_imported_media_command(
     if let Err(error) = ensure_speaker_models(&state, &app).await {
         eprintln!("speaker-diarization models unavailable: {error}");
     }
-    let segments =
+    let worker =
         tauri::async_runtime::spawn_blocking(move || -> Result<Vec<TranscriptSegment>, String> {
             let database = open_database(&database_path).map_err(command_error)?;
             let engine = load_asr_engine(&model_root, &engine_id).map_err(command_error)?;
@@ -2706,10 +2876,22 @@ async fn process_imported_media_command(
             })
             .map_err(command_error)
         })
-        .await
-        .map_err(|error| format!("transcription worker failed: {error}"))??;
+        .await;
+    let segments = match worker {
+        Ok(Ok(segments)) => segments,
+        Ok(Err(error)) => {
+            record_transcription_failure(&state.database_path, &status_meeting_id, &error)?;
+            return Err(error);
+        }
+        Err(error) => {
+            let error = format!("transcription worker failed: {error}");
+            record_transcription_failure(&state.database_path, &status_meeting_id, &error)?;
+            return Err(error);
+        }
+    };
+    let database = open_database(&state.database_path).map_err(command_error)?;
     bea_core::set_meeting_status(
-        &open_database(&state.database_path).map_err(command_error)?,
+        &database,
         &status_meeting_id,
         bea_core::MeetingStatus::Ready,
         segments
@@ -2718,6 +2900,7 @@ async fn process_imported_media_command(
             .unwrap_or(0),
     )
     .map_err(command_error)?;
+    bea_core::clear_meeting_last_error(&database, &status_meeting_id).map_err(command_error)?;
     Ok(segments)
 }
 
@@ -3919,7 +4102,7 @@ async fn transcribe_recording_command(
     if let Err(error) = ensure_speaker_models(&state, &app).await {
         eprintln!("speaker-diarization models unavailable: {error}");
     }
-    let segments =
+    let worker =
         tauri::async_runtime::spawn_blocking(move || -> Result<Vec<TranscriptSegment>, String> {
             let database = open_database(&database_path).map_err(command_error)?;
             let engine = load_asr_engine(&model_root, &engine_id).map_err(command_error)?;
@@ -4009,8 +4192,19 @@ async fn transcribe_recording_command(
             })
             .map_err(command_error)
         })
-        .await
-        .map_err(|error| format!("transcription worker failed: {error}"))??;
+        .await;
+    let segments = match worker {
+        Ok(Ok(segments)) => segments,
+        Ok(Err(error)) => {
+            record_transcription_failure(&state.database_path, &meeting_id, &error)?;
+            return Err(error);
+        }
+        Err(error) => {
+            let error = format!("transcription worker failed: {error}");
+            record_transcription_failure(&state.database_path, &meeting_id, &error)?;
+            return Err(error);
+        }
+    };
     let database = open_database(&state.database_path).map_err(command_error)?;
     database
         .execute(
@@ -4029,19 +4223,20 @@ async fn transcribe_recording_command(
         duration,
     )
     .map_err(command_error)?;
+    bea_core::clear_meeting_last_error(&database, &meeting_id).map_err(command_error)?;
     Ok(segments)
 }
 
 #[tauri::command]
-fn check_for_updates_command(
+async fn check_for_updates_command(
     app: tauri::AppHandle,
 ) -> Result<Option<bea_core::updater::UpdateInfo>, String> {
-    bea_core::updater::check_now(&app)
+    bea_core::updater::check_now(&app).await
 }
 
 #[tauri::command]
-fn install_update_command(app: tauri::AppHandle) -> Result<(), String> {
-    bea_core::updater::download_and_install(&app)
+async fn install_update_command(app: tauri::AppHandle) -> Result<(), String> {
+    bea_core::updater::download_and_install(&app).await
 }
 
 fn main() {
@@ -4068,6 +4263,7 @@ fn main() {
             rename_meeting_command,
             delete_meeting_command,
             delete_all_data_command,
+            delete_transcript_segments_command,
             cancel_minutes_generation_command,
             update_transcript_segment_command,
             list_media_command,
@@ -4144,7 +4340,18 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{locate_tesseract, parse_oauth_callback, sanitize_meeting_id, verify_media_source};
+    use super::{locate_tesseract, minutes_failure_message, parse_oauth_callback, sanitize_meeting_id, verify_media_source};
+
+    #[test]
+    fn minutes_failure_guidance_never_doubles_the_period() {
+        // Provider errors usually end with a sentence period; bolting the
+        // guidance sentence on must not render "fallback.. Fix the provider".
+        let message = minutes_failure_message("Your ChatGPT plan's usage limit is reached — it resets in 6 days.");
+        assert!(message.ends_with("local heuristic minutes."), "got: {message}");
+        assert!(!message.contains(".."), "got: {message}");
+        let bare = minutes_failure_message("no punctuation here");
+        assert!(bare.contains("no punctuation here. Fix the provider"), "got: {bare}");
+    }
 
     #[test]
     fn tesseract_locator_checks_installed_windows_location() {

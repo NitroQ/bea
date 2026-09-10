@@ -22,6 +22,12 @@ const contextLabel = (context?: number | null) => {
   return `${context} ctx`;
 };
 
+/// Closed-picker label. When the value is empty the picker is not "nothing
+/// selected": with a default option it means "follow the Settings default",
+/// so the trigger must say that instead of the misleading "Select a model".
+export const modelSelectTriggerLabel = (value: string, includeDefaultOption: boolean): string =>
+  value || (includeDefaultOption ? 'Default model (Settings)' : 'Select a model');
+
 type Option = { id: string; info?: OpenRouterModelInfo };
 
 type Props = {
@@ -112,7 +118,7 @@ export default function ModelSelect({ value, onChange, models = [], ids = [], ex
     <div className={`model-select ${open ? 'open' : ''}`} ref={rootRef}>
       <button type="button" className="model-select-trigger" aria-haspopup="listbox" aria-expanded={open} aria-label={ariaLabel} onClick={() => (open ? setOpen(false) : openList())} onKeyDown={onKeyDown}>
         <span className="model-select-value">
-          <span className="model-select-id">{value || 'Select a model'}</span>
+          <span className="model-select-id">{modelSelectTriggerLabel(value, includeDefaultOption)}</span>
           {selectedBadges.map((badge) => <span key={badge.id} className={`model-capability cap-${badge.id}`} title={badge.title}>{badge.label}</span>)}
           {selectedContext && <span className="model-select-ctx">{selectedContext}</span>}
         </span>

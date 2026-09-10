@@ -101,7 +101,12 @@ pub fn responses_payload(request: &LlmRequest) -> serde_json::Value {
         "input": [
             {"role": "user", "content": [{"type": "input_text", "text": request.user}]}
         ],
-        "max_output_tokens": request.max_output_tokens,
+        // The ChatGPT/Codex backend rejects Responses calls without this.
+        "store": false,
+        // ...and it only answers streaming (SSE) requests.
+        "stream": true,
+        // max_output_tokens is rejected ("Unsupported parameter") — output is
+        // bounded by the backend itself.
     });
     if !request.json_schema.trim().is_empty() {
         if let Ok(schema) = serde_json::from_str::<serde_json::Value>(&request.json_schema) {
@@ -150,7 +155,9 @@ pub fn responses_payload_multimodal(
         "input": [
             {"role": "user", "content": parts}
         ],
-        "max_output_tokens": request.max_output_tokens,
+        // Same ChatGPT/Codex payload contract as the text payload.
+        "store": false,
+        "stream": true,
     });
     // Same reasoning contract as `responses_payload`: omitted when "off".
     match crate::normalize_reasoning_effort(&request.reasoning_effort) {
@@ -175,6 +182,105 @@ pub fn responses_output_text(payload: &serde_json::Value) -> Option<String> {
         .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
         .next()
         .map(str::to_string)
+}
+
+/// The page the user's browser lands on after the OpenAI sign-in. Rendered
+/// from the local callback server (127.0.0.1:1455), so it must be fully
+/// self-contained — inline CSS and SVG only, no external requests. Success
+/// and failure share one layout; the outcome is always stated plainly.
+pub fn callback_page_html(success: bool, title: &str, message: &str) -> String {
+    let (kicker, hint, icon, accent) = if success {
+        (
+            "Sign-in complete",
+            "You can close this tab and return to Bea — the app picks up automatically.",
+            r#"<svg class="cb-icon" viewBox="0 0 52 52" aria-hidden="true"><circle class="cb-ring" cx="26" cy="26" r="24" fill="none"/><path class="cb-check" fill="none" d="M14 27l8 8 16-17"/></svg>"#,
+            "#5bd0ac",
+        )
+    } else {
+        (
+            "Sign-in didn't finish",
+            "Close this tab and start the sign-in again from Bea. The app still works without it.",
+            r#"<svg class="cb-icon" viewBox="0 0 52 52" aria-hidden="true"><circle class="cb-ring" cx="26" cy="26" r="24" fill="none"/><path class="cb-cross-a" fill="none" d="M17 17l18 18"/><path class="cb-cross-b" fill="none" d="M35 17l-18 18"/></svg>"#,
+            "#e0b774",
+        )
+    };
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} · Bea</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ box-sizing: border-box; margin: 0; }}
+  html, body {{ height: 100%; }}
+  body {{
+    display: grid; place-items: center; padding: 24px;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: #e8edf4; background: #0c1117; overflow: hidden;
+  }}
+  .glow {{
+    position: fixed; inset: 0; pointer-events: none;
+    background:
+      radial-gradient(560px 420px at 78% 12%, {accent}14, transparent 68%),
+      radial-gradient(640px 480px at 16% 88%, #5bd0ac0d, transparent 70%);
+  }}
+  .card {{
+    position: relative; width: min(430px, 100%); padding: 44px 38px 30px;
+    display: grid; justify-items: center; gap: 0; text-align: center;
+    background: #151d26; border: 1px solid #2a3541; border-radius: 16px;
+    box-shadow: 0 24px 70px #00000073;
+  }}
+  .cb-icon {{ width: 76px; height: 76px; stroke: {accent}; stroke-width: 2.6; stroke-linecap: round; stroke-linejoin: round; }}
+  .cb-ring {{ stroke-dasharray: 151; stroke-dashoffset: 151; animation: draw .55s ease-out forwards; opacity: .9; }}
+  .cb-check {{ stroke-dasharray: 40; stroke-dashoffset: 40; animation: draw .4s ease-out .38s forwards; }}
+  .cb-cross-a, .cb-cross-b {{ stroke-dasharray: 26; stroke-dashoffset: 26; animation: draw .3s ease-out .4s forwards; }}
+  @keyframes draw {{ to {{ stroke-dashoffset: 0; }} }}
+  .kicker {{ margin-top: 26px; color: {accent}; font-size: 10px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }}
+  h1 {{ margin: 11px 0 10px; font-size: 26px; font-weight: 650; letter-spacing: -.03em; }}
+  p {{ color: #8d9aaa; font-size: 13px; line-height: 1.65; max-width: 320px; }}
+  .divider {{ width: 100%; height: 1px; margin: 24px 0 14px; background: #222d39; }}
+  .brand {{ display: flex; align-items: baseline; gap: 7px; letter-spacing: -.05em; }}
+  .brand span {{ font-size: 21px; font-weight: 700; }}
+  .brand small {{ color: #687688; font-size: 9px; letter-spacing: .02em; }}
+  .foot {{ margin-top: 12px; display: flex; align-items: center; gap: 7px; color: #687688; font-size: 10px; }}
+  .dot {{ width: 6px; height: 6px; border-radius: 50%; background: {accent}; box-shadow: 0 0 0 3px {accent}1a; }}
+</style>
+</head>
+<body>
+  <div class="glow" aria-hidden="true"></div>
+  <main class="card">
+    {icon}
+    <span class="kicker">{kicker}</span>
+    <h1>{title}</h1>
+    <p>{message}</p>
+    <p class="hint">{hint}</p>
+    <div class="divider" aria-hidden="true"></div>
+    <div class="brand" aria-label="Bea meeting assistant"><span>bea</span><small>meeting assistant</small></div>
+    <div class="foot"><span class="dot" aria-hidden="true"></span>Local-first · Your recordings never leave this computer</div>
+  </main>
+</body>
+</html>
+"#,
+        title = html_escape(title),
+        kicker = kicker,
+        message = html_escape(message),
+        hint = hint,
+        icon = icon,
+        accent = accent,
+    )
+}
+
+/// Minimal HTML escaping for user-visible callback text (`&`, `<`, `>`,
+/// quotes) so provider/system messages can never inject markup.
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 #[cfg(test)]
@@ -245,18 +351,70 @@ mod tests {
     }
 
     #[test]
+    fn codex_payload_sets_store_false_for_the_chatgpt_backend() {
+        // The ChatGPT/Codex backend rejects Responses calls without
+        // `store: false` ("Store must be set to false").
+        let request = LlmRequest {
+            model: "gpt-5.6-luna".into(),
+            system: "sys".into(),
+            user: "usr".into(),
+            json_schema: String::new(),
+            max_output_tokens: 500,
+            reasoning_effort: "off".into(),
+        };
+        assert_eq!(responses_payload(&request)["store"], serde_json::json!(false));
+        assert_eq!(
+            responses_payload_multimodal(&request, &[])["store"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn callback_pages_state_the_outcome_and_self_contain() {
+        // Success variant: says what happened and what to do next.
+        let success = callback_page_html(true, "You are connected", "Bea is signed in.");
+        assert!(success.contains("You are connected"));
+        assert!(success.contains("Bea is signed in."));
+        assert!(success.to_lowercase().contains("close this tab"));
+        // Error variant: never pretends the login worked.
+        let failure = callback_page_html(false, "Sign-in did not finish", "OAuth state mismatch");
+        assert!(failure.contains("Sign-in did not finish"));
+        assert!(failure.contains("OAuth state mismatch"));
+        assert!(!failure.to_lowercase().contains("connected"));
+        // Fully self-contained: no external fonts, scripts, or images.
+        for page in [success, failure] {
+            assert!(
+                !page.contains("http://") || page.contains("http://localhost:1455"),
+                "page must not reference external resources"
+            );
+            assert!(!page.contains("https://"));
+            assert!(page.contains("<!DOCTYPE html>"));
+        }
+    }
+
+    #[test]
+    fn callback_page_escapes_user_visible_text() {
+        let page = callback_page_html(false, "Title <with> & \"quotes\"", "It's a message");
+        assert!(page.contains("Title &lt;with&gt; &amp; &quot;quotes&quot;"));
+        assert!(page.contains("It&#39;s a message"));
+        assert!(!page.contains("<with>"));
+    }
+
+    #[test]
     fn codex_payload_translates_llm_request_to_responses_api() {
         let body = responses_payload(&LlmRequest {
-            model: "gpt-5.1-codex".into(),
+            model: "gpt-5.6-luna".into(),
             system: "sys".into(),
             user: "usr".into(),
             json_schema: String::new(),
             max_output_tokens: 500,
             reasoning_effort: "off".into(),
         });
-        assert_eq!(body["model"], "gpt-5.1-codex");
+        assert_eq!(body["model"], "gpt-5.6-luna");
         assert_eq!(body["instructions"], "sys");
-        assert_eq!(body["max_output_tokens"], 500);
+        // The ChatGPT/Codex backend rejects max_output_tokens ("Unsupported
+        // parameter") — the request must not carry it.
+        assert!(body.get("max_output_tokens").is_none());
         assert!(body["input"].as_array().unwrap().iter().any(|item| {
             item["role"] == "user"
                 && item["content"][0]["type"] == "input_text"

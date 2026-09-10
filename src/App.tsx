@@ -4,12 +4,13 @@ import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import type { AsrEngineDescriptor, AsrEngineId, Meeting, Minutes, OpenRouterModelInfo, ProviderConfig, RuntimeAvailability, SetupStatus, TranscriptLanguage, TranscriptSegment } from './types';
 import { REASONING_EFFORTS } from './types';
-import { CODEX_FALLBACK_MODELS, DEFAULT_BASE_URLS, LOCAL_PRESETS } from './providerPresets';
+import { CODEX_FALLBACK_MODELS, LOCAL_PRESETS, PROVIDER_KIND_OPTIONS, providerPersistsImmediately, withProviderKind } from './providerPresets';
 import { loadMeetings, saveMeetings } from './meetingStore';
 import SetupFlow, { type EngineProgress } from './SetupFlow';
 import Library from './Library';
 import MeetingWorkspace from './MeetingWorkspace';
 import ModelSelect from './ModelSelect';
+import Select from './Select';
 import Icon from './Icon';
 import BeaAvatar from './BeaAvatar';
 import { UpdateSettingsSection } from './UpdateSettings';
@@ -38,7 +39,7 @@ export default function App() {
   const [route, setRoute] = useState<{ screen: 'library' | 'meeting' | 'settings'; meetingId?: string }>(() => parseHash());
   const lastOpenedRef = useRef<string | null>(null);
   const [librarySelection, setLibrarySelection] = useState<string | null>(null);
-  const [notice, setNotice] = useState('Check the essentials to unlock your meeting library.');
+  const [notice, setNotice] = useState<string | null>('Check the essentials to unlock your meeting library.');
   const [repairing, setRepairing] = useState<Array<'ffmpeg' | 'tesseract'>>([]);
   const [engineProgress, setEngineProgress] = useState<EngineProgress | null>(null);
   const [transcribing, setTranscribing] = useState<string | null>(null);
@@ -60,7 +61,10 @@ export default function App() {
         const { id, downloaded, total } = event.payload;
         setEngineProgress({ id, downloaded, total, phase: 'downloading' });
         const mb = Math.round(downloaded / 1_000_000);
-        setNotice(total ? `Downloading ${id}… ${mb} MB of ${Math.round(total / 1_000_000)} MB` : `Downloading ${id}… ${mb} MB`);
+        const message = total ? `Downloading ${id}… ${mb} MB of ${Math.round(total / 1_000_000)} MB` : `Downloading ${id}… ${mb} MB`;
+        setNotice(message);
+        // The workspace toast surfaces download progress on the meeting screen.
+        window.dispatchEvent(new CustomEvent('bea:notice', { detail: { message } }));
       });
       const stopTranscription = listen<{ meeting_id: string; completed: number; total: number; segment?: TranscriptSegment }>('transcription-progress', (event) => {
         const { meeting_id, completed, total, segment } = event.payload;
@@ -90,24 +94,35 @@ export default function App() {
   }, [route.screen, route.meetingId, selectedMeeting]);
 
   const refreshRuntime = useCallback(async () => { try { const inspected = await invoke<RuntimeAvailability>('inspect_runtime_command'); setRuntime(inspected); setNotice('Runtime checks refreshed.'); } catch { setRuntime((current) => current ?? browserFallbackRuntime()); setNotice('Runtime checks will refresh when Bea is running as a desktop app.'); } }, []);
+  /// Provider edits: keyless OAuth changes save immediately (no save button
+  /// exists for that kind); keyed kinds keep the explicit test/save flow.
+  function changeProvider(next: ProviderConfig) {
+    setProvider(next);
+    if (providerPersistsImmediately(next.kind)) {
+      void invoke('save_provider_command', { provider: { ...next, enabled: true } }).catch(() => undefined);
+    }
+  }
+  /// Notice that also reaches the meeting workspace's toast (App notices are
+  /// invisible there, which made tool installs look like silent no-ops).
+  function emitNotice(message: string) { setNotice(message); window.dispatchEvent(new CustomEvent('bea:notice', { detail: { message } })); }
   async function repairTools(ids: Array<'ffmpeg' | 'tesseract'>) {
     setRepairing(ids);
     const inDesktop = Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
-    setNotice(`Setting up ${ids.join(' and ')}…`);
+    emitNotice(`Setting up ${ids.join(' and ')}…`);
     if (inDesktop) {
       try {
         // Download-first: fetch the official builds into the app-data bin directory.
         for (const id of ids) {
           setRepairing([id]);
-          setNotice(`Downloading ${id === 'ffmpeg' ? 'FFmpeg + FFprobe' : 'Tesseract OCR'}…`);
+          emitNotice(`Downloading ${id === 'ffmpeg' ? 'FFmpeg + FFprobe' : 'Tesseract OCR'}… this can take a minute.`);
           await invoke<RuntimeAvailability>('download_tool_command', { tool: id });
         }
         const inspected = await invoke<RuntimeAvailability>('inspect_runtime_command');
         setRuntime(inspected);
-        setNotice('Required local tools are ready.');
+        emitNotice('Local tools installed. You can retry the transcription now.');
         return;
       } catch (downloadError) {
-        setNotice(`Download failed (${String(downloadError)}). Trying the bundled copies…`);
+        emitNotice(`Download failed (${String(downloadError)}). Trying the bundled copies…`);
       } finally {
         setRepairing([]);
       }
@@ -117,15 +132,15 @@ export default function App() {
       setRepairing(ids);
       const inspected = await invoke<RuntimeAvailability>('repair_runtime_command', { tools: ids });
       setRuntime(inspected);
-      setNotice(ids.every((id) => id === 'ffmpeg' ? inspected.ffmpeg_available && inspected.ffprobe_available : inspected.ocr_available) ? 'Required local tools are ready.' : 'Repair finished, but one or more tools still need attention.');
+      emitNotice(ids.every((id) => id === 'ffmpeg' ? inspected.ffmpeg_available && inspected.ffprobe_available : inspected.ocr_available) ? 'Required local tools are ready.' : 'Repair finished, but one or more tools still need attention.');
     } catch (error) {
       const message = String(error);
       if (!inDesktop && /not found|unknown command|tauri/i.test(message)) {
         await new Promise((resolve) => setTimeout(resolve, 700));
         setRuntime((current) => ({ ...(current ?? browserFallbackRuntime()), ffmpeg_available: ids.includes('ffmpeg') ? true : Boolean(current?.ffmpeg_available), ffprobe_available: ids.includes('ffmpeg') ? true : Boolean(current?.ffprobe_available), ocr_available: ids.includes('tesseract') ? true : Boolean(current?.ocr_available) }));
-        setNotice('Browser preview marked the requested tools as ready; verify them in the packaged app.');
+        emitNotice('Browser preview marked the requested tools as ready; verify them in the packaged app.');
       } else {
-        setNotice(`Repair failed: ${message}`);
+        emitNotice(`Repair failed: ${message}`);
       }
     } finally {
       setRepairing([]);
@@ -170,7 +185,7 @@ export default function App() {
       setMeetings((current) => current.map((item) => item.id === meeting.id ? { ...item, status: 'ready' } : item));
       setNotice('Transcription completed locally.');
     } catch (error) {
-      setMeetings((current) => current.map((item) => item.id === meeting.id ? { ...item, status: 'failed' } : item));
+      setMeetings((current) => current.map((item) => item.id === meeting.id ? { ...item, status: 'failed', last_error: String(error) } : item));
       setNotice(`Transcription failed: ${String(error)} — open the meeting to retry.`);
       // The meeting screen renders its own toast (App notices are invisible there).
       window.dispatchEvent(new CustomEvent('bea:notice', { detail: { message: `Transcription failed: ${String(error)}` } }));
@@ -219,7 +234,19 @@ export default function App() {
     }
   }
   async function recording(meeting: Meeting, action: 'start' | 'pause' | 'resume' | 'stop', deviceIds?: string[]) { const command = { start: 'start_recording_command', pause: 'pause_recording_command', resume: 'resume_recording_command', stop: 'stop_recording_command' }[action]; try { const result = await invoke<{ end_seconds?: number }[]>(command, { meetingId: meeting.id, ...(action === 'start' ? { deviceIds: deviceIds ?? [] } : {}) }); const nextStatus: Meeting['status'] = action === 'start' ? 'recording' : action === 'pause' ? 'paused' : action === 'resume' ? 'recording' : 'processing'; setMeetings((current) => current.map((item) => item.id === meeting.id ? { ...item, status: nextStatus, duration_seconds: result?.at(-1)?.end_seconds ?? item.duration_seconds } : item)); if (action === 'stop') { await runTranscription(meeting, meeting.language, 'transcribe_recording_command', { meetingId: meeting.id, language: meeting.language }); } else setNotice(`Recording ${action}ed.`); } catch (error) { setNotice(`Unable to ${action} recording: ${String(error)}`); window.dispatchEvent(new CustomEvent('bea:notice', { detail: { message: `Unable to ${action} recording: ${String(error)}` } })); } }
-  async function retryTranscription(meeting: Meeting) { await runTranscription(meeting, meeting.language, 'transcribe_recording_command', { meetingId: meeting.id, language: meeting.language }); }
+  async function retryTranscription(meeting: Meeting) {
+    // Imported files must re-run the media pipeline (ffmpeg normalize → ASR);
+    // recorded meetings replay their stored chunks. Without this split,
+    // retrying an imported meeting failed with "no completed recording chunks".
+    const media = await invoke<Array<{ path: string; kind: string }>>('list_media_command', { meetingId: meeting.id }).catch(() => []);
+    const source = media.find((item) => item.path);
+    if (source) {
+      const kind = (source.kind === 'video' ? 'video' : 'audio') as 'video' | 'audio';
+      await runTranscription(meeting, meeting.language, 'process_imported_media_command', { meetingId: meeting.id, path: source.path, kind, language: meeting.language });
+    } else {
+      await runTranscription(meeting, meeting.language, 'transcribe_recording_command', { meetingId: meeting.id, language: meeting.language });
+    }
+  }
   async function renameMeeting(meeting: Meeting, title: string) { try { await invoke('rename_meeting_command', { meetingId: meeting.id, title }); } catch { /* local preview */ } setMeetings((current) => { const next = current.map((item) => item.id === meeting.id ? { ...item, title } : item); saveMeetings(next); return next; }); setNotice('Meeting renamed.'); }
   async function deleteMeeting(meeting: Meeting) { if (!window.confirm(`Delete “${meeting.title}”? This removes its local meeting project.`)) return; try { await invoke('delete_meeting_command', { meetingId: meeting.id }); } catch { /* local preview */ } setMeetings((current) => { const next = current.filter((item) => item.id !== meeting.id); saveMeetings(next); return next; }); if (route.meetingId === meeting.id) window.location.hash = '#library'; setNotice('Meeting project deleted.'); }
   function openSettings() { window.location.hash = '#settings'; setRoute({ screen: 'settings' }); setNotice('Settings are ready for runtime and provider maintenance.'); }
@@ -252,16 +279,18 @@ export default function App() {
     }
   }
 
-  if (!setupComplete) return <SetupFlow status={{ ...setupStatus, tools: setupStatus.tools.map((tool) => repairing.includes(tool.id) ? { ...tool, status: 'repairing' } : tool) }} provider={provider} apiKey={apiKey} step={setupStep} onStep={setSetupStep} onSelectEngine={selectEngine} onInstallEngine={installEngine} onImportEngine={importEngine} onRepairTools={repairTools} onProviderChange={setProvider} onApiKeyChange={setApiKey} onTestProvider={testProvider} onComplete={completeSetup} notice={notice} engineProgress={engineProgress} />;
-  if (route.screen === 'meeting' && selectedMeeting) return <MeetingWorkspace key={selectedMeeting.id} meeting={selectedMeeting} onBack={() => { window.location.hash = '#library'; }} onNotice={setNotice} onImport={importMedia} onImportVtt={importVtt} onRecording={recording} onMeetingStatus={(id, status) => setMeetings((items) => items.map((item) => item.id === id ? { ...item, status } : item))} onRetryTranscription={retryTranscription} busy={transcribing === selectedMeeting.id} transcribeProgress={transcribing === selectedMeeting.id ? transcriptionProgress : null} liveSegments={liveSegments[selectedMeeting.id] ?? []} />;
-  if (route.screen === 'settings') return <SettingsScreen status={setupStatus} provider={provider} apiKey={apiKey} onBack={() => { window.location.hash = '#library'; }} onRefresh={refreshRuntime} onRepair={repairTools} onProviderChange={setProvider} onApiKeyChange={setApiKey} onTest={testProvider} onSelectEngine={selectEngine} onInstallEngine={installEngine} onReset={() => { localStorage.removeItem('bea.setup-complete'); setSetupComplete(false); setSetupStep(0); }} onDeleteAllData={() => void deleteAllData()} onClearAiMemory={() => void clearAiMemory()} />;
-  return <Library meetings={meetings} selectedId={librarySelection ?? meetings[0]?.id ?? null} onSelect={setLibrarySelection} onOpen={(meeting) => { setLibrarySelection(meeting.id); window.location.hash = `#meeting/${meeting.id}`; }} onCreate={createMeeting} onImport={importMedia} onImportVtt={importVtt} onRename={renameMeeting} onDelete={deleteMeeting} onSettings={openSettings} runtimeReady={Boolean(runtime?.can_transcribe_locally || setupStatus.engines.some((engine) => engine.id === selectedEngine && engine.status === 'ready'))} selectedEngineName={selectedEngineName} />;
+  if (!setupComplete) return <SetupFlow status={{ ...setupStatus, tools: setupStatus.tools.map((tool) => repairing.includes(tool.id) ? { ...tool, status: 'repairing' } : tool) }} provider={provider} apiKey={apiKey} step={setupStep} onStep={setSetupStep} onSelectEngine={selectEngine} onInstallEngine={installEngine} onImportEngine={importEngine} onRepairTools={repairTools} onProviderChange={changeProvider} onApiKeyChange={setApiKey} onTestProvider={testProvider} onComplete={completeSetup} notice={notice} engineProgress={engineProgress} />;
+  if (route.screen === 'meeting' && selectedMeeting) return <MeetingWorkspace key={selectedMeeting.id} meeting={selectedMeeting} onBack={() => { window.location.hash = '#library'; }} onNotice={setNotice} onImport={importMedia} onImportVtt={importVtt} onRecording={recording} onMeetingStatus={(id, status) => setMeetings((items) => items.map((item) => item.id === id ? { ...item, status } : item))} onRetryTranscription={retryTranscription} onRepairTools={repairTools} repairing={repairing} busy={transcribing === selectedMeeting.id} transcribeProgress={transcribing === selectedMeeting.id ? transcriptionProgress : null} liveSegments={liveSegments[selectedMeeting.id] ?? []} />;
+  if (route.screen === 'settings') return <SettingsScreen notice={notice} onDismissNotice={() => setNotice(null)} status={setupStatus} provider={provider} apiKey={apiKey} onBack={() => { window.location.hash = '#library'; }} onRefresh={refreshRuntime} onRepair={repairTools} repairing={repairing} onProviderChange={changeProvider} onApiKeyChange={setApiKey} onTest={testProvider} onSelectEngine={selectEngine} onInstallEngine={installEngine} onReset={() => { localStorage.removeItem('bea.setup-complete'); setSetupComplete(false); setSetupStep(0); }} onDeleteAllData={() => void deleteAllData()} onClearAiMemory={() => void clearAiMemory()} />;
+  return <Library notice={notice} onDismissNotice={() => setNotice(null)} meetings={meetings} selectedId={librarySelection ?? meetings[0]?.id ?? null} onSelect={setLibrarySelection} onOpen={(meeting) => { setLibrarySelection(meeting.id); window.location.hash = `#meeting/${meeting.id}`; }} onCreate={createMeeting} onImport={importMedia} onImportVtt={importVtt} onRename={renameMeeting} onDelete={deleteMeeting} onSettings={openSettings} runtimeReady={Boolean(runtime?.can_transcribe_locally || setupStatus.engines.some((engine) => engine.id === selectedEngine && engine.status === 'ready'))} selectedEngineName={selectedEngineName} />;
 }
 
 function parseHash(): { screen: 'library' | 'meeting' | 'settings'; meetingId?: string } { const hash = window.location.hash.replace(/^#/, ''); if (hash === 'settings') return { screen: 'settings' }; if (hash.startsWith('meeting/')) return { screen: 'meeting', meetingId: hash.slice('meeting/'.length) }; return { screen: 'library' }; }
 
 /// Settings-side ChatGPT sign-in block (same contract as SetupFlow's CodexSignIn).
-function CodexSignInSettings({ provider, onProviderChange, verified }: { provider: ProviderConfig; onProviderChange: (provider: ProviderConfig) => void; verified: boolean }) {
+/// After a successful login `onTest` re-runs the provider test so the provider
+/// is persisted and the "Verified" state label updates.
+function CodexSignInSettings({ provider, onProviderChange, onTest, verified }: { provider: ProviderConfig; onProviderChange: (provider: ProviderConfig) => void; onTest: () => Promise<void>; verified: boolean }) {
   const [codexModels, setCodexModels] = useState<string[]>(CODEX_FALLBACK_MODELS);
   const [signingIn, setSigningIn] = useState(false);
   const [signInError, setSignInError] = useState<string | null>(null);
@@ -272,8 +301,8 @@ function CodexSignInSettings({ provider, onProviderChange, verified }: { provide
   };
   useEffect(refreshModels, []);
   return <div className="oauth-block">
-    <label>Minutes model<select value={provider.model} onChange={(event) => onProviderChange({ ...provider, model: event.target.value })}>{codexModels.map((id) => <option key={id} value={id}>{id}</option>)}</select></label>
-    <button type="button" className="primary" disabled={signingIn} onClick={() => { setSigningIn(true); setSignInError(null); invoke('codex_oauth_login_command').then(() => onProviderChange({ ...provider, enabled: true })).then(refreshModels).catch((error) => setSignInError(`Sign-in failed: ${String(error)}`)).finally(() => setSigningIn(false)); }}>
+    <label>Minutes model<Select value={provider.model} options={codexModels.map((id) => ({ value: id, label: id }))} onChange={(model) => onProviderChange({ ...provider, model })} ariaLabel="Minutes model" /></label>
+    <button type="button" className="primary" disabled={signingIn} onClick={() => { setSigningIn(true); setSignInError(null); invoke('codex_oauth_login_command').then(() => onTest()).then(refreshModels).catch((error) => setSignInError(`Sign-in failed: ${String(error)}`)).finally(() => setSigningIn(false)); }}>
       <Icon name="spark" size={14} />{signingIn ? 'Waiting for browser…' : verified ? 'Re-sign in with ChatGPT' : 'Sign in with ChatGPT'}
     </button>
     <small className="field-help">Uses your ChatGPT/Codex subscription — no API key. Tokens live in your Windows user profile, outside the project database.</small>
@@ -281,7 +310,7 @@ function CodexSignInSettings({ provider, onProviderChange, verified }: { provide
   </div>;
 }
 
-function SettingsScreen({ status, provider, apiKey, onBack, onRefresh, onRepair, onProviderChange, onApiKeyChange, onTest, onSelectEngine, onInstallEngine, onReset, onDeleteAllData, onClearAiMemory }: { status: SetupStatus; provider: ProviderConfig; apiKey: string; onBack: () => void; onRefresh: () => void; onRepair: (ids: Array<'ffmpeg' | 'tesseract'>) => Promise<void>; onProviderChange: (provider: ProviderConfig) => void; onApiKeyChange: (value: string) => void; onTest: () => Promise<void>; onSelectEngine: (id: AsrEngineId) => void; onInstallEngine: (id: AsrEngineId) => Promise<void>; onReset: () => void; onDeleteAllData: () => void; onClearAiMemory: () => void }) {
+function SettingsScreen({ notice, onDismissNotice, status, provider, apiKey, onBack, onRefresh, onRepair, repairing = [], onProviderChange, onApiKeyChange, onTest, onSelectEngine, onInstallEngine, onReset, onDeleteAllData, onClearAiMemory }: { notice: string | null; onDismissNotice: () => void; status: SetupStatus; provider: ProviderConfig; apiKey: string; onBack: () => void; onRefresh: () => void; onRepair: (ids: Array<'ffmpeg' | 'tesseract'>) => Promise<void>; repairing?: string[]; onProviderChange: (provider: ProviderConfig) => void; onApiKeyChange: (value: string) => void; onTest: () => Promise<void>; onSelectEngine: (id: AsrEngineId) => void; onInstallEngine: (id: AsrEngineId) => Promise<void>; onReset: () => void; onDeleteAllData: () => void; onClearAiMemory: () => void }) {
   const keyRequired = provider.kind !== 'Local' && provider.kind !== 'OpenAiOAuth';
   const [openRouterModels, setOpenRouterModels] = useState<OpenRouterModelInfo[]>([]);
   useEffect(() => { invoke<OpenRouterModelInfo[]>('fetch_openrouter_models_command').then(setOpenRouterModels).catch(() => setOpenRouterModels([])); }, []);
@@ -308,7 +337,7 @@ function SettingsScreen({ status, provider, apiKey, onBack, onRefresh, onRepair,
             <div className="settings-row" key={tool.id}>
               <span className={`setup-status ${tool.status === 'ready' ? 'is-ready' : ''}`}><Icon name={tool.status === 'ready' ? 'check' : 'download'} size={14} /></span>
               <span><strong>{tool.name}</strong><small>{tool.detail}</small></span>
-              <button className="secondary small" onClick={() => void onRepair([tool.id])}>{tool.status === 'ready' ? 'Repair' : 'Install'}</button>
+              <button className="secondary small" disabled={repairing.includes(tool.id)} onClick={() => void onRepair([tool.id])}>{repairing.includes(tool.id) ? 'Working…' : tool.status === 'ready' ? 'Repair' : 'Install'}</button>
             </div>
           ))}
         </section>
@@ -324,19 +353,13 @@ function SettingsScreen({ status, provider, apiKey, onBack, onRefresh, onRepair,
         <UpdateSettingsSection />
         <section className="settings-section provider-settings">
           <div className="settings-section-title"><div><h2>AI provider</h2><p>Keys are held outside your project database.</p></div><span className={`state-label ${status.provider.verified ? 'ready' : 'attention'}`}>{status.provider.verified ? 'Verified' : 'Needs test'}</span></div>
-          <label>Provider<select value={provider.kind} onChange={(event) => onProviderChange({ ...provider, kind: event.target.value as ProviderConfig['kind'], base_url: DEFAULT_BASE_URLS[event.target.value as ProviderConfig['kind']] ?? '' })}>
-            <option value="OpenRouter">OpenRouter</option>
-            <option value="OpenAiCompatible">OpenAI-compatible</option>
-            <option value="ClaudeCompatible">Claude-compatible proxy</option>
-            <option value="Local">Local server (LM Studio / Ollama / llama.cpp)</option>
-            <option value="OpenAiOAuth">OpenAI (ChatGPT sign-in)</option>
-          </select></label>
+          <label>Provider<Select value={provider.kind} options={PROVIDER_KIND_OPTIONS} onChange={(kind) => onProviderChange(withProviderKind(provider, kind))} ariaLabel="Provider" /></label>
           {provider.kind === 'Local' && (
             <div className="local-presets">{LOCAL_PRESETS.map((preset) => (
               <button key={preset.id} type="button" className={`preset ${provider.base_url === preset.base_url ? 'selected' : ''}`} onClick={() => onProviderChange({ ...provider, base_url: preset.base_url })}>{preset.label}<small>{preset.base_url}</small></button>
             ))}</div>
           )}
-          {provider.kind === 'OpenAiOAuth' && <CodexSignInSettings provider={provider} onProviderChange={onProviderChange} verified={status.provider.verified} />}
+          {provider.kind === 'OpenAiOAuth' && <CodexSignInSettings provider={provider} onProviderChange={onProviderChange} onTest={onTest} verified={status.provider.verified} />}
           {provider.kind !== 'OpenAiOAuth' && (
             <label>Model
               <ModelSelect
@@ -351,9 +374,7 @@ function SettingsScreen({ status, provider, apiKey, onBack, onRefresh, onRepair,
           )}
           {provider.kind !== 'OpenAiOAuth' && provider.kind !== 'ClaudeCompatible' && (
             <label>Reasoning
-              <select value={provider.reasoning_effort ?? 'off'} onChange={(event) => onProviderChange({ ...provider, reasoning_effort: event.target.value as ProviderConfig['reasoning_effort'] })}>
-                {REASONING_EFFORTS.map((option) => <option key={option.id} value={option.id} title={option.hint}>{option.label}</option>)}
-              </select>
+              <Select value={provider.reasoning_effort ?? 'off'} options={REASONING_EFFORTS.map(({ id, label }) => ({ value: id, label }))} onChange={(value) => onProviderChange({ ...provider, reasoning_effort: value })} ariaLabel="Reasoning" />
               <small className="field-help">Default thinking effort for minutes and chat. Off is fastest; higher efforts think longer (each attempt waits up to 200s, up to 3 attempts). A meeting can override it in its Chat tab.</small>
             </label>
           )}
@@ -372,6 +393,7 @@ function SettingsScreen({ status, provider, apiKey, onBack, onRefresh, onRepair,
       </div>
       <div className="settings-danger"><div><strong>Delete all data</strong><p>Permanently removes every meeting, transcript, minutes, chat notes, generated files, and the ChatGPT sign-in. Downloaded engines and local tools are kept. This cannot be undone.</p></div><button className="danger-button" onClick={onDeleteAllData}><Icon name="trash" size={14} />Delete all data</button></div>
       <div className="settings-danger"><div><strong>Start setup again</strong><p>Use this only if you want to change the required first-run choices.</p></div><button className="secondary" onClick={onReset}>Reset setup gate</button></div>
+      {notice && <div className="workspace-toast" role="status" style={{ position: 'fixed', bottom: 24, right: 24, zIndex: 50 }}><Icon name="check" size={14} /><span>{notice}</span><button type="button" className="workspace-toast-close" onClick={onDismissNotice} aria-label="Dismiss notification"><Icon name="x" size={12} /></button></div>}
     </main>
   );
 }

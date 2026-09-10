@@ -7,9 +7,12 @@ export interface UpdateInfo {
 export type UpdateState = {
   status: "idle" | "available" | "installing";
   info: UpdateInfo | null;
+  /// Why the last check failed (network, GitHub unreachable…). The Settings
+  /// status line renders it so a manual check never fails silently.
+  message: string | null;
 };
 
-export const initialUpdateState: UpdateState = { status: "idle", info: null };
+export const initialUpdateState: UpdateState = { status: "idle", info: null, message: null };
 
 export type UpdateEvent =
   | { type: "available"; info: UpdateInfo }
@@ -25,13 +28,15 @@ export type UpdateEvent =
 export function reduceUpdateState(state: UpdateState, event: UpdateEvent): UpdateState {
   switch (event.type) {
     case "available":
-      return { status: "available", info: event.info };
+      return { status: "available", info: event.info, message: null };
     case "none":
+      // A definitive "no updates" also clears any earlier error message.
+      return { status: "idle", info: null, message: null };
     case "error":
-      return state.status === "idle" ? state : { status: "idle", info: null };
+      return { status: "idle", info: null, message: event.message };
     case "install-start":
       return state.status === "available" ? { ...state, status: "installing" } : state;
     case "dismiss":
-      return { status: "idle", info: null };
+      return { status: "idle", info: null, message: null };
   }
 }

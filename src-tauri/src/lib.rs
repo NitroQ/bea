@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use cpal::traits::{DeviceTrait, HostTrait};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sherpa_onnx::{
@@ -62,6 +62,11 @@ pub enum BeaError {
     ChecksumMismatch { expected: String, actual: String },
     #[error("provider request failed: {0}")]
     ProviderRequest(String),
+    /// A quota wall (e.g. the ChatGPT plan's usage limit). Displays bare —
+    /// the frontend already frames it as "Chat failed:" / "Correction
+    /// failed:", and the transport skips retries for it.
+    #[error("{0}")]
+    UsageLimit(String),
     #[error("media processing failed: {0}")]
     MediaProcessing(String),
 }
@@ -117,6 +122,10 @@ pub struct Meeting {
     pub duration_seconds: u64,
     pub language: TranscriptLanguage,
     pub asr_engine_id: String,
+    /// Why the last transcription run failed ("Needs attention" reason).
+    /// Cleared on the next successful run; NULL while the meeting is healthy.
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2469,7 +2478,7 @@ pub struct ContextPack {
 
 pub fn open_database(path: impl AsRef<Path>) -> Result<Connection, BeaError> {
     let conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, duration_seconds INTEGER NOT NULL DEFAULT 0, language TEXT NOT NULL DEFAULT 'auto', asr_engine_id TEXT NOT NULL DEFAULT 'qwen-standard'); CREATE TABLE IF NOT EXISTS transcript_segments (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, start_seconds INTEGER NOT NULL, end_seconds INTEGER NOT NULL, text TEXT NOT NULL, language_detected TEXT, language_confidence REAL, speaker INTEGER); CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(meeting_id UNINDEXED, segment_id UNINDEXED, text); CREATE TABLE IF NOT EXISTS recording_chunks (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, start_seconds INTEGER NOT NULL, end_seconds INTEGER NOT NULL, path TEXT NOT NULL, state TEXT NOT NULL, UNIQUE(meeting_id, ordinal)); CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, kind TEXT NOT NULL, state TEXT NOT NULL, progress REAL NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, error TEXT); CREATE TABLE IF NOT EXISTS media_sources (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, path TEXT NOT NULL, kind TEXT NOT NULL, duration_seconds INTEGER, copied INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS model_manifests (id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, runtime TEXT NOT NULL, languages TEXT NOT NULL, installed INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS provider_configs (id TEXT PRIMARY KEY, kind TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL, credential_ref TEXT, enabled INTEGER NOT NULL DEFAULT 1); CREATE TABLE IF NOT EXISTS usage_records (id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, estimated_cost REAL, operation TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS ledger_events (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS minutes (meeting_id TEXT PRIMARY KEY REFERENCES meetings(id) ON DELETE CASCADE, payload TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); ")?;
+    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, duration_seconds INTEGER NOT NULL DEFAULT 0, language TEXT NOT NULL DEFAULT 'auto', asr_engine_id TEXT NOT NULL DEFAULT 'qwen-standard', last_error TEXT); CREATE TABLE IF NOT EXISTS transcript_segments (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, start_seconds INTEGER NOT NULL, end_seconds INTEGER NOT NULL, text TEXT NOT NULL, language_detected TEXT, language_confidence REAL, speaker INTEGER); CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(meeting_id UNINDEXED, segment_id UNINDEXED, text); CREATE TABLE IF NOT EXISTS recording_chunks (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, start_seconds INTEGER NOT NULL, end_seconds INTEGER NOT NULL, path TEXT NOT NULL, state TEXT NOT NULL, UNIQUE(meeting_id, ordinal)); CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, kind TEXT NOT NULL, state TEXT NOT NULL, progress REAL NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, error TEXT); CREATE TABLE IF NOT EXISTS media_sources (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, path TEXT NOT NULL, kind TEXT NOT NULL, duration_seconds INTEGER, copied INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS model_manifests (id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, runtime TEXT NOT NULL, languages TEXT NOT NULL, installed INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS provider_configs (id TEXT PRIMARY KEY, kind TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL, credential_ref TEXT, enabled INTEGER NOT NULL DEFAULT 1); CREATE TABLE IF NOT EXISTS usage_records (id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, estimated_cost REAL, operation TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS ledger_events (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS minutes (meeting_id TEXT PRIMARY KEY REFERENCES meetings(id) ON DELETE CASCADE, payload TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); ")?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS participants (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, name TEXT NOT NULL, role TEXT, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS context_events (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, kind TEXT NOT NULL, payload TEXT NOT NULL, confidence REAL NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS topics (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, label TEXT NOT NULL, summary TEXT, start_seconds INTEGER, end_seconds INTEGER); CREATE TABLE IF NOT EXISTS visual_evidence (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, timestamp_seconds INTEGER NOT NULL, path TEXT NOT NULL, thumbnail_path TEXT, ocr_text TEXT, perceptual_hash TEXT NOT NULL, description TEXT); CREATE TABLE IF NOT EXISTS action_items (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, event_id TEXT, owner TEXT, summary TEXT NOT NULL, due TEXT, status TEXT NOT NULL DEFAULT 'open', FOREIGN KEY(event_id) REFERENCES context_events(id) ON DELETE SET NULL); CREATE TABLE IF NOT EXISTS llm_runs (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, provider_id TEXT, model TEXT NOT NULL, operation TEXT NOT NULL, prompt_version TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, state TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_context_events_meeting ON context_events(meeting_id); CREATE INDEX IF NOT EXISTS idx_visual_evidence_meeting_time ON visual_evidence(meeting_id, timestamp_seconds); CREATE INDEX IF NOT EXISTS idx_action_items_meeting_status ON action_items(meeting_id, status); CREATE TABLE IF NOT EXISTS speaker_names (meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, speaker_index INTEGER NOT NULL, name TEXT NOT NULL, UNIQUE(meeting_id, speaker_index)); CREATE TABLE IF NOT EXISTS segment_speakers (segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, speaker_index INTEGER NOT NULL, UNIQUE(segment_id, speaker_index));")?;
     // Backward-compatible column migrations: "duplicate column name" is the
     // normal already-migrated case, but any other failure (locked/corrupt DB)
@@ -2496,6 +2505,13 @@ pub fn open_database(path: impl AsRef<Path>) -> Result<Connection, BeaError> {
         "ALTER TABLE provider_configs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'off'",
         [],
     ) {
+        if !error.to_string().contains("duplicate column name") {
+            return Err(BeaError::Database(error));
+        }
+    }
+    // Persistent "Needs attention" reason: transcription failures record what
+    // went wrong so the UI can explain the state instead of just labeling it.
+    if let Err(error) = conn.execute("ALTER TABLE meetings ADD COLUMN last_error TEXT", []) {
         if !error.to_string().contains("duplicate column name") {
             return Err(BeaError::Database(error));
         }
@@ -2543,13 +2559,14 @@ pub fn create_meeting_with_engine(
         duration_seconds: 0,
         language,
         asr_engine_id: asr_engine_id.to_string(),
+        last_error: None,
     };
     conn.execute("INSERT INTO meetings (id,title,status,created_at,duration_seconds,language,asr_engine_id) VALUES (?1,?2,?3,?4,0,?5,?6)", params![meeting.id, meeting.title, meeting.status.as_str(), meeting.created_at.to_rfc3339(), meeting.language.as_str(), meeting.asr_engine_id])?;
     Ok(meeting)
 }
 
 pub fn list_meetings(conn: &Connection) -> Result<Vec<Meeting>, BeaError> {
-    let mut stmt = conn.prepare("SELECT id,title,status,created_at,duration_seconds,language,asr_engine_id FROM meetings ORDER BY created_at DESC")?;
+    let mut stmt = conn.prepare("SELECT id,title,status,created_at,duration_seconds,language,asr_engine_id,last_error FROM meetings ORDER BY created_at DESC")?;
     let rows = stmt.query_map([], |r| {
         let status = match r.get::<_, String>(2)?.as_str() {
             "recording" => MeetingStatus::Recording,
@@ -2578,9 +2595,40 @@ pub fn list_meetings(conn: &Connection) -> Result<Vec<Meeting>, BeaError> {
             asr_engine_id: r
                 .get(6)
                 .unwrap_or_else(|_| "whisper-compatibility".to_string()),
+            last_error: r.get(7).unwrap_or(None),
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Records why a meeting needs attention: status flips to `failed` and the
+/// reason persists in the database, so the UI can explain the state (and
+/// keep explaining it after restarts, unlike a transient toast).
+pub fn mark_meeting_failed(
+    conn: &Connection,
+    meeting_id: &str,
+    error: &str,
+) -> Result<(), BeaError> {
+    let changed = conn.execute(
+        "UPDATE meetings SET status='failed', last_error=?2 WHERE id=?1",
+        params![meeting_id, error],
+    )?;
+    if changed == 0 {
+        return Err(BeaError::MeetingNotFound(meeting_id.to_string()));
+    }
+    Ok(())
+}
+
+/// Clears the failure reason once a later run succeeds.
+pub fn clear_meeting_last_error(
+    conn: &Connection,
+    meeting_id: &str,
+) -> Result<(), BeaError> {
+    conn.execute(
+        "UPDATE meetings SET last_error=NULL WHERE id=?1",
+        params![meeting_id],
+    )?;
+    Ok(())
 }
 
 pub fn update_meeting_title(
@@ -2754,6 +2802,40 @@ pub fn clear_transcript(conn: &Connection, meeting_id: &str) -> Result<(), BeaEr
     Ok(())
 }
 
+/// Removes specific transcript segments (meeting-scoped) together with their
+/// full-text entries. Used by the conversation editor: a merged block's edited
+/// text replaces its first segment and the remaining merged rows are deleted,
+/// so edits never duplicate across merged segments.
+pub fn delete_transcript_segments(
+    conn: &Connection,
+    meeting_id: &str,
+    segment_ids: &[&str],
+) -> Result<usize, BeaError> {
+    if segment_ids.is_empty() {
+        return Ok(0);
+    }
+    let placeholders = segment_ids
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("?{}", index + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let ids: Vec<String> = segment_ids.iter().map(|id| id.to_string()).collect();
+    let deleted = conn.execute(
+        &format!(
+            "DELETE FROM transcript_segments WHERE meeting_id=?1 AND id IN ({placeholders})"
+        ),
+        params_from_iter(std::iter::once(meeting_id.to_string()).into_iter().chain(ids.clone())),
+    )?;
+    conn.execute(
+        &format!(
+            "DELETE FROM transcript_fts WHERE meeting_id=?1 AND segment_id IN ({placeholders})"
+        ),
+        params_from_iter(std::iter::once(meeting_id.to_string()).into_iter().chain(ids)),
+    )?;
+    Ok(deleted)
+}
+
 pub fn search_transcript(
     conn: &Connection,
     meeting_id: &str,
@@ -2867,6 +2949,39 @@ mod memory_tests {
             params![meeting_id, id, text],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn deletes_named_segments_scoped_to_the_meeting() {
+        // The conversation editor writes a merged block's edited text into
+        // its first segment and deletes the rest — only those rows, only in
+        // that meeting, with their FTS entries.
+        let conn = memory_db();
+        insert_meeting(&conn, "m1", "A");
+        insert_meeting(&conn, "m2", "B");
+        insert_segment(&conn, "keep", "m1", 0, "keep me");
+        insert_segment(&conn, "drop1", "m1", 10, "drop one");
+        insert_segment(&conn, "drop2", "m1", 20, "drop two");
+        insert_segment(&conn, "other", "m2", 0, "other meeting");
+        let deleted = delete_transcript_segments(&conn, "m1", &["drop1", "drop2"]).unwrap();
+        assert_eq!(deleted, 2);
+        let mut remaining: Vec<String> = conn
+            .prepare("SELECT id FROM transcript_segments ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        remaining.sort();
+        assert_eq!(remaining, vec!["keep".to_string(), "other".to_string()]);
+        let fts: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM transcript_fts WHERE segment_id IN ('drop1','drop2')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts, 0);
     }
 
     #[test]
@@ -2999,7 +3114,193 @@ pub fn pack_context_mode(
 }
 
 pub fn parse_minutes_json(raw: &str) -> Result<Minutes, BeaError> {
-    serde_json::from_str(raw).map_err(|e| BeaError::InvalidModelOutput(e.to_string()))
+    // Strict first (exact schema match, as structured-output providers return);
+    // on failure the lenient parser salvages missing-field and truncated
+    // replies instead of failing the whole run.
+    match serde_json::from_str::<Minutes>(raw) {
+        Ok(minutes) => Ok(minutes),
+        Err(_) => parse_minutes_json_lenient(raw),
+    }
+}
+
+/// Normalizes a provider's minutes JSON so lenient models still parse:
+/// - fills every missing optional field (`title`, `summary`, `agenda`,
+///   `visual_observations`, `decisions`, `action_items`, `unresolved`) with
+///   its serde Default — a reply that contains only `action_items` (seen in
+///   the wild from small hosted models) becomes valid minutes instead of a
+///   hard failure;
+/// - defaults each ledger event's `kind` from the array it lives in;
+/// - injects `confidence` (required by LedgerEvent) when a model omitted it;
+/// - repairs arrays truncated mid-item by JSON-aware bracket balancing, so a
+///   reply cut off by the token budget still yields the items it completed.
+/// Strict callers (schema-enforced providers) parse without touching this.
+fn normalize_minutes_value(value: &mut serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "title",
+        "summary",
+        "agenda",
+        "visual_observations",
+        "decisions",
+        "action_items",
+        "unresolved",
+    ] {
+        let default = match key {
+            "title" | "summary" => serde_json::json!(""),
+            _ => serde_json::json!([]),
+        };
+        object.entry(key).or_insert(default);
+    }
+    for (key, kind) in [
+        ("decisions", "decision"),
+        ("action_items", "action"),
+        ("unresolved", "unresolved"),
+    ] {
+        if let Some(items) = object
+            .get_mut(key)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for item in items.iter_mut() {
+                if let Some(item_object) = item.as_object_mut() {
+                    item_object
+                        .entry("kind")
+                        .or_insert_with(|| serde_json::json!(kind));
+                    item_object
+                        .entry("confidence")
+                        .or_insert_with(|| serde_json::json!(0.8));
+                    // A truncated or sloppy item without its own summary
+                    // cannot render meaningfully; drop just this item.
+                    if !item_object.contains_key("summary") {
+                        *item = serde_json::Value::Null;
+                        continue;
+                    }
+                    if let Some(evidence) = item_object
+                        .get_mut("evidence")
+                        .and_then(serde_json::Value::as_array_mut)
+                    {
+                        for entry in evidence.iter_mut() {
+                            if let Some(evidence_object) = entry.as_object_mut() {
+                                // u64 timestamps must exist; a truncated or
+                                // sloppy entry without them cannot be placed
+                                // on the timeline, so drop just this entry.
+                                if !evidence_object.contains_key("start_seconds")
+                                    || !evidence_object.contains_key("end_seconds")
+                                    || !evidence_object.contains_key("quote")
+                                {
+                                    *entry = serde_json::Value::Null;
+                                    continue;
+                                }
+                                evidence_object
+                                    .entry("title")
+                                    .or_insert_with(|| serde_json::json!(""));
+                            }
+                        }
+                        evidence.retain(|entry| !entry.is_null());
+                    }
+                }
+            }
+            // Items dropped above became Null; remove them so the final
+            // from_value::<Minutes> sees a clean array.
+            items.retain(|item| !item.is_null());
+        }
+    }
+}
+
+/// Balances truncated JSON so a reply cut off by the token budget mid-object
+/// still parses: closes the innermost unterminated string/array/object, then
+/// appends every bracket needed to reach a top-level close. A `null`-suffixed
+/// string tail (cut inside a quote) is shortened to the last complete element.
+fn balance_truncated_json(text: &str) -> Option<String> {
+    let trimmed = text.trim().trim_start_matches("```json").trim_start_matches("```").trim();
+    if !trimmed.starts_with('{') || trimmed.ends_with('}') {
+        return None; // nothing to salvage
+    }
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut stack: Vec<char> = Vec::new();
+    for character in trimmed.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    if stack.is_empty() && !in_string {
+        return None;
+    }
+    let mut repaired = trimmed.to_string();
+    // A string truncated mid-quote is closed with a quote; JSON tolerates a
+    // dangling escape before it less well, so strip a trailing backslash.
+    if in_string {
+        while repaired.ends_with('\\') {
+            repaired.pop();
+        }
+        repaired.push('"');
+    }
+    // Drop a trailing comma so the closing brackets produce valid JSON.
+    while repaired.trim_end().ends_with(',') {
+        repaired = repaired.trim_end().trim_end_matches(',').to_string();
+    }
+    // Balance depth-first: the last opened bracket closes first.
+    for closer in stack.into_iter().rev() {
+        repaired.push(closer);
+    }
+    Some(repaired)
+}
+
+/// Like [`parse_minutes_json`] but salvages replies a strict parse rejects:
+/// missing top-level fields are defaulted and a token-budget truncation is
+/// bracket-balanced before retrying. Used by the chat-completions minutes
+/// path; the OAuth path funnels through the same normalizer.
+pub fn parse_minutes_json_lenient(raw: &str) -> Result<Minutes, BeaError> {
+    let attempts: Vec<String> = {
+        let mut attempts = vec![raw.to_string()];
+        if let Some(start) = raw.find('{') {
+            if let Some(end) = raw.rfind('}') {
+                if end > start {
+                    attempts.push(raw[start..=end].to_string());
+                }
+            }
+        }
+        if let Some(balanced) = balance_truncated_json(raw) {
+            attempts.push(balanced);
+        }
+        attempts
+    };
+    for attempt in attempts {
+        let stripped = attempt
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(stripped) else {
+            continue;
+        };
+        normalize_minutes_value(&mut value);
+        if let Ok(minutes) = serde_json::from_value::<Minutes>(value) {
+            return Ok(minutes);
+        }
+    }
+    Err(BeaError::InvalidModelOutput(
+        "provider minutes JSON did not match the expected schema".into(),
+    ))
 }
 
 pub fn app_data_paths(root: impl AsRef<Path>, meeting_id: &str) -> (PathBuf, PathBuf) {
@@ -3813,11 +4114,12 @@ pub fn build_multimodal_body(
     images: &[(PathBuf, String)], // (frame path, ocr_text) pairs
     max_tokens: u32,
     reasoning_effort: &str,
+    model: &str,
 ) -> serde_json::Value {
     if images.is_empty() {
         if provider.kind == ProviderKind::OpenAiOAuth {
             let request = LlmRequest {
-                model: provider.model.clone(),
+                model: model.to_string(),
                 system: system.to_string(),
                 user: user_text.to_string(),
                 json_schema: String::new(),
@@ -3827,7 +4129,7 @@ pub fn build_multimodal_body(
             return codex_oauth::responses_payload(&request);
         }
         let mut body = serde_json::json!({
-            "model": provider.model,
+            "model": model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_text}
@@ -3839,7 +4141,7 @@ pub fn build_multimodal_body(
     }
     if provider.kind == ProviderKind::OpenAiOAuth {
         let request = LlmRequest {
-            model: provider.model.clone(),
+            model: model.to_string(),
             system: system.to_string(),
             user: user_text.to_string(),
             json_schema: String::new(),
@@ -3861,7 +4163,7 @@ pub fn build_multimodal_body(
         }));
     }
     let mut body = serde_json::json!({
-        "model": provider.model,
+        "model": model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": parts}
@@ -3884,6 +4186,7 @@ pub async fn call_provider_messages(
     max_output_tokens: u32,
     reasoning_effort: &str,
     api_key: Option<&str>,
+    model: &str,
 ) -> Result<String, BeaError> {
     let base = provider.base_url.trim_end_matches('/');
     let url = match provider.kind {
@@ -3893,8 +4196,15 @@ pub async fn call_provider_messages(
         ProviderKind::Local => format!("{base}/v1/chat/completions"),
         ProviderKind::OpenAiOAuth => format!("{base}/responses"),
     };
-    let body =
-        build_multimodal_body(provider, system, user_text, images, max_output_tokens, reasoning_effort);
+    let body = build_multimodal_body(
+        provider,
+        system,
+        user_text,
+        images,
+        max_output_tokens,
+        reasoning_effort,
+        model,
+    );
     // Same 200 s budget and transient-failure retries as the text path above.
     let payload: serde_json::Value = post_provider_json(url, &body, api_key).await?;
     if provider.kind == ProviderKind::OpenAiOAuth {
@@ -3928,6 +4238,103 @@ fn body_snippet(raw: &str) -> String {
         .collect()
 }
 
+/// Turns provider error bodies into messages a person can act on. Quota walls
+/// in particular used to surface as opaque JSON with raw epoch numbers — the
+/// user needs "your plan's limit is reached, it resets on <date>", not a dump.
+fn humanize_provider_error(status: &str, raw: &str) -> String {
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return format!("HTTP {status}; body: {:?}", body_snippet(raw));
+    };
+    let kind = payload["error"]["type"].as_str();
+    if kind == Some("usage_limit_reached") {
+        let resets_at = payload["error"]["resets_at"].as_i64();
+        let resets_in = payload["error"]["resets_in_seconds"].as_i64();
+        let when = match (resets_in, resets_at) {
+            (Some(seconds), _) if seconds >= 172_800 => {
+                format!("in {} days", (seconds as f64 / 86_400.0).ceil() as i64)
+            }
+            (Some(seconds), _) if seconds >= 3_600 => {
+                format!("in {} hours", (seconds as f64 / 3_600.0).ceil() as i64)
+            }
+            (Some(seconds), _) if seconds > 0 => format!("in {} minutes", (seconds / 60).max(1)),
+            _ => match resets_at {
+                Some(epoch) => format!(
+                    "on {}",
+                    chrono::DateTime::from_timestamp(epoch, 0)
+                        .map(|t| t.format("%b %d, %Y %H:%M UTC").to_string())
+                        .unwrap_or_else(|| "soon".to_string())
+                ),
+                None => "soon".to_string(),
+            },
+        };
+        return format!(
+            "Your ChatGPT plan's usage limit is reached — it resets {when}. Until then, minutes and chat need a different provider or Bea's local fallback."
+        );
+    }
+    format!("HTTP {status}; body: {:?}", body_snippet(raw))
+}
+
+/// Classifies a failed provider response into the right `BeaError`: quota
+/// walls display bare (see `UsageLimit`) and are not retried; everything
+/// else keeps the "provider request failed:" transport framing.
+fn provider_error_from_status(status: &str, raw: &str) -> BeaError {
+    if let Ok(payload) = serde_json::from_str::<serde_json::Value>(raw) {
+        if payload["error"]["type"].as_str() == Some("usage_limit_reached") {
+            return BeaError::UsageLimit(humanize_provider_error(status, raw));
+        }
+    }
+    BeaError::ProviderRequest(humanize_provider_error(status, raw))
+}
+
+/// Extracts the final Responses-API object from an SSE stream. The ChatGPT/
+/// Codex backend only answers `stream: true` requests; its `response.completed`
+/// event carries the complete response object, so no delta accumulation is
+/// needed. A `response.failed` event surfaces the server's error message.
+fn parse_sse_final_response(raw: &str) -> Result<serde_json::Value, BeaError> {
+    let mut last_error: Option<String> = None;
+    for line in raw.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        match event["type"].as_str() {
+            Some("response.completed") => {
+                if let Some(response) = event.get("response") {
+                    return Ok(response.clone());
+                }
+            }
+            Some("response.failed") | Some("response.incomplete") => {
+                last_error = Some(
+                    event["response"]["error"]["message"]
+                        .as_str()
+                        .or_else(|| event["response"]["incomplete_details"]["reason"].as_str())
+                        .unwrap_or("the stream ended with a failed response")
+                        .to_string(),
+                );
+            }
+            Some("error") => {
+                last_error = Some(
+                    event["message"]
+                        .as_str()
+                        .unwrap_or("the stream reported an error")
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+    Err(BeaError::ProviderRequest(match last_error {
+        Some(message) => format!("provider stream failed: {message}"),
+        None => "provider stream ended without a response.completed event".to_string(),
+    }))
+}
+
 pub fn parse_provider_minutes(response: &serde_json::Value) -> Result<Minutes, BeaError> {
     let message = response
         .get("choices")
@@ -3959,51 +4366,11 @@ pub fn parse_provider_minutes(response: &serde_json::Value) -> Result<Minutes, B
 }
 
 fn parse_provider_minutes_text(text: &str) -> Result<Minutes, BeaError> {
-    let mut attempts: Vec<String> = vec![text.to_string()];
-    if let Some(start) = text.find('{') {
-        if let Some(end) = text.rfind('}') {
-            if end > start {
-                attempts.push(text[start..=end].to_string());
-            }
-        }
-    }
-    for attempt in attempts {
-        let stripped = attempt
-            .trim()
-            .trim_start_matches("```json")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim();
-        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(stripped) else {
-            continue;
-        };
-        if let Some(object) = value.as_object_mut() {
-            for (key, kind) in [
-                ("decisions", "decision"),
-                ("action_items", "action"),
-                ("unresolved", "unresolved"),
-            ] {
-                if let Some(items) = object
-                    .get_mut(key)
-                    .and_then(serde_json::Value::as_array_mut)
-                {
-                    for item in items.iter_mut() {
-                        if let Some(item_object) = item.as_object_mut() {
-                            item_object
-                                .entry("kind")
-                                .or_insert_with(|| serde_json::json!(kind));
-                        }
-                    }
-                }
-            }
-        }
-        if let Ok(minutes) = serde_json::from_value::<Minutes>(value) {
-            return Ok(minutes);
-        }
-    }
-    Err(BeaError::InvalidModelOutput(
-        "provider minutes JSON did not match the expected schema".into(),
-    ))
+    // Delegates to the lenient parser: missing top-level fields are defaulted
+    // (some models return only the arrays they found content for), omitted
+    // kind/confidence/evidence-title are injected, and a reply truncated by
+    // the token budget is bracket-balanced so completed items survive.
+    parse_minutes_json_lenient(text)
 }
 
 /// Maximum number of correction round-trips when a provider's minutes reply
@@ -4071,9 +4438,15 @@ async fn post_provider_json(
         // failure. Rate limits and server errors are worth a retry; other
         // client errors (bad key, unknown model) would fail identically.
         if !status.is_success() {
-            let error = BeaError::ProviderRequest(format!("HTTP {status}"));
-            if (status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
-                && attempt + 1 < PROVIDER_MAX_ATTEMPTS
+            // Read the body so the error can name the reason — 4xx bodies
+            // usually say exactly what was rejected (e.g. max_tokens above
+            // the model's limit), which the max-tokens fallback relies on.
+            let raw = response.text().await.unwrap_or_default();
+            let error = provider_error_from_status(&status.to_string(), &raw);
+            // Quota walls (usage_limit_reached) don't clear within a retry
+            // window — fail fast instead of burning attempts on backoff.
+            let retriable = status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+            if retriable && !matches!(error, BeaError::UsageLimit(_)) && attempt + 1 < PROVIDER_MAX_ATTEMPTS
             {
                 last_error = Some(error);
                 continue;
@@ -4091,6 +4464,11 @@ async fn post_provider_json(
         // A 200 with an unparseable body is treated as persistent (an HTML
         // error page or wrong endpoint returns the same page on retry), so it
         // surfaces immediately instead of burning the remaining attempts.
+        // Streaming (SSE) bodies — the ChatGPT/Codex Responses API — are
+        // unwrapped into the final completed response object instead.
+        if raw.trim_start().starts_with("event:") || raw.contains("\ndata: {") {
+            return parse_sse_final_response(&raw);
+        }
         return parse_provider_payload(&raw);
     }
     Err(last_error
@@ -4140,14 +4518,16 @@ fn minutes_from_payload(
 fn minutes_correction_request(original: &LlmRequest, broken: &str, parse_error: &str) -> LlmRequest {
     LlmRequest {
         model: original.model.clone(),
-        system: "You repair malformed JSON meeting minutes. Reply with ONLY the corrected JSON object matching the schema — no markdown fences, no commentary, no explanations.".to_string(),
+        system: "You repair malformed JSON meeting minutes. Reply with ONLY the corrected JSON object matching the schema, in compact single-line form (no pretty-printing, no extra whitespace) — no markdown fences, no commentary, no explanations.".to_string(),
         user: format!(
             "The reply below was supposed to be meeting-minutes JSON matching this schema:\n{}\n\nIt failed to parse: {parse_error}\n\nReturn ONLY the corrected JSON object.\n\nBroken reply:\n{broken}",
             original.json_schema
         ),
         json_schema: original.json_schema.clone(),
         max_output_tokens: original.max_output_tokens,
-        reasoning_effort: original.reasoning_effort.clone(),
+        // Repairs are mechanical: thinking would burn the same budget that
+        // likely caused the truncation being repaired. Force it off.
+        reasoning_effort: "off".to_string(),
     }
 }
 
@@ -4206,6 +4586,175 @@ pub async fn repair_minutes_reply(
     Err(failed_minutes_error(last_error, &broken))
 }
 
+/// Fallback sections for sectioned minutes generation: each round asks for a
+/// small slice of the minutes (identified by the top-level keys it should
+/// fill) so no single reply is large enough to truncate, even for meetings
+/// whose one-shot minutes exceed the model's output budget.
+const MINUTES_SECTIONS: [(&[&str], &str); 3] = [
+    (&["title", "summary", "agenda"], "title, summary, and agenda"),
+    (&["decisions"], "decisions"),
+    (
+        &["action_items", "unresolved"],
+        "action items and unresolved questions",
+    ),
+];
+
+/// Builds a section-only schema from the full minutes schema, reusing the
+/// exact item shapes (evidence, quotes, timestamps) for the requested keys.
+fn minutes_section_schema(full_schema: &str, keys: &[&str]) -> String {
+    let Ok(schema) = serde_json::from_str::<serde_json::Value>(full_schema) else {
+        return full_schema.to_string();
+    };
+    let Some(properties) = schema.get("properties") else {
+        return full_schema.to_string();
+    };
+    let mut subset = serde_json::Map::new();
+    for key in keys {
+        if let Some(property) = properties.get(*key) {
+            subset.insert((*key).to_string(), property.clone());
+        }
+    }
+    serde_json::json!({
+        "type": "object",
+        "properties": subset,
+        "required": keys,
+    })
+    .to_string()
+}
+
+/// Extracts the first JSON object from a model reply without schema
+/// validation: fenced blocks stripped, outermost braces scraped as a fallback.
+fn parse_reply_json(text: &str) -> Option<serde_json::Value> {
+    let stripped = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(stripped) {
+        return Some(value);
+    }
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str(&text[start..=end]).ok()
+}
+
+/// Backfills the optional ledger fields a trimmed section reply may omit so
+/// items still deserialize (same tolerance as the one-shot parser, extended
+/// to confidence and evidence).
+fn backfill_ledger_items(items: &[serde_json::Value], kind: &str) -> Vec<LedgerEvent> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let mut item = item.clone();
+            if let Some(object) = item.as_object_mut() {
+                object
+                    .entry("kind")
+                    .or_insert_with(|| serde_json::json!(kind));
+                object
+                    .entry("confidence")
+                    .or_insert_with(|| serde_json::json!(0.8));
+                object
+                    .entry("evidence")
+                    .or_insert_with(|| serde_json::json!([]));
+            }
+            serde_json::from_value(item).ok()
+        })
+        .collect()
+}
+
+/// Merges one sectioned reply into the accumulating minutes. A section that
+/// parses but yields nothing leaves the corresponding field untouched.
+fn merge_minutes_section(minutes: &mut Minutes, section: &serde_json::Value) {
+    if let Some(title) = section.get("title").and_then(serde_json::Value::as_str) {
+        if !title.trim().is_empty() {
+            minutes.title = title.to_string();
+        }
+    }
+    if let Some(summary) = section.get("summary").and_then(serde_json::Value::as_str) {
+        if !summary.trim().is_empty() {
+            minutes.summary = summary.to_string();
+        }
+    }
+    if let Some(items) = section.get("agenda").and_then(serde_json::Value::as_array) {
+        let parsed: Vec<AgendaItem> = items
+            .iter()
+            .filter_map(|item| serde_json::from_value(item.clone()).ok())
+            .collect();
+        if !parsed.is_empty() {
+            minutes.agenda = parsed;
+        }
+    }
+    for (key, target, kind) in [
+        ("decisions", &mut minutes.decisions, "decision"),
+        ("action_items", &mut minutes.action_items, "action"),
+        ("unresolved", &mut minutes.unresolved, "unresolved"),
+    ] {
+        if let Some(items) = section.get(key).and_then(serde_json::Value::as_array) {
+            let parsed = backfill_ledger_items(items, kind);
+            if !parsed.is_empty() {
+                *target = parsed;
+            }
+        }
+    }
+}
+
+/// Last-resort minutes generation: regenerates the minutes section by section
+/// (title/summary/agenda, then decisions, then action items/unresolved) so
+/// every reply is small enough to complete even for very long meetings where
+/// a one-shot reply truncated. Sections are merged into one Minutes; a section
+/// that fails to parse contributes nothing.
+async fn call_provider_sectioned(
+    provider: &ProviderConfig,
+    request: &LlmRequest,
+    api_key: Option<&str>,
+) -> Result<Minutes, BeaError> {
+    let mut minutes = Minutes::default();
+    let mut failures: Vec<String> = Vec::new();
+    for (keys, label) in MINUTES_SECTIONS {
+        let schema = minutes_section_schema(&request.json_schema, keys);
+        let section_request = LlmRequest {
+            model: request.model.clone(),
+            system: request.system.clone(),
+            user: format!(
+                "{}\n\n=== SECTIONED OUTPUT REQUEST ===\nProduce ONLY the {label} portion of the minutes, as a single JSON object with exactly these top-level keys: {}. Compact single-line JSON, no markdown fences, no commentary.\nSchema for this section:\n{}",
+                request.user,
+                keys.join(", "),
+                schema
+            ),
+            json_schema: schema,
+            max_output_tokens: request.max_output_tokens,
+            reasoning_effort: request.reasoning_effort.clone(),
+        };
+        let payload = match send_provider_request(provider, &section_request, api_key).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                failures.push(format!("{label}: {error}"));
+                continue;
+            }
+        };
+        let text = reply_text(provider, &payload);
+        match parse_reply_json(&text) {
+            Some(section) => merge_minutes_section(&mut minutes, &section),
+            None => failures.push(format!("{label}: reply was not JSON")),
+        }
+    }
+    if minutes.title.trim().is_empty()
+        && minutes.summary.trim().is_empty()
+        && minutes.decisions.is_empty()
+        && minutes.action_items.is_empty()
+    {
+        return Err(BeaError::InvalidModelOutput(format!(
+            "sectioned minutes generation produced nothing usable; {}",
+            failures.join("; ")
+        )));
+    }
+    Ok(minutes)
+}
+
 /// Sends only the packed text/image request supplied by the caller. The API key is passed at
 /// the effect boundary and is never persisted in `ProviderConfig`, SQLite, or a request body.
 pub async fn call_provider(
@@ -4224,7 +4773,14 @@ pub async fn call_provider(
                 // Repairs cannot fix an empty reply; say so explicitly.
                 return Err(failed_minutes_error(error, ""));
             }
-            repair_minutes_reply(provider, request, api_key, broken, error).await
+            if let Ok(minutes) =
+                repair_minutes_reply(provider, request, api_key, broken, error).await
+            {
+                return Ok(minutes);
+            }
+            // Last resort: regenerate section by section so every reply is
+            // small enough to complete even when one-shot output truncated.
+            call_provider_sectioned(provider, request, api_key).await
         }
     }
 }
@@ -4561,7 +5117,7 @@ pub fn load_minutes(conn: &Connection, meeting_id: &str) -> Result<Option<Minute
 
 pub fn export_markdown(minutes: &Minutes) -> String {
     let mut out = format!(
-        "# Minutes of the Meeting\n\n## {}\n\n{}\n",
+        "# Minutes of the Meeting\n\n## {}\n\n{}\n\n",
         minutes.title, minutes.summary
     );
     if !minutes.agenda.is_empty() {
@@ -4872,6 +5428,7 @@ mod tests {
             &images,
             1_000,
             "off",
+            &provider.model,
         );
         // Vision path: user content is an array with a text part and an image_url part.
         let content = body["messages"][1]["content"].as_array().unwrap();
@@ -4889,6 +5446,7 @@ mod tests {
             &images,
             1_000,
             "medium",
+            &provider.model,
         );
         assert_eq!(
             thinking["reasoning"],
@@ -4900,15 +5458,22 @@ mod tests {
             base_url: "https://chatgpt.com/backend-api/codex".into(),
             ..provider.clone()
         };
-        let responses_body =
-            build_multimodal_body(&oauth, "system prompt", "user question", &images, 1_000, "off");
+        let responses_body = build_multimodal_body(
+            &oauth,
+            "system prompt",
+            "user question",
+            &images,
+            1_000,
+            "off",
+            &oauth.model,
+        );
         let input = responses_body["input"][0]["content"].as_array().unwrap();
         assert_eq!(input[0]["type"], "input_text");
         assert_eq!(input[1]["type"], "input_image");
         // OCR fallback path: no images sent; the caller embeds the OCR text in
         // the user text, which travels as a plain string.
         let user_text = "=== VISUAL CONTEXT (OCR) ===\nslide showing Q3 budget\n\nuser question";
-        let fallback = build_multimodal_body(&provider, "system", user_text, &[], 1_000, "off");
+        let fallback = build_multimodal_body(&provider, "system", user_text, &[], 1_000, "off", &provider.model);
         assert!(fallback["messages"][1]["content"].as_str().unwrap().contains("slide showing Q3 budget"));
     }
     #[test]
@@ -4937,6 +5502,10 @@ mod tests {
         let markdown = export_markdown(&minutes);
         assert!(markdown.contains("## Agenda"));
         assert!(markdown.contains("Budget review"));
+        // Sections are separated by a blank line — the summary must never
+        // squash into the next heading ("Summary.\n## Agenda").
+        assert!(markdown.contains("Summary.\n\n## Agenda"), "got: {markdown:?}");
+        assert!(!markdown.contains(".\n## "), "got: {markdown:?}");
     }
     #[test]
     fn chat_context_includes_speaker_names_and_custom_format() {
@@ -5344,6 +5913,125 @@ mod tests {
         assert_eq!(estimate_tokens("1234"), 1);
     }
     #[test]
+    fn multimodal_body_uses_the_requested_model_not_the_provider_default() {
+        // Regression: the vision paths (minutes with video frames, chat with
+        // images) dropped the per-meeting model override and silently sent the
+        // provider default — which the Codex backend may reject outright
+        // ("model is not supported when using Codex with a ChatGPT account").
+        let provider = ProviderConfig {
+            id: "openai-oauth".into(),
+            kind: ProviderKind::OpenAiOAuth,
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            model: "provider-default".into(),
+            credential_ref: None,
+            enabled: true,
+            reasoning_effort: "off".into(),
+        };
+        let text_only = build_multimodal_body(
+            &provider,
+            "sys",
+            "usr",
+            &[],
+            100,
+            "off",
+            "requested-model",
+        );
+        assert_eq!(text_only["model"], "requested-model");
+        let with_images = build_multimodal_body(
+            &provider,
+            "sys",
+            "usr",
+            &[(std::path::PathBuf::from("missing.jpg"), String::new())],
+            100,
+            "off",
+            "requested-model",
+        );
+        assert_eq!(with_images["model"], "requested-model");
+    }
+
+    #[test]
+    fn sse_stream_yields_the_completed_response_object() {
+        // The Codex backend only answers with `stream: true` — an SSE body
+        // whose `response.completed` event carries the full response object.
+        let raw = "event: response.created\n\
+                   data: {\"type\":\"response.created\"}\n\n\
+                   event: response.output_text.delta\n\
+                   data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+                   event: response.completed\n\
+                   data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"{\\\"title\\\":\\\"T\\\"}\"}]}]}}\n\n";
+        let parsed = parse_sse_final_response(raw).unwrap();
+        assert_eq!(parsed["id"], "r1");
+        assert_eq!(
+            codex_oauth::responses_output_text(&parsed).unwrap(),
+            "{\"title\":\"T\"}"
+        );
+    }
+
+    #[test]
+    fn sse_stream_failure_event_surfaces_the_error() {
+        let raw = "event: response.failed\n\
+                   data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"model overloaded\"}}}\n\n";
+        let error = parse_sse_final_response(raw).unwrap_err().to_string();
+        assert!(error.contains("model overloaded"), "got: {error}");
+        // A stream that ends without completing is an error too.
+        let incomplete = "event: response.output_text.delta\n\
+                          data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n";
+        assert!(parse_sse_final_response(incomplete).is_err());
+    }
+
+    #[test]
+    fn openai_oauth_payloads_request_streaming() {
+        // The ChatGPT/Codex backend answers 400 "Stream must be set to true"
+        // unless the payload asks for an SSE stream.
+        let request = LlmRequest {
+            model: "gpt-5.6-luna".into(),
+            system: "sys".into(),
+            user: "usr".into(),
+            json_schema: String::new(),
+            max_output_tokens: 100,
+            reasoning_effort: "off".into(),
+        };
+        assert_eq!(codex_oauth::responses_payload(&request)["stream"], serde_json::json!(true));
+        assert_eq!(
+            codex_oauth::responses_payload_multimodal(&request, &[])["stream"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn usage_limit_errors_read_like_a_human_wrote_them() {
+        // Live example from the ChatGPT/Codex backend (free plan quota wall).
+        let raw = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"free","resets_at":1789366082,"eligible_promo":null,"resets_in_seconds":442422}}"#;
+        let message = humanize_provider_error("HTTP 429 Too Many Requests", raw);
+        assert!(message.contains("usage limit"), "got: {message}");
+        assert!(message.contains("resets"), "got: {message}");
+        // Roughly 5 days — say days, not raw epoch seconds.
+        assert!(!message.contains("442422"), "got: {message}");
+        // Non-quota errors pass through untouched.
+        let plain = humanize_provider_error("HTTP 400", r#"{"detail":"nope"}"#);
+        assert!(plain.contains("nope"));
+    }
+
+    #[test]
+    fn usage_limit_errors_display_without_transport_jargon() {
+        // The humanized quota message must reach the user bare — the UI already
+        // says "Chat failed:" / "Correction failed:", so "provider request
+        // failed:" in between reads like an error inside an error.
+        let raw = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"free","resets_at":1789366082,"resets_in_seconds":442422}}"#;
+        let error = provider_error_from_status("429 Too Many Requests", raw);
+        let text = error.to_string();
+        assert!(!text.contains("provider request failed"), "got: {text}");
+        assert!(text.contains("usage limit"), "got: {text}");
+        // Quota walls are also not worth retrying — the error is classified
+        // so the transport skips its attempt/backoff cycle for them.
+        assert!(matches!(error, BeaError::UsageLimit(_)));
+        // Other failures keep the transport context.
+        let plain = provider_error_from_status("400 Bad Request", r#"{"detail":"nope"}"#);
+        assert!(plain.to_string().contains("provider request failed"));
+        assert!(matches!(plain, BeaError::ProviderRequest(_)));
+    }
+
+    #[test]
     fn openai_oauth_uses_the_responses_endpoint_and_codex_payload() {
         let provider = ProviderConfig {
             id: "openai-oauth".into(),
@@ -5393,6 +6081,54 @@ mod tests {
         assert!(correction.user.contains("EOF while parsing an object"));
         assert!(correction.user.contains(r#"{"type":"object"}"#));
         assert!(correction.system.contains("ONLY the corrected JSON"));
+    }
+    #[test]
+    fn minutes_section_schema_slices_the_full_schema() {
+        let schema = minutes_section_schema(
+            r#"{"type":"object","properties":{"title":{"type":"string"},"decisions":{"type":"array"}},"required":["title"]}"#,
+            &["decisions"],
+        );
+        let value: serde_json::Value = serde_json::from_str(&schema).unwrap();
+        assert!(value["properties"].get("decisions").is_some());
+        assert!(value["properties"].get("title").is_none());
+        assert_eq!(value["required"][0], "decisions");
+    }
+    #[test]
+    fn parse_reply_json_strips_fences_and_scrapes_embedded_objects() {
+        let fenced = parse_reply_json("```json\n{\"title\":\"T\"}\n```").unwrap();
+        assert_eq!(fenced["title"], "T");
+        let embedded = parse_reply_json("Here you go:\n{\"summary\":\"S\"}\nDone.").unwrap();
+        assert_eq!(embedded["summary"], "S");
+        assert!(parse_reply_json("no json here").is_none());
+    }
+    #[test]
+    fn merge_minutes_section_backfills_optional_ledger_fields() {
+        let mut minutes = Minutes::default();
+        let section = serde_json::json!({
+            "title": "Weekly Sync",
+            "summary": "Discussed the roadmap.",
+            "agenda": [{"heading": "Roadmap"}],
+            "action_items": [{"summary": "Draft the spec", "evidence": []}]
+        });
+        merge_minutes_section(&mut minutes, &section);
+        assert_eq!(minutes.title, "Weekly Sync");
+        assert_eq!(minutes.summary, "Discussed the roadmap.");
+        assert_eq!(minutes.agenda.len(), 1);
+        assert_eq!(minutes.action_items.len(), 1);
+        assert_eq!(minutes.action_items[0].kind, "action");
+        assert_eq!(minutes.action_items[0].confidence, 0.8);
+        // An empty or failing section leaves existing content untouched.
+        let empty = serde_json::json!({"decisions": []});
+        minutes.decisions.push(LedgerEvent {
+            kind: "decision".into(),
+            summary: "Keep".into(),
+            owner: None,
+            due: None,
+            confidence: 0.9,
+            evidence: Vec::new(),
+        });
+        merge_minutes_section(&mut minutes, &empty);
+        assert_eq!(minutes.decisions.len(), 1);
     }
     #[test]
     fn reasoning_effort_normalizes_and_resolves_with_meeting_override() {
@@ -5489,6 +6225,57 @@ mod tests {
         };
         let body = build_provider_request(&local, &off).body;
         assert!(body.get("reasoning").is_none());
+    }
+    #[test]
+    fn lenient_parser_defaults_missing_fields_and_injects_kinds() {
+        // The exact shape seen in the wild: only action_items, pretty-printed,
+        // no title/summary/decisions/unresolved, no kind/confidence.
+        let raw = r#"{
+  "action_items": [
+    {
+      "evidence": [
+        { "end_seconds": 1120, "quote": "hindi pa natin maia-announce ngayon", "start_seconds": 1100 }
+      ],
+      "summary": "Announce the next chairman once finalized"
+    }
+  ]
+}"#;
+        let minutes = parse_minutes_json(raw).expect("lenient parse should succeed");
+        assert_eq!(minutes.title, "");
+        assert_eq!(minutes.summary, "");
+        assert!(minutes.decisions.is_empty() && minutes.unresolved.is_empty());
+        assert_eq!(minutes.action_items.len(), 1);
+        let item = &minutes.action_items[0];
+        assert_eq!(item.kind, "action");
+        assert!(item.confidence > 0.0);
+        assert_eq!(item.evidence[0].title, "");
+    }
+    #[test]
+    fn lenient_parser_salvages_token_budget_truncation() {
+        // Reply cut off mid-item by max_output_tokens: the completed decision
+        // must survive instead of the whole run failing.
+        let raw = r#"{"title":"Board meeting","summary":"Q3 review","decisions":[{"kind":"decision","summary":"Approve the budget","confidence":0.9,"evidence":[{"start_seconds":10,"end_seconds":20,"quote":"approved the b"#;
+        let minutes = parse_minutes_json(raw).expect("truncated reply should be salvaged");
+        assert_eq!(minutes.title, "Board meeting");
+        assert_eq!(minutes.decisions.len(), 1);
+        assert_eq!(minutes.decisions[0].summary, "Approve the budget");
+        assert!(minutes.action_items.is_empty());
+    }
+    #[test]
+    fn truncated_string_tail_is_closed_not_corrupted() {
+        // The user's exact failure prefix: a truncated quote ending in "t".
+        // The item's summary and evidence start_seconds were never emitted,
+        // so the salvaged minutes are valid but the incomplete item itself is
+        // dropped — the important property is that parsing succeeds instead
+        // of failing the whole run.
+        let raw = r#"{ "action_items": [ { "evidence": [ { "end_seconds": 1120, "quote": "hindi pa natin maia-announce ngayon kung sino yung mga next chairman and co-chair natin for t"#;
+        let minutes = parse_minutes_json(raw).expect("truncated quote should be closed");
+        assert!(minutes.action_items.is_empty());
+    }
+    #[test]
+    fn parse_minutes_json_still_rejects_prose() {
+        assert!(parse_minutes_json("Sorry, I cannot output JSON today.").is_err());
+        assert!(parse_minutes_json("not json at all").is_err());
     }
     #[test]
     fn failed_minutes_error_attaches_reply_snippet() {

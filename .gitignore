@@ -28,6 +28,12 @@ IDEA.md
 
 # Local Windows scripts
 scripts/*.ps1
+
+# Smoke-test harness artifacts (logs, media clips, snapshots, exports) — keep scripts
+.smoke/*
+!.smoke/pw.py
+!.smoke/launch-bea.ps1
+!.smoke/launch-bea.cmd
 scripts/regenerate_minutes.py
 
 # OS files

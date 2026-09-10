@@ -1,7 +1,7 @@
 export type MeetingStatus = 'draft' | 'recording' | 'paused' | 'processing' | 'ready' | 'failed';
 export type TranscriptLanguage = 'auto' | 'en' | 'fil' | 'taglish';
 export type AsrEngineId = 'qwen-standard' | 'whisper-compatibility' | 'nemotron-multilingual';
-export type Meeting = { id: string; title: string; status: MeetingStatus; duration_seconds: number; language: TranscriptLanguage; created_at: string; asr_engine_id?: AsrEngineId; last_opened_at?: string };
+export type Meeting = { id: string; title: string; status: MeetingStatus; duration_seconds: number; language: TranscriptLanguage; created_at: string; asr_engine_id?: AsrEngineId; last_opened_at?: string; last_error?: string | null };
 export type Evidence = { start_seconds: number; end_seconds: number; quote: string; title?: string };
 export type LedgerEvent = { kind: string; summary: string; owner?: string | null; due?: string | null; confidence: number; evidence: Evidence[] };
 export type AgendaItem = { heading: string; start_seconds?: number | null; end_seconds?: number | null };
@@ -34,6 +34,12 @@ export type ProviderVerification = { verified: boolean; checkedAt?: string; mess
 export type SetupStatus = { tools: SetupTool[]; engines: AsrEngineDescriptor[]; selectedEngine: AsrEngineId; provider: ProviderVerification; complete: boolean };
 
 export const statusLabel: Record<MeetingStatus, string> = { draft: 'Draft', recording: 'Recording', paused: 'Paused', processing: 'Processing', ready: 'Ready', failed: 'Needs attention' };
+/// Decides which media element the workspace mounts: `<video>` for video
+/// sources, `<audio>` for audio-only ones. Kind strings come from SQLite
+/// where they are stored capitalized ('Audio'/'Video') — compare
+/// case-insensitively or audio meetings render in a black video box.
+export const mediaKindIsVideo = (kind: string | null | undefined): boolean =>
+  (kind ?? 'video').toLowerCase() !== 'audio';
 export type ContextEventRow = { id: string; meeting_id: string; kind: string; payload: string; created_at: string };
 export type SpeakerName = { speaker_index: number; name: string };
 export const speakerLabel = (index: number | null, names: SpeakerName[], extra: number[] = []) => {
@@ -42,3 +48,14 @@ export const speakerLabel = (index: number | null, names: SpeakerName[], extra: 
   const others = extra.filter((i) => i !== index).map((i) => names.find((n) => n.speaker_index === i)?.name ?? `Speaker ${i + 1}`);
   return [primary, ...others].join(' + ');
 };
+/// True when the minutes carry anything worth sharing. Exporting an empty
+/// shell produced blank documents that looked like a successful share.
+export const minutesHasExportableContent = (minutes: Minutes): boolean =>
+  minutes.summary.trim().length > 0
+  || minutes.agenda.length > 0
+  || minutes.decisions.length > 0
+  || minutes.action_items.length > 0;
+/// File extension per export format — markdown maps to "md" (the exporter
+/// rejects a ".markdown" file), pdf/docx pass through.
+export const exportExtension = (format: 'markdown' | 'pdf' | 'docx'): string =>
+  format === 'markdown' ? 'md' : format;

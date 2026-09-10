@@ -126,7 +126,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .import-model strong { font-size: 12px; }
 .import-model small { color: var(--quiet); font-size: 10px; }
 .import-model > svg { margin-left: auto; color: var(--quiet); }
-.install-detail { display: grid; grid-template-columns: 1.5fr 1fr 1fr; gap: 18px; margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--line-soft); }
+.install-detail { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; margin-top: 32px; padding-top: 20px; border-top: 1px solid var(--line-soft); }
 .install-detail div { display: grid; gap: 5px; }
 .detail-label, .field-help { color: var(--quiet); font-size: 10px; }
 .install-detail strong { font-size: 12px; font-weight: 500; }
@@ -148,9 +148,6 @@ select {
 select:hover { border-color: #45566a; background: #111b26; }
 select:focus { border-color: var(--teal); box-shadow: 0 0 0 3px #5bd0ac22; }
 select option { background: #0e151d; color: var(--text); }
-.provider-form label:has(select), .provider-settings label:has(select) { position: relative; }
-.provider-form label:has(select)::after, .provider-settings label:has(select)::after, .chat-model-select:has(select)::after { content: '▾'; position: absolute; right: 12px; bottom: 11px; color: var(--quiet); font-size: 10px; pointer-events: none; transition: color .14s; }
-.provider-form label:has(select):hover::after, .provider-settings label:has(select):hover::after { color: var(--muted); }
 .field-help { line-height: 1.45; }
 .verify-button { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 39px; margin-top: 4px; border: 1px solid #5bd0ac99; border-radius: 6px; color: #0c1917; background: var(--teal); font-size: 12px; font-weight: 700; }
 .provider-message { margin: -4px 0 0; font-size: 11px; line-height: 1.4; }
@@ -178,8 +175,11 @@ select option { background: #0e151d; color: var(--text); }
 .readiness-list strong { font-size: 12px; font-weight: 600; }
 .readiness-list small { color: var(--quiet); font-size: 10px; }
 .setup-footer { display: flex; justify-content: space-between; align-items: center; gap: 18px; width: min(850px, calc(100% - 126px)); margin: auto auto 27px; padding-top: 17px; border-top: 1px solid var(--line-soft); color: var(--quiet); font-size: 10px; }
+.setup-footer > span { min-width: 0; line-height: 1.5; overflow-wrap: anywhere; }
 .setup-footer > div { display: flex; align-items: center; gap: 9px; }
 .setup-footnote { color: var(--quiet); font-size: 10px; }
+.setup-heading-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 28px; }
+.setup-mascot { flex: none; }
 @keyframes pulse { 50% { transform: scale(.88); opacity: .6; } }
 
 /* Library */
@@ -409,6 +409,15 @@ select option { background: #0e151d; color: var(--text); }
 .settings-danger strong { color: #efb0b0; font-size: 11px; }
 .settings-danger p { margin: 5px 0 0; color: #ae7e86; font-size: 10px; }
 
+/* Failed-meeting attention panel: shows the persisted failure reason with the
+   actions that fix it, instead of a bare "Needs attention" label. */
+.attention-panel { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 30px; padding: 14px 16px; border: 1px solid #6c3e46; border-radius: var(--radius); background: #321d25; }
+.attention-copy { display: grid; gap: 4px; min-width: 0; }
+.attention-copy strong { color: #efb0b0; font-size: 12px; }
+.attention-copy span { color: #ae7e86; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.attention-actions { display: flex; flex: none; flex-wrap: wrap; justify-content: flex-end; gap: 9px; }
+.status-reason { max-width: 260px; overflow: hidden; color: #efb0b0; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+
 @media (max-width: 920px) {
   .setup-shell { grid-template-columns: 190px minmax(0, 1fr); }
   .setup-topbar, .setup-footer { padding-left: 38px; padding-right: 38px; }
@@ -436,6 +445,8 @@ select option { background: #0e151d; color: var(--text); }
   .setup-topbar { height: 54px; padding: 0 18px; }
   .setup-page { width: calc(100% - 36px); margin-top: 36px; }
   .setup-heading h1 { font-size: 29px; }
+  .setup-heading-row { gap: 0; }
+  .setup-mascot { display: none; }
   .setup-row { grid-template-columns: 28px minmax(0, 1fr) auto; gap: 9px; min-height: 67px; }
   .setup-row-state { display: none; }
   .engine-grid, .provider-layout, .install-detail { grid-template-columns: 1fr; }
@@ -443,6 +454,9 @@ select option { background: #0e151d; color: var(--text); }
   .provider-layout { gap: 18px; }
   .setup-footer { width: calc(100% - 36px); display: grid; gap: 13px; margin-top: 42px; padding: 14px 0 17px; }
   .setup-footer > div { justify-content: flex-end; }
+  .attention-panel { flex-direction: column; align-items: flex-start; }
+  .attention-actions { justify-content: flex-start; }
+  .status-reason { display: none; }
   .library-main { padding: 28px 18px; }
   .library-header { display: block; }
   .library-header-actions { margin-top: 18px; justify-content: space-between; }
@@ -481,8 +495,8 @@ select option { background: #0e151d; color: var(--text); }
 .chat-model-select { display: inline-flex; align-items: center; }
 .chat-model-select select { min-width: 180px; max-width: 240px; min-height: 32px; font-size: 11px; padding: 0 28px 0 10px; background: var(--surface-3); border: 1px solid var(--line); border-radius: 6px; }
 .chat-reasoning-select { display: inline-flex; align-items: center; position: relative; }
-.chat-reasoning-select::after { content: '▾'; position: absolute; right: 10px; color: var(--quiet); font-size: 10px; pointer-events: none; }
-.chat-reasoning-select select { min-height: 32px; font-size: 11px; padding: 0 26px 0 10px; background: var(--surface-3); border: 1px solid var(--line); border-radius: 6px; color: var(--muted); appearance: none; }
+.chat-reasoning-select .select-trigger { min-height: 32px; min-width: 0; padding: 0 10px; font-size: 11px; color: var(--muted); background: var(--surface-3); border-color: var(--line); }
+.chat-reasoning-select .select-trigger:hover { background: var(--surface-3); }
 .chat-command-menu { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 30; display: grid; min-width: 320px; padding: 6px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-2); box-shadow: 0 10px 26px #00000055; }
 
 .chat-command-menu button { display: flex; align-items: baseline; gap: 10px; min-height: 32px; padding: 6px 9px; border: 0; border-radius: 6px; background: transparent; color: var(--text); text-align: left; font-size: 12px; }
@@ -560,6 +574,7 @@ select option { background: #0e151d; color: var(--text); }
 .model-select-option-caps { display: inline-flex; gap: 4px; }
 .model-select-foot { padding: 6px 9px 5px; color: var(--quiet); font-size: 9.5px; border-top: 1px solid var(--line-soft); margin-top: 3px; }
 .provider-settings .model-select-trigger { width: 100%; }
+.provider-form .model-select-trigger { width: 100%; }
 .export-menu { position: relative; }
 .export-menu-list { position: absolute; z-index: 60; top: calc(100% + 6px); right: 0; width: 250px; background: #0b1218; border: 1px solid #344252; border-radius: 8px; box-shadow: 0 14px 34px #00000090; padding: 4px; display: flex; flex-direction: column; }
 .export-menu-item { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 8px 10px; border: 0; border-radius: 5px; background: transparent; color: var(--text); cursor: pointer; }

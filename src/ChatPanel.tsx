@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { SLASH_COMMANDS, SLASH_HELP } from './chatActions';
 import ModelSelect from './ModelSelect';
+import Select from './Select';
 import type { OpenRouterModelInfo } from './types';
 import { REASONING_EFFORTS, normalizeReasoningEffort } from './types';
 import Icon from './Icon';
@@ -118,10 +119,12 @@ export default function ChatPanel({ messages, busy, hasCustomFormat, meetingMode
         />
       </div>
       <div className="chat-reasoning-select" title="Thinking effort for this meeting — leave on Default to use Settings">
-        <select value={meetingReasoning.trim() === '' ? '' : normalizeReasoningEffort(meetingReasoning)} onChange={(event) => onReasoningChange(event.target.value)} aria-label="Reasoning effort for this meeting">
-          <option value="">Reasoning: Default</option>
-          {REASONING_EFFORTS.map((option) => <option key={option.id} value={option.id} title={option.hint}>Reasoning: {option.label}</option>)}
-        </select>
+        <Select
+          value={meetingReasoning.trim() === '' ? '' : normalizeReasoningEffort(meetingReasoning)}
+          options={[{ value: '', label: 'Reasoning: Default' }, ...REASONING_EFFORTS.map((option) => ({ value: option.id, label: `Reasoning: ${option.label}` }))]}
+          onChange={onReasoningChange}
+          ariaLabel="Reasoning effort for this meeting"
+        />
       </div>
       <button type="button" className="secondary small" onClick={() => fileRef.current?.click()} title="Attach images for the model as reference">
         <Icon name="image" size={14} />Attach

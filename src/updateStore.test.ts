@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import { reduceUpdateState, initialUpdateState, type UpdateState, type UpdateInfo } from "./updateStore";
 
 describe("updateStore", () => {
-  it("starts hidden with no version", () => {
-    expect(initialUpdateState).toEqual({ status: "idle", info: null });
+  it("starts hidden with no version and no error", () => {
+    expect(initialUpdateState).toEqual({ status: "idle", info: null, message: null });
   });
 
   it("shows the banner when an update is available", () => {
@@ -16,6 +16,18 @@ describe("updateStore", () => {
   it("stays hidden on update://none and update://error", () => {
     expect(reduceUpdateState(initialUpdateState, { type: "none" }).status).toBe("idle");
     expect(reduceUpdateState(initialUpdateState, { type: "error", message: "offline" }).status).toBe("idle");
+  });
+
+  it("keeps the error text so the settings status line can show it", () => {
+    // A failed manual check must not vanish silently — the user pressed the
+    // button and deserves to know what happened.
+    const errored = reduceUpdateState(initialUpdateState, { type: "error", message: "offline" });
+    expect(errored.message).toBe("offline");
+    // A later "none" clears the stale error.
+    expect(reduceUpdateState(errored, { type: "none" }).message).toBeNull();
+    // A fresh available update also clears it.
+    const info: UpdateInfo = { version: "1.1.0", notes: "Fixes", current_version: "1.0.0" };
+    expect(reduceUpdateState(errored, { type: "available", info }).message).toBeNull();
   });
 
   it("marks installing only from the available state", () => {
