@@ -1,0 +1,11 @@
+{
+  "version": "0.2.0",
+  "notes": "Bea 0.2 - updates verified in the field: cross-meeting AI memory now reaches chat answers (ask about an earlier meeting and Bea cites it with timestamps), minutes/chat run on any provider including OpenRouter with catalog badges, Markdown/PDF/DOCX exports download reliably, update and repair actions now always tell you what happened, styled in-app sign-in pages, and friendlier quota errors. Transcription, recording, and import flows smoke-tested end to end.",
+  "pub_date": "2026-09-10T01:42:41.107Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSbGY0dUJocWgrcFJXVktlaXc5bUl5Um03Z2FxbTNqMVNIeEhrNDkwRWJ3OE5wcHgyRDJPaVNQTE5oM2RjT1F1Q21oZXAvdEEvRVVSZGVZMi91akluVHh5K1puQkxRaUFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5MDA0NTQwCWZpbGU6QmVhXzAuMi4wX3g2NC1zZXR1cC5leGUKZVRCYVg0amtUM2JsWUFIZTBJWGU4TG15U0RuTEVBd2hlbm80TGlhK2swSVJZUTdyYUxxbFRubzJDRUhTaDd3M1NXS3ZhV3p1TWoyaGxKVnlvYURvQ2c9PQo=",
+      "url": "https://github.com/NitroQ/bea/releases/download/v0.2.0/Bea_0.2.0_x64-setup.exe"
+    }
+  }
+}
