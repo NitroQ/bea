@@ -53,6 +53,10 @@ type Props = {
 /// custom popup.
 export default function ModelSelect({ value, onChange, models = [], ids = [], extraIds = [], includeDefaultOption = false, ariaLabel = 'AI model' }: Props) {
   const [open, setOpen] = useState(false);
+  // Flip the list above the trigger when there is no room below (e.g. the
+  // chat picker sits at the bottom of the window inside an overflow-hidden
+  // panel, so a downward list gets clipped).
+  const [dropUp, setDropUp] = useState(false);
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -94,6 +98,11 @@ export default function ModelSelect({ value, onChange, models = [], ids = [], ex
   }, [activeIndex, open]);
 
   const openList = () => {
+    const rect = rootRef.current?.getBoundingClientRect();
+    const spaceBelow = rect ? window.innerHeight - rect.bottom : Infinity;
+    const spaceAbove = rect ? rect.top : Infinity;
+    // Rough full-list height: search row + options cap (300px) + footer.
+    setDropUp(spaceBelow < 340 && spaceAbove > spaceBelow);
     setQuery('');
     setActive(Math.max(0, options.findIndex((option) => option.id === value)));
     setOpen(true);
@@ -115,7 +124,7 @@ export default function ModelSelect({ value, onChange, models = [], ids = [], ex
   };
 
   return (
-    <div className={`model-select ${open ? 'open' : ''}`} ref={rootRef}>
+    <div className={`model-select ${open ? 'open' : ''} ${dropUp && open ? 'drop-up' : ''}`} ref={rootRef}>
       <button type="button" className="model-select-trigger" aria-haspopup="listbox" aria-expanded={open} aria-label={ariaLabel} onClick={() => (open ? setOpen(false) : openList())} onKeyDown={onKeyDown}>
         <span className="model-select-value">
           <span className="model-select-id">{modelSelectTriggerLabel(value, includeDefaultOption)}</span>

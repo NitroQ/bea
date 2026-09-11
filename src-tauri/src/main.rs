@@ -5,18 +5,17 @@
 
 use bea_core::{
     call_provider, create_job, create_meeting_with_engine, delete_meeting, estimate_tokens,
-    export_minutes, extract_ledger_events, generate_minutes, get_app_setting, import_media,
-    inspect_asr_model_package, inspect_runtime, install_qwen_model_package,
+    export_minutes, extract_ledger_events, generate_minutes, get_app_setting,
+    import_media, inspect_asr_model_package, inspect_runtime, install_qwen_model_package,
     install_sherpa_model_package, list_audio_input_devices, list_completed_recording_chunks,
-    list_meetings, list_transcript, load_asr_engine, load_minutes, load_provider, open_database,
-    persist_completed_audio_chunk, record_usage, register_model, save_ledger_events, save_minutes,
-    save_provider, search_transcript, set_app_setting, transcribe_chunks_with_progress,
-    transcribe_imported_media_with_progress, update_meeting_title, waveform_peaks, AudioChunkInput,
-    CompletedAudioChunk, ContextMode, ExportFormat, FfmpegPipeline, LlmRequest, MediaKind,
-    OcrEngine,
-    MediaSource, Meeting, Minutes, ModelInstallProgress, ModelManifest, ProviderConfig,
-    RecorderConfig, RuntimeAvailability, SegmentedWavRecorder, TranscriptLanguage,
-    TranscriptSegment, UsageRecord,
+    list_done_chunks, list_meetings, list_transcript, load_asr_engine, load_minutes, load_provider,
+    open_database, partition_chunks, persist_completed_audio_chunk, prepare_imported_media_chunks,
+    record_usage, register_model, save_ledger_events,
+    save_minutes, save_provider, search_transcript, set_app_setting, transcribe_chunks_with_progress,
+    update_meeting_title, waveform_peaks, AsrDevice, AudioChunkInput, CompletedAudioChunk,
+    ContextMode, ExportFormat, FfmpegPipeline, LlmRequest, MediaKind, OcrEngine, MediaSource,
+    Meeting, Minutes, ModelInstallProgress, ModelManifest, ProviderConfig, RecorderConfig,
+    RuntimeAvailability, SegmentedWavRecorder, TranscriptLanguage, TranscriptSegment, UsageRecord,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use keyring::Entry;
@@ -86,6 +85,69 @@ fn language_from_code(code: &str) -> TranscriptLanguage {
 
 fn command_error(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+/// Builds the engine sessions for one transcription run:
+/// - one decoder by default (strict utilization baseline);
+/// - two *independent* sessions when "Faster transcription" is enabled and the
+///   machine carries it (4+ cores, 8+ GB RAM) — GPU mode keeps one session;
+/// - the DirectML provider when the GPU toggle is on. Session-creation
+///   failures fall back to CPU inside the constructors.
+fn load_transcription_engines(
+    database: &rusqlite::Connection,
+    model_root: &std::path::Path,
+    engine_id: &str,
+) -> Result<Vec<bea_core::ConfiguredAsrEngine>, String> {
+    let gpu_enabled = get_app_setting(database, "asr_gpu_enabled")
+        .map(|value| value.as_deref() == Some("1"))
+        .unwrap_or(false);
+    let parallel_enabled = get_app_setting(database, "asr_parallel_decode")
+        .map(|value| value.as_deref() == Some("1"))
+        .unwrap_or(false);
+    let device = if gpu_enabled {
+        AsrDevice::DirectML
+    } else {
+        AsrDevice::Cpu
+    };
+    let wanted = if parallel_enabled && device == AsrDevice::Cpu && bea_core::turbo_supported() {
+        2
+    } else {
+        1
+    };
+    let mut engines = Vec::new();
+    for _ in 0..wanted {
+        match load_asr_engine(model_root, engine_id, device) {
+            Ok(engine) => engines.push(engine),
+            Err(error) => {
+                if engines.is_empty() {
+                    return Err(command_error(error));
+                }
+                eprintln!("second ASR engine unavailable; decoding single-threaded: {error}");
+                break;
+            }
+        }
+    }
+    Ok(engines)
+}
+
+/// Resume runs keep every chunk already decoded (resume markers) and decode
+/// only the rest; fresh runs clear the transcript (and markers), starting from
+/// zero. Returns the chunks to decode and how many were already done so
+/// progress reports can show the full timeline.
+fn partition_for_resume(
+    database: &rusqlite::Connection,
+    meeting_id: &str,
+    inputs: &[AudioChunkInput],
+    resume: bool,
+) -> Result<(Vec<AudioChunkInput>, usize), String> {
+    if resume {
+        let done = list_done_chunks(database, meeting_id).map_err(command_error)?;
+        let (pending, done_count) = partition_chunks(inputs, &done);
+        Ok((pending.into_iter().cloned().collect(), done_count))
+    } else {
+        bea_core::clear_transcript(database, meeting_id).map_err(command_error)?;
+        Ok((inputs.to_vec(), 0))
+    }
 }
 
 /// Records a failed transcription run durably: the meeting flips to `failed`
@@ -2647,11 +2709,11 @@ fn set_segment_speakers_command(
     speaker_indexes: Vec<u32>,
 ) -> Result<(), String> {
     let database = open_database(&state.database_path).map_err(command_error)?;
-    // An empty selection means "no speaker at all": clear the primary label
-    // too, not just the overlap rows.
-    if speaker_indexes.is_empty() {
-        bea_core::update_segment_speaker(&database, &segment_id, None).map_err(command_error)?;
-    }
+    // The primary speaker lives on the segment itself: an empty selection
+    // clears it, a non-empty one writes the first checked name. Without this
+    // write a manual assignment reverts to the diarization label after reload.
+    let primary = speaker_indexes.first().copied();
+    bea_core::update_segment_speaker(&database, &segment_id, primary).map_err(command_error)?;
     bea_core::set_segment_speakers(&database, &segment_id, &speaker_indexes).map_err(command_error)
 }
 
@@ -2764,6 +2826,7 @@ async fn process_imported_media_command(
     path: String,
     kind: String,
     language: String,
+    resume: Option<bool>,
 ) -> Result<Vec<TranscriptSegment>, String> {
     let media_kind = match kind.as_str() {
         "audio" => MediaKind::Audio,
@@ -2810,73 +2873,112 @@ async fn process_imported_media_command(
     let worker =
         tauri::async_runtime::spawn_blocking(move || -> Result<Vec<TranscriptSegment>, String> {
             let database = open_database(&database_path).map_err(command_error)?;
-            let engine = load_asr_engine(&model_root, &engine_id).map_err(command_error)?;
-            // Diarize the whole normalized meeting once (if the speaker models are
-            // present) so every chunk can be attributed to a speaker. Read through
-            // the resampling helper because normalized audio may not be 16 kHz.
-            // Failures here degrade gracefully to unlabeled speakers.
-            let audio_path = std::path::Path::new(&output_dir).join("audio.wav");
-            let turns = bea_core::read_wav_samples_resampled(&audio_path, 16_000)
-                .map(|(samples, _)| samples)
-                .and_then(|samples| {
-                    bea_core::SpeakerDiarizer::from_models_dir(&model_root)
-                        .and_then(|diarizer| diarizer.process_wave(&samples))
-                })
-                .unwrap_or_default();
-            // Re-transcription replaces the previous transcript instead of
-            // appending duplicate segments beside it.
-            bea_core::clear_transcript(&database, &worker_meeting_id).map_err(command_error)?;
-            transcribe_imported_media_with_progress(
-                &database,
-                &worker_meeting_id,
+            // Normalize once and reuse: `derived/<id>/audio.wav` from a
+            // previous run (fresh or interrupted) is fed straight into the
+            // chunk grid, so a resume of a long import skips re-extraction.
+            let inputs = prepare_imported_media_chunks(
                 std::path::Path::new(&path),
                 &media_kind,
                 &output_dir,
-                &language_from_code(&language),
                 &pipeline,
-                engine,
-                |segment, completed, total| {
-                    // Attribute the segment to the speaker active at its midpoint.
+            )
+            .map_err(command_error)?;
+            // Diarize the whole normalized meeting once (if the speaker models
+            // are present) so every chunk can be attributed to a speaker. The
+            // read is capped at the same 60 minutes as recordings — a
+            // multi-hour import must not spike RAM. Failures degrade
+            // gracefully to unlabeled speakers.
+            const DIARIZATION_MAX_SECONDS: u64 = 60 * 60;
+            let audio_path = std::path::Path::new(&output_dir).join("audio.wav");
+            let turns = bea_core::read_wav_samples_resampled_capped(
+                &audio_path,
+                16_000,
+                DIARIZATION_MAX_SECONDS,
+            )
+            .map(|(samples, _)| samples)
+            .and_then(|samples| {
+                bea_core::run_at_below_normal(|| {
+                    bea_core::SpeakerDiarizer::from_models_dir(&model_root)
+                        .and_then(|diarizer| diarizer.process_wave(&samples))
+                })
+            })
+            .unwrap_or_default();
+            // RAM order: diarize BEFORE loading the ASR engine so the small
+            // pyannote models are dropped before Whisper's session is built —
+            // the two model stacks never coexist at peak.
+            let engines = load_transcription_engines(&database, &model_root, &engine_id)?;
+            // Resume runs keep every decoded chunk (resume markers) and decode
+            // only the rest; fresh runs clear the transcript and start from zero.
+            let (pending, done_count) =
+                partition_for_resume(&database, &worker_meeting_id, &inputs, resume.unwrap_or(false))?;
+            let total_chunks = inputs.len();
+            let language_hint = language_from_code(&language);
+            let mut progress = |segment: &TranscriptSegment, completed: usize, _: usize| {
+                // Attribute the segment to the speaker active at its midpoint.
+                let midpoint = (segment.start_seconds + segment.end_seconds) as f32 / 2.0;
+                let mut labeled = segment.clone();
+                labeled.speaker = turns
+                    .iter()
+                    .find(|turn| midpoint >= turn.start && midpoint < turn.end)
+                    .map(|turn| turn.speaker);
+                let _ = app.emit(
+                    "transcription-progress",
+                    serde_json::json!({
+                        "meeting_id": worker_meeting_id,
+                        "completed": done_count + completed,
+                        "total": total_chunks,
+                        "segment": labeled,
+                    }),
+                );
+            };
+            let decoded = if engines.len() > 1 {
+                bea_core::transcribe_chunks_multi_engine_with_progress(
+                    &database,
+                    &worker_meeting_id,
+                    &pending,
+                    &language_hint,
+                    engines,
+                    &mut progress,
+                )
+                .map_err(command_error)?
+            } else {
+                let engine = engines
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "no ASR engine available".to_string())?;
+                transcribe_chunks_with_progress(
+                    &database,
+                    &worker_meeting_id,
+                    &pending,
+                    &language_hint,
+                    engine,
+                    &mut progress,
+                )
+                .map_err(command_error)?
+            };
+            // Persist speaker labels on the stored segments (the transcribe
+            // loop already wrote them without labels).
+            Ok(decoded
+                .into_iter()
+                .map(|mut segment| {
                     let midpoint = (segment.start_seconds + segment.end_seconds) as f32 / 2.0;
-                    let mut labeled = segment.clone();
-                    labeled.speaker = turns
+                    segment.speaker = turns
                         .iter()
                         .find(|turn| midpoint >= turn.start && midpoint < turn.end)
                         .map(|turn| turn.speaker);
-                    let _ = app.emit(
-                        "transcription-progress",
-                        serde_json::json!({
-                            "meeting_id": meeting_id,
-                            "completed": completed,
-                            "total": total,
-                            "segment": labeled,
-                        }),
+                    let _ = bea_core::update_segment_speaker(
+                        &database,
+                        &segment.id,
+                        segment.speaker,
                     );
-                },
-            )
-            .map(|segments| {
-                // Persist speaker labels on the stored segments (the transcribe
-                // loop already wrote them without labels).
-                segments
-                    .into_iter()
-                    .map(|mut segment| {
-                        let midpoint = (segment.start_seconds + segment.end_seconds) as f32 / 2.0;
-                        segment.speaker = turns
-                            .iter()
-                            .find(|turn| midpoint >= turn.start && midpoint < turn.end)
-                            .map(|turn| turn.speaker);
-                        let _ = bea_core::update_segment_speaker(
-                            &database,
-                            &segment.id,
-                            segment.speaker,
-                        );
-                        segment
-                    })
-                    .collect()
-            })
-            .map_err(command_error)
+                    segment
+                })
+                .collect())
         })
         .await;
+    // The ONNX sessions were dropped inside the worker; hand the freed pages
+    // back to the OS right away instead of leaving them in the working set.
+    bea_core::trim_process_memory();
     let segments = match worker {
         Ok(Ok(segments)) => segments,
         Ok(Err(error)) => {
@@ -4063,6 +4165,7 @@ async fn transcribe_recording_command(
     app: tauri::AppHandle,
     meeting_id: String,
     language: String,
+    resume: Option<bool>,
 ) -> Result<Vec<TranscriptSegment>, String> {
     let database_path = state.database_path.clone();
     let model_root = database_path
@@ -4105,7 +4208,6 @@ async fn transcribe_recording_command(
     let worker =
         tauri::async_runtime::spawn_blocking(move || -> Result<Vec<TranscriptSegment>, String> {
             let database = open_database(&database_path).map_err(command_error)?;
-            let engine = load_asr_engine(&model_root, &engine_id).map_err(command_error)?;
             // Diarize the full recorded meeting once: concatenate every chunk's
             // samples (resampled to 16 kHz — microphone devices commonly run at
             // 44.1/48 kHz and diarization models expect 16 kHz), then attribute
@@ -4114,6 +4216,9 @@ async fn transcribe_recording_command(
             // Diarization memory guard: cap the concatenated audio at the
             // first 60 minutes (16 kHz mono f32 ≈ 230 GB-equivalent would
             // otherwise be unbounded for hour-long meetings).
+            // RAM order: diarize BEFORE loading the ASR engine so the small
+            // pyannote models are dropped before Whisper's session is built —
+            // the two model stacks never coexist at peak.
             const DIARIZATION_MAX_SECONDS: f32 = 60.0 * 60.0;
             const DIARIZATION_MAX_SAMPLES: usize =
                 (DIARIZATION_MAX_SECONDS * 16_000.0) as usize;
@@ -4121,7 +4226,7 @@ async fn transcribe_recording_command(
             let mut truncated = false;
             'collect: for input in &inputs {
                 if let Some((samples, _)) =
-                    bea_core::read_wav_samples_resampled(&input.path, 16_000)
+                    bea_core::read_wav_samples_resampled_capped(&input.path, 16_000, u64::MAX)
                 {
                     let remaining = DIARIZATION_MAX_SAMPLES - meeting_samples.len();
                     if samples.len() > remaining {
@@ -4140,9 +4245,13 @@ async fn transcribe_recording_command(
             let turns = if meeting_samples.is_empty() {
                 Vec::new()
             } else {
-                bea_core::SpeakerDiarizer::from_models_dir(&model_root)
-                    .and_then(|diarizer| diarizer.process_wave(&meeting_samples))
-                    .unwrap_or_default()
+                // Strict utilization: diarization is a full-meeting CPU pass;
+                // run it below normal priority like every other decode.
+                bea_core::run_at_below_normal(|| {
+                    bea_core::SpeakerDiarizer::from_models_dir(&model_root)
+                        .and_then(|diarizer| diarizer.process_wave(&meeting_samples))
+                })
+                .unwrap_or_default()
             };
             let speaker_at = |segment: &TranscriptSegment| -> Option<u32> {
                 let midpoint = (segment.start_seconds + segment.end_seconds) as f32 / 2.0;
@@ -4151,48 +4260,72 @@ async fn transcribe_recording_command(
                     .find(|turn| midpoint >= turn.start && midpoint < turn.end)
                     .map(|turn| turn.speaker)
             };
-            // Re-transcription replaces the previous transcript instead of
-            // appending duplicate segments beside it.
-            bea_core::clear_transcript(&database, &worker_meeting_id).map_err(command_error)?;
-            transcribe_chunks_with_progress(
-                &database,
-                &worker_meeting_id,
-                &inputs,
-                &language_from_code(&language),
-                engine,
-                |segment, completed, total| {
-                    let mut labeled = segment.clone();
-                    labeled.speaker = speaker_at(segment);
-                    let _ = app.emit(
-                        "transcription-progress",
-                        serde_json::json!({
-                            "meeting_id": worker_meeting_id,
-                            "completed": completed,
-                            "total": total,
-                            "segment": labeled,
-                        }),
-                    );
-                },
-            )
-            .map(|segments| {
-                // Persist speaker labels on the stored segments (the transcribe
-                // loop already wrote them without labels).
-                segments
+            // The diarizer (and its models) was dropped above — only now is the
+            // heavyweight ASR session built, so the peaks never stack.
+            let engines = load_transcription_engines(&database, &model_root, &engine_id)?;
+            // Resume runs keep every decoded chunk (resume markers) and decode
+            // only the rest; fresh runs clear the transcript and start from zero.
+            let (pending, done_count) =
+                partition_for_resume(&database, &worker_meeting_id, &inputs, resume.unwrap_or(false))?;
+            let total_chunks = inputs.len();
+            let language_hint = language_from_code(&language);
+            let mut progress = |segment: &TranscriptSegment, completed: usize, _: usize| {
+                let mut labeled = segment.clone();
+                labeled.speaker = speaker_at(segment);
+                let _ = app.emit(
+                    "transcription-progress",
+                    serde_json::json!({
+                        "meeting_id": worker_meeting_id,
+                        "completed": done_count + completed,
+                        "total": total_chunks,
+                        "segment": labeled,
+                    }),
+                );
+            };
+            let decoded = if engines.len() > 1 {
+                bea_core::transcribe_chunks_multi_engine_with_progress(
+                    &database,
+                    &worker_meeting_id,
+                    &pending,
+                    &language_hint,
+                    engines,
+                    &mut progress,
+                )
+                .map_err(command_error)?
+            } else {
+                let engine = engines
                     .into_iter()
-                    .map(|mut segment| {
-                        segment.speaker = speaker_at(&segment);
-                        let _ = bea_core::update_segment_speaker(
-                            &database,
-                            &segment.id,
-                            segment.speaker,
-                        );
-                        segment
-                    })
-                    .collect()
-            })
-            .map_err(command_error)
+                    .next()
+                    .ok_or_else(|| "no ASR engine available".to_string())?;
+                transcribe_chunks_with_progress(
+                    &database,
+                    &worker_meeting_id,
+                    &pending,
+                    &language_hint,
+                    engine,
+                    &mut progress,
+                )
+                .map_err(command_error)?
+            };
+            // Persist speaker labels on the stored segments (the transcribe
+            // loop already wrote them without labels).
+            Ok(decoded
+                .into_iter()
+                .map(|mut segment| {
+                    segment.speaker = speaker_at(&segment);
+                    let _ = bea_core::update_segment_speaker(
+                        &database,
+                        &segment.id,
+                        segment.speaker,
+                    );
+                    segment
+                })
+                .collect())
         })
         .await;
+    // The ONNX sessions were dropped inside the worker; hand the freed pages
+    // back to the OS right away instead of leaving them in the working set.
+    bea_core::trim_process_memory();
     let segments = match worker {
         Ok(Ok(segments)) => segments,
         Ok(Err(error)) => {
@@ -4228,6 +4361,79 @@ async fn transcribe_recording_command(
 }
 
 #[tauri::command]
+fn get_transcription_settings_command(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let parallel_decode = get_app_setting(&database, "asr_parallel_decode")
+        .map(|value| value.as_deref() == Some("1"))
+        .unwrap_or(false);
+    let gpu_enabled = get_app_setting(&database, "asr_gpu_enabled")
+        .map(|value| value.as_deref() == Some("1"))
+        .unwrap_or(false);
+    // Honest device reporting: sherpa's API cannot reveal the provider a
+    // session actually landed on (its CPU-only runtime silently downgrades
+    // DirectML requests), so "directml" is only reported when the last run
+    // REQUESTED the GPU and the process actually ships the DirectML runtime.
+    let directml_runtime = bea_core::directml_runtime_available();
+    let active_device = if bea_core::active_asr_device() == AsrDevice::DirectML && directml_runtime {
+        "directml"
+    } else {
+        "cpu"
+    };
+    Ok(serde_json::json!({
+        "parallel_decode": parallel_decode,
+        "gpu_enabled": gpu_enabled,
+        "directml_runtime_available": directml_runtime,
+        "active_device": active_device,
+        "turbo_supported": bea_core::turbo_supported(),
+        "cores": std::thread::available_parallelism()
+            .map(|cores| cores.get())
+            .unwrap_or(0),
+    }))
+}
+
+#[tauri::command]
+fn set_transcription_parallel_command(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    set_app_setting(&database, "asr_parallel_decode", if enabled { "1" } else { "0" })
+        .map_err(command_error)
+}
+
+#[tauri::command]
+fn set_transcription_gpu_command(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    set_app_setting(&database, "asr_gpu_enabled", if enabled { "1" } else { "0" })
+        .map_err(command_error)
+}
+
+/// Completed-chunk count for a meeting: drives the Resume button's visibility
+/// on the "Needs attention" panel.
+#[tauri::command]
+fn get_transcription_progress_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<serde_json::Value, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    let done = bea_core::count_done_chunks(&database, &meeting_id).map_err(command_error)?;
+    Ok(serde_json::json!({ "done": done }))
+}
+
+/// Working-set memory of bea.exe and its helper processes — powers the
+/// Settings memory row so RAM changes are verifiable in-app.
+#[tauri::command]
+fn get_memory_usage_command() -> Result<serde_json::Value, String> {
+    let snapshot = bea_core::process_memory_snapshot();
+    Ok(serde_json::json!({
+        "bea_mb": snapshot.bea_mb,
+        "helper_processes": snapshot.helper_processes,
+    }))
+}
+
+#[tauri::command]
 async fn check_for_updates_command(
     app: tauri::AppHandle,
 ) -> Result<Option<bea_core::updater::UpdateInfo>, String> {
@@ -4250,6 +4456,17 @@ fn main() {
                 speaker_models_lock: tauri::async_runtime::Mutex::new(()),
                 cancelled_minutes: Mutex::new(std::collections::HashSet::new()),
             });
+            // Recover meetings a previous session left mid-transcription: their
+            // finished chunks keep their resume markers, so the meetings show
+            // up as "Needs attention" with a Resume button instead of staying
+            // stuck in "processing" forever.
+            match bea_core::recover_interrupted_transcriptions(&data_dir.join("bea.db")) {
+                Ok(count) if count > 0 => {
+                    eprintln!("recovered {count} interrupted transcription(s) — resume available");
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("startup transcription recovery failed: {error}"),
+            }
             bea_core::updater::spawn_scheduled_checks(app.handle().clone());
             Ok(())
         })
@@ -4331,6 +4548,11 @@ fn main() {
             resume_recording_command,
             stop_recording_command,
             transcribe_recording_command,
+            get_transcription_settings_command,
+            set_transcription_parallel_command,
+            set_transcription_gpu_command,
+            get_transcription_progress_command,
+            get_memory_usage_command,
             check_for_updates_command,
             install_update_command
         ])

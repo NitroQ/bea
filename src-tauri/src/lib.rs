@@ -32,6 +32,244 @@ pub fn hide_console_window(command: &mut std::process::Command) -> &mut std::pro
     command
 }
 
+/// Strict utilization guard for transcription helpers: background children
+/// (ffmpeg/ffprobe) run with no console window AND in the below-normal
+/// priority class, so slicing/extraction only consumes idle CPU and the
+/// user's foreground apps always keep priority. Both flags are set in ONE
+/// `creation_flags` call — the setter replaces rather than ORs, so two
+/// separate calls would silently drop the first flags.
+pub fn background_process(command: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
+    }
+    command
+}
+
+/// Returns freed pages to the OS right away. Called after transcription runs
+/// drop their ONNX sessions: without this, the freed model pages stay in the
+/// process working set until Windows reclaims them on its own schedule, which
+/// is exactly the "RAM stays high after a run" effect.
+pub fn trim_process_memory() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows_sys::Win32::System::{
+            Memory::SetProcessWorkingSetSizeEx, Threading::GetCurrentProcess,
+        };
+        // Minimum = maximum = -1 (usize::MAX) asks the OS to empty the
+        // working set; pages are still committed, just paged out until used.
+        SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, 0);
+    }
+}
+
+/// Working-set memory of Bea itself plus its helper processes (ffmpeg,
+/// ffprobe, tesseract, the WebView runtime), in MB. Powers the Settings memory
+/// row so resource changes are verifiable in-app.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessMemorySnapshot {
+    pub bea_mb: u64,
+    /// `(name, mb)` sums per helper process name.
+    pub helper_processes: Vec<(String, u64)>,
+}
+
+#[cfg(target_os = "windows")]
+pub fn process_memory_snapshot() -> ProcessMemorySnapshot {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    fn working_set_of(process: HANDLE) -> Option<u64> {
+        let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let ok = unsafe { GetProcessMemoryInfo(process, &mut counters, counters.cb) };
+        (ok != 0).then(|| counters.WorkingSetSize as u64)
+    }
+
+    let bea_mb = working_set_of(unsafe { GetCurrentProcess() }).unwrap_or(0) / (1024 * 1024);
+    let watched = ["ffmpeg.exe", "ffprobe.exe", "tesseract.exe", "msedgewebview2.exe"];
+    let mut helper_processes: Vec<(String, u64)> = Vec::new();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if !snapshot.is_null() {
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if Process32FirstW(snapshot, &mut entry) != 0 {
+                loop {
+                    let name = String::from_utf16_lossy(&entry.szExeFile).to_lowercase();
+                    if watched.iter().any(|watched_name| name == *watched_name) {
+                        let process =
+                            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID);
+                        if !process.is_null() {
+                            if let Some(working_set) = working_set_of(process) {
+                                match helper_processes
+                                    .iter_mut()
+                                    .find(|(existing, _)| *existing == name)
+                                {
+                                    Some((_, total)) => *total += working_set,
+                                    None => helper_processes.push((name, working_set)),
+                                }
+                            }
+                            CloseHandle(process);
+                        }
+                    }
+                    if Process32NextW(snapshot, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snapshot);
+        }
+    }
+    let helper_processes = helper_processes
+        .into_iter()
+        .map(|(name, working_set)| (name, working_set / (1024 * 1024)))
+        .collect();
+    ProcessMemorySnapshot {
+        bea_mb,
+        helper_processes,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn process_memory_snapshot() -> ProcessMemorySnapshot {
+    ProcessMemorySnapshot {
+        bea_mb: 0,
+        helper_processes: Vec::new(),
+    }
+}
+
+/// Runs transcription-adjacent helper work (ASR decodes, diarization) on a
+/// below-normal-priority thread. Strict utilization contract: heavy local
+/// inference must never outrank the user's foreground applications, whatever
+/// speed modes are enabled.
+pub fn run_at_below_normal<T>(work: impl FnOnce() -> T) -> T {
+    use thread_priority::{ThreadPriority, ThreadPriorityValue};
+    let previous = thread_priority::get_current_thread_priority().ok();
+    // Crossplatform value 30 maps to WinAPI BELOW_NORMAL (21..=39) and to a
+    // below-normal scheduling level on Unix, so one constant covers both.
+    if let Ok(value) = ThreadPriorityValue::try_from(30u8) {
+        let _ = thread_priority::set_current_thread_priority(ThreadPriority::Crossplatform(value));
+    }
+    let result = work();
+    if let Some(priority) = previous {
+        let _ = thread_priority::set_current_thread_priority(priority);
+    }
+    result
+}
+
+/// sherpa-onnx execution device for an ASR session. DirectML targets any
+/// DirectX 12 GPU (NVIDIA/AMD/Intel) through a small runtime; sessions that
+/// fail to create fall back to [`AsrDevice::Cpu`] at the construction site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsrDevice {
+    Cpu,
+    DirectML,
+}
+
+impl AsrDevice {
+    pub fn provider_string(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::DirectML => "directml",
+        }
+    }
+
+    /// Serializes into the Settings UI's device label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::DirectML => "directml",
+        }
+    }
+}
+
+use std::sync::atomic::{AtomicU8, Ordering};
+
+static LAST_ASR_DEVICE: AtomicU8 = AtomicU8::new(0);
+
+/// Records the device REQUESTED for the most recently constructed ASR session.
+/// The sherpa-onnx API cannot reveal the execution provider the session
+/// actually landed on (its CPU-only runtime silently downgrades DirectML
+/// requests to CPU), so callers pair this with a runtime capability check
+/// (`directml_runtime_available`) when reporting what really ran.
+pub fn note_asr_device(device: AsrDevice) {
+    LAST_ASR_DEVICE.store(device as u8, Ordering::Relaxed);
+}
+
+/// Device requested by the most recent ASR session construction.
+pub fn active_asr_device() -> AsrDevice {
+    match LAST_ASR_DEVICE.load(Ordering::Relaxed) {
+        1 => AsrDevice::DirectML,
+        _ => AsrDevice::Cpu,
+    }
+}
+
+/// Whether the process actually ships a DirectML-capable ONNX runtime: the
+/// CPU-only static build has no provider DLLs, a DirectML link ships
+/// `DirectML.dll`. Without this check the GPU toggle could report success
+/// while sherpa quietly decoded on the CPU.
+pub fn directml_runtime_available() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.parent().map(|dir| {
+                dir.join("DirectML.dll").is_file()
+                    || dir.join("onnxruntime_providers_directml.dll").is_file()
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Conservative intra-op thread budget for one sherpa-onnx session: half of
+/// the logical cores, capped at 4, floored at 1. Strict utilization rule —
+/// transcription may never claim all cores for background work.
+pub fn asr_thread_count() -> usize {
+    asr_thread_count_for(available_cores())
+}
+
+pub fn asr_thread_count_for(cores: usize) -> usize {
+    (cores / 2).clamp(1, 4)
+}
+
+fn available_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(2)
+}
+
+/// CPU-side threads for a GPU session: the GPU does the math, CPU threads
+/// only feed samples and collect results.
+pub fn gpu_assist_thread_count() -> usize {
+    (available_cores() / 4).clamp(1, 2)
+}
+
+/// Turbo (two parallel decoders) needs 4+ logical cores and 8+ GB RAM so the
+/// second model instance can never squeeze a low-RAM machine. Pure so tests
+/// can exercise the matrix without hardware.
+pub fn turbo_supported_with(cores: usize, total_ram_bytes: u64) -> bool {
+    cores >= 4 && total_ram_bytes >= 8 * 1024 * 1024 * 1024
+}
+
+pub fn turbo_supported() -> bool {
+    turbo_supported_with(available_cores(), total_physical_ram())
+}
+
+fn total_physical_ram() -> u64 {
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    system.total_memory()
+}
+
 /// Spawns `program` with args and captures its output without flashing a
 /// console window on Windows.
 fn run_hidden(
@@ -40,7 +278,7 @@ fn run_hidden(
 ) -> std::io::Result<std::process::Output> {
     let mut command = std::process::Command::new(program.as_ref());
     command.args(args);
-    hide_console_window(&mut command);
+    background_process(&mut command);
     command.output()
 }
 
@@ -647,6 +885,16 @@ pub struct Qwen3AsrEngine {
 
 impl Qwen3AsrEngine {
     pub fn from_model_dir(model_dir: impl AsRef<Path>) -> Result<Self, BeaError> {
+        Self::from_model_dir_with_device(model_dir, AsrDevice::Cpu)
+    }
+
+    /// Builds the recognizer for the requested device. A DirectML session that
+    /// cannot be created (no DX12 GPU, old driver, CPU-only runtime build)
+    /// falls back to CPU automatically so a GPU toggle can never break Bea.
+    pub fn from_model_dir_with_device(
+        model_dir: impl AsRef<Path>,
+        device: AsrDevice,
+    ) -> Result<Self, BeaError> {
         let model_dir = model_dir.as_ref();
         let required = [
             model_dir.join("conv_frontend.onnx"),
@@ -667,28 +915,43 @@ impl Qwen3AsrEngine {
                 encoder: Some(required[1].to_string_lossy().into_owned()),
                 decoder: Some(required[2].to_string_lossy().into_owned()),
                 tokenizer: Some(required[3].to_string_lossy().into_owned()),
-                // The KV budget must cover the prompt scaffold (~50 tokens)
-                // plus one audio token per ~0.5s of audio. sherpa's 512 default
-                // truncates a 60-second chunk down to a fraction of a second —
-                // the transcript then collapses to scaffold text like
-                // "language". 2048 fits ~15 minutes; 512 output tokens cover a
-                // minute of dense speech.
-                max_total_len: 2048,
+                // The KV budget must cover the prompt scaffold (~50 tokens), one audio
+                // token per ~0.5s of audio, and the generated text (max 512).
+                // sherpa's 512 default truncates a 60-second chunk down to a
+                // fraction of a second — the transcript then collapses to
+                // scaffold text like "language". Chunks are fixed at 28 s
+                // (≈ 56 audio tokens), so 50 + 56 + 512 ≈ 620: 1024 covers the
+                // worst case with headroom while halving the KV cache RAM.
+                // Revisit if chunk_seconds ever changes.
+                max_total_len: 1024,
                 max_new_tokens: 512,
                 temperature: 1e-6,
                 top_p: 0.8,
                 seed: 42,
                 hotwords: None,
             },
-            num_threads: 2,
-            provider: Some("cpu".into()),
+            num_threads: match device {
+                AsrDevice::Cpu => asr_thread_count() as i32,
+                AsrDevice::DirectML => gpu_assist_thread_count() as i32,
+            },
+            provider: Some(device.provider_string().into()),
             ..OfflineModelConfig::default()
         },
         ..OfflineRecognizerConfig::default()
         };
-        let recognizer = OfflineRecognizer::create(&config).ok_or_else(|| {
-            BeaError::MediaProcessing("sherpa-onnx could not initialize Qwen3-ASR".into())
-        })?;
+        let recognizer = match OfflineRecognizer::create(&config) {
+            Some(recognizer) => recognizer,
+            None if device == AsrDevice::DirectML => {
+                eprintln!("DirectML session unavailable for Qwen3-ASR; falling back to CPU");
+                return Self::from_model_dir_with_device(model_dir, AsrDevice::Cpu);
+            }
+            None => {
+                return Err(BeaError::MediaProcessing(
+                    "sherpa-onnx could not initialize Qwen3-ASR".into(),
+                ))
+            }
+        };
+        note_asr_device(device);
         Ok(Self {
             recognizer: std::sync::Arc::new(std::sync::Mutex::new(recognizer)),
         })
@@ -939,6 +1202,15 @@ pub struct WhisperCompatibilityEngine {
 
 impl WhisperCompatibilityEngine {
     pub fn from_model_dir(model_dir: impl AsRef<Path>) -> Result<Self, BeaError> {
+        Self::from_model_dir_with_device(model_dir, AsrDevice::Cpu)
+    }
+
+    /// Builds the recognizer for the requested device; DirectML failures fall
+    /// back to CPU (see [`Qwen3AsrEngine::from_model_dir_with_device`]).
+    pub fn from_model_dir_with_device(
+        model_dir: impl AsRef<Path>,
+        device: AsrDevice,
+    ) -> Result<Self, BeaError> {
         let model_dir = model_dir.as_ref();
         // Upstream sherpa-onnx whisper archives prefix files with the model name
         // (e.g. `turbo-encoder.onnx`) and often ship int8 variants
@@ -967,15 +1239,28 @@ impl WhisperCompatibilityEngine {
                 enable_segment_timestamps: true,
             },
             tokens: Some(tokens.to_string_lossy().into_owned()),
-            num_threads: 2,
-            provider: Some("cpu".into()),
+            num_threads: match device {
+                AsrDevice::Cpu => asr_thread_count() as i32,
+                AsrDevice::DirectML => gpu_assist_thread_count() as i32,
+            },
+            provider: Some(device.provider_string().into()),
             ..OfflineModelConfig::default()
         },
         ..OfflineRecognizerConfig::default()
         };
-        let recognizer = OfflineRecognizer::create(&config).ok_or_else(|| {
-            BeaError::MediaProcessing("sherpa-onnx could not initialize Whisper".into())
-        })?;
+        let recognizer = match OfflineRecognizer::create(&config) {
+            Some(recognizer) => recognizer,
+            None if device == AsrDevice::DirectML => {
+                eprintln!("DirectML session unavailable for Whisper; falling back to CPU");
+                return Self::from_model_dir_with_device(model_dir, AsrDevice::Cpu);
+            }
+            None => {
+                return Err(BeaError::MediaProcessing(
+                    "sherpa-onnx could not initialize Whisper".into(),
+                ))
+            }
+        };
+        note_asr_device(device);
         Ok(Self {
             recognizer: std::sync::Arc::new(std::sync::Mutex::new(recognizer)),
         })
@@ -1033,6 +1318,15 @@ pub struct NemotronMultilingualEngine {
 
 impl NemotronMultilingualEngine {
     pub fn from_model_dir(model_dir: impl AsRef<Path>) -> Result<Self, BeaError> {
+        Self::from_model_dir_with_device(model_dir, AsrDevice::Cpu)
+    }
+
+    /// Builds the recognizer for the requested device; DirectML failures fall
+    /// back to CPU (see [`Qwen3AsrEngine::from_model_dir_with_device`]).
+    pub fn from_model_dir_with_device(
+        model_dir: impl AsRef<Path>,
+        device: AsrDevice,
+    ) -> Result<Self, BeaError> {
         let model_dir = model_dir.as_ref();
         if !nemotron_model_is_complete(model_dir) {
             return Err(BeaError::InvalidState(format!(
@@ -1053,8 +1347,11 @@ impl NemotronMultilingualEngine {
             ..OnlineRecognizerConfig::default()
         };
         config.model_config.tokens = Some(tokens);
-        config.model_config.num_threads = 2;
-        config.model_config.provider = Some("cpu".into());
+        config.model_config.num_threads = match device {
+            AsrDevice::Cpu => asr_thread_count() as i32,
+            AsrDevice::DirectML => gpu_assist_thread_count() as i32,
+        };
+        config.model_config.provider = Some(device.provider_string().into());
         if let Some(ctc) = required_model_file(model_dir, "model.onnx") {
             // Older hand-packaged layouts use a CTC model.onnx.
             config.model_config.nemo_ctc = OnlineNemoCtcModelConfig {
@@ -1074,9 +1371,19 @@ impl NemotronMultilingualEngine {
                 joiner: Some(joiner.to_string_lossy().into_owned()),
             };
         }
-        let recognizer = OnlineRecognizer::create(&config).ok_or_else(|| {
-            BeaError::MediaProcessing("sherpa-onnx could not initialize Nemotron".into())
-        })?;
+        let recognizer = match OnlineRecognizer::create(&config) {
+            Some(recognizer) => recognizer,
+            None if device == AsrDevice::DirectML => {
+                eprintln!("DirectML session unavailable for Nemotron; falling back to CPU");
+                return Self::from_model_dir_with_device(model_dir, AsrDevice::Cpu);
+            }
+            None => {
+                return Err(BeaError::MediaProcessing(
+                    "sherpa-onnx could not initialize Nemotron".into(),
+                ))
+            }
+        };
+        note_asr_device(device);
         Ok(Self {
             recognizer: std::sync::Arc::new(std::sync::Mutex::new(recognizer)),
         })
@@ -1269,22 +1576,25 @@ fn required_model_file(root: &Path, file_name: &str) -> Option<PathBuf> {
 pub fn load_asr_engine(
     model_root: impl AsRef<Path>,
     engine_id: &str,
+    device: AsrDevice,
 ) -> Result<ConfiguredAsrEngine, BeaError> {
     let model_root = model_root.as_ref();
     match engine_id {
         "whisper-compatibility" => {
             let model_dir = model_root.join("whisper-compatibility");
-            WhisperCompatibilityEngine::from_model_dir(model_dir).map(ConfiguredAsrEngine::Whisper)
+            WhisperCompatibilityEngine::from_model_dir_with_device(model_dir, device)
+                .map(ConfiguredAsrEngine::Whisper)
         }
         "nemotron-multilingual" => {
             let model_dir = model_root.join("nemotron-multilingual");
-            NemotronMultilingualEngine::from_model_dir(model_dir).map(ConfiguredAsrEngine::Nemotron)
+            NemotronMultilingualEngine::from_model_dir_with_device(model_dir, device)
+                .map(ConfiguredAsrEngine::Nemotron)
         }
         _ => find_qwen_model_dir(model_root)
             .ok_or_else(|| {
                 BeaError::InvalidState("Qwen3-ASR model is not installed or is incomplete".into())
             })
-            .and_then(Qwen3AsrEngine::from_model_dir)
+            .and_then(|model_dir| Qwen3AsrEngine::from_model_dir_with_device(model_dir, device))
             .map(ConfiguredAsrEngine::Qwen),
     }
 }
@@ -1324,7 +1634,9 @@ fn transcribe_chunk_with_timeout<E: AsrEngine + Send + 'static>(
     let (engine_tx, engine_rx) = std::sync::mpsc::channel();
     let path_display = chunk.path.display().to_string();
     let worker = std::thread::spawn(move || {
-        let result = engine.transcribe(&owned, &language);
+        // Strict utilization: decodes run below normal priority so the user's
+        // foreground applications always win, whatever speed mode is enabled.
+        let result = run_at_below_normal(|| engine.transcribe(&owned, &language));
         // Hand the engine back first; the caller declares a hang when this
         // never arrives inside the watchdog budget.
         if engine_tx.send(engine).is_err() {
@@ -1367,6 +1679,91 @@ fn transcribe_chunk_with_timeout<E: AsrEngine + Send + 'static>(
     }
 }
 
+/// Per-chunk decode result, shared by the sequential and parallel loops so
+/// both paths apply identical silence gating, watchdog handling, and the
+/// degenerate-output retry.
+enum ChunkOutcome {
+    /// Measured silence or nothing intelligible — persist the timed
+    /// `[silence]` placeholder for this stretch.
+    Placeholder,
+    Speech {
+        text: String,
+        language_detected: Option<String>,
+        confidence: Option<f32>,
+    },
+}
+
+/// Runs the full per-chunk decode pipeline (silence gate → watchdog decode →
+/// degenerate retry) and classifies the result. Consumes the engine handle it
+/// is given (callers pass a cheap clone).
+fn decode_chunk_outcome<E: AsrEngine + Clone + Send + 'static>(
+    engine: E,
+    chunk: &AudioChunkInput,
+    language: &TranscriptLanguage,
+) -> Result<ChunkOutcome, BeaError> {
+    if chunk_is_silent(&chunk.path) {
+        // No speech energy in this stretch — log it so silent minutes stay
+        // visible and timed in the transcript instead of vanishing.
+        return Ok(ChunkOutcome::Placeholder);
+    }
+    // Watchdog: a hung ONNX decode now fails loudly instead of stalling.
+    let (_, mut result) = transcribe_chunk_with_timeout(engine.clone(), chunk, language)?;
+    // Degenerate output (scaffold leaks, repetition loops, single-token
+    // echoes) gets one fallback pass without the language hint before the
+    // text is accepted — measurably better Taglish on codeswitched speech.
+    if is_degenerate_asr_text(&result.text, language).is_some() {
+        if let Some(fallback) = retry_language(language) {
+            let (_, retried) = transcribe_chunk_with_timeout(engine, chunk, &fallback)?;
+            if is_degenerate_asr_text(&retried.text, &fallback).is_none() {
+                result = retried;
+            }
+        }
+    }
+    if result.text.trim().is_empty() || SILENCE_TEXT == result.text.trim() {
+        // The engine heard nothing intelligible — keep the stretch timed
+        // with the same placeholder used for measured silence.
+        return Ok(ChunkOutcome::Placeholder);
+    }
+    Ok(ChunkOutcome::Speech {
+        text: result.text,
+        language_detected: result.language_detected,
+        confidence: result.confidence,
+    })
+}
+
+/// Persists a decoded chunk: builds the segment row (speech or silence
+/// placeholder), stores it, and records the resume marker so an interrupted
+/// run never decodes this chunk again.
+fn persist_chunk_outcome(
+    conn: &Connection,
+    meeting_id: &str,
+    chunk: &AudioChunkInput,
+    outcome: ChunkOutcome,
+) -> Result<TranscriptSegment, BeaError> {
+    let segment = match outcome {
+        ChunkOutcome::Placeholder => {
+            silent_segment(meeting_id, chunk.start_seconds, chunk.end_seconds)
+        }
+        ChunkOutcome::Speech {
+            text,
+            language_detected,
+            confidence,
+        } => TranscriptSegment {
+            id: Uuid::new_v4().to_string(),
+            meeting_id: meeting_id.to_string(),
+            start_seconds: chunk.start_seconds,
+            end_seconds: chunk.end_seconds,
+            text,
+            language_detected,
+            language_confidence: confidence,
+            speaker: None,
+        },
+    };
+    add_segment(conn, &segment)?;
+    mark_chunk_done(conn, meeting_id, chunk.start_seconds, chunk.end_seconds)?;
+    Ok(segment)
+}
+
 /// Same as [`transcribe_chunks`], but reports after every chunk with the newly
 /// persisted segment so the UI can stream the transcript live. Silent chunks
 /// are logged as timed `[silence]` rows (so minutes of silence stay visible in
@@ -1385,50 +1782,110 @@ pub fn transcribe_chunks_with_progress<E: AsrEngine + Clone + Send + 'static>(
     // The watchdog worker owns a fresh clone of the cheap engine handle per
     // decode; the original stays with this loop.
     for (index, chunk) in chunks.iter().enumerate() {
-        if chunk_is_silent(&chunk.path) {
-            // No speech energy in this stretch — log it so silent minutes stay
-            // visible and timed in the transcript instead of vanishing.
-            let silent = silent_segment(meeting_id, chunk.start_seconds, chunk.end_seconds);
-            add_segment(conn, &silent)?;
-            segments.push(silent.clone());
-            on_progress(&silent, index + 1, total);
-            continue;
-        }
-        // Watchdog: a hung ONNX decode now fails loudly instead of stalling.
-        let (_, mut result) = transcribe_chunk_with_timeout(engine.clone(), chunk, language)?;
-        // Degenerate output (scaffold leaks, repetition loops, single-token
-        // echoes) gets one fallback pass without the language hint before the
-        // text is accepted — measurably better Taglish on codeswitched speech.
-        if is_degenerate_asr_text(&result.text, language).is_some() {
-            if let Some(fallback) = retry_language(language) {
-                let (_, retried) = transcribe_chunk_with_timeout(engine.clone(), chunk, &fallback)?;
-                if is_degenerate_asr_text(&retried.text, &fallback).is_none() {
-                    result = retried;
-                }
-            }
-        }
-        if result.text.trim().is_empty() || SILENCE_TEXT == result.text.trim() {
-            // The engine heard nothing intelligible — keep the stretch timed
-            // with the same placeholder used for measured silence.
-            let empty = silent_segment(meeting_id, chunk.start_seconds, chunk.end_seconds);
-            add_segment(conn, &empty)?;
-            segments.push(empty.clone());
-            on_progress(&empty, index + 1, total);
-            continue;
-        }
-        let segment = TranscriptSegment {
-            id: Uuid::new_v4().to_string(),
-            meeting_id: meeting_id.to_string(),
-            start_seconds: chunk.start_seconds,
-            end_seconds: chunk.end_seconds,
-            text: result.text,
-            language_detected: result.language_detected,
-            language_confidence: result.confidence,
-            speaker: None,
-        };
-        add_segment(conn, &segment)?;
+        let outcome = decode_chunk_outcome(engine.clone(), chunk, language)?;
+        let segment = persist_chunk_outcome(conn, meeting_id, chunk, outcome)?;
         segments.push(segment.clone());
         on_progress(&segment, index + 1, total);
+    }
+    Ok(segments)
+}
+
+/// Transcribes chunks across several *independent* engine sessions in parallel
+/// ("Faster transcription" turbo mode). One worker thread per engine drains a
+/// shared queue of chunk indexes; completed chunks flow back through a channel
+/// and the caller thread does all database work (rusqlite connections are not
+/// `Sync`). Out-of-order completion is fine — segments carry their own
+/// timestamps. Any chunk error fails the job loudly (same contract as the
+/// sequential path); resume markers let a later run skip finished chunks.
+pub fn transcribe_chunks_multi_engine_with_progress<
+    E: AsrEngine + Clone + Send + 'static,
+>(
+    conn: &Connection,
+    meeting_id: &str,
+    chunks: &[AudioChunkInput],
+    language: &TranscriptLanguage,
+    engines: Vec<E>,
+    mut on_progress: impl FnMut(&TranscriptSegment, usize, usize),
+) -> Result<Vec<TranscriptSegment>, BeaError> {
+    if engines.len() <= 1 {
+        return match engines.into_iter().next() {
+            Some(engine) => {
+                transcribe_chunks_with_progress(conn, meeting_id, chunks, language, engine, on_progress)
+            }
+            None => Ok(Vec::new()),
+        };
+    }
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let total = chunks.len();
+    // The queue is fully populated before workers start, so workers simply
+    // drain it — no condvar needed.
+    let queue = Arc::new(Mutex::new(VecDeque::from_iter(0..total)));
+    let stop = Arc::new(AtomicBool::new(false));
+    let owned_chunks = Arc::new(chunks.to_vec());
+    let (outcome_tx, outcome_rx) = std::sync::mpsc::channel::<(usize, Result<ChunkOutcome, BeaError>)>();
+
+    for engine in engines {
+        let queue = Arc::clone(&queue);
+        let stop = Arc::clone(&stop);
+        let owned_chunks = Arc::clone(&owned_chunks);
+        let tx = outcome_tx.clone();
+        let language = language.clone();
+        std::thread::spawn(move || loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let index = {
+                let mut indexes = match queue.lock() {
+                    Ok(indexes) => indexes,
+                    Err(_) => return,
+                };
+                match indexes.pop_front() {
+                    Some(index) => index,
+                    None => return,
+                }
+            };
+            let chunk = owned_chunks.get(index).expect("queue index out of range");
+            // catch_unwind guarantees one channel message per popped chunk even
+            // if the decode panics — the collector below never deadlocks.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                decode_chunk_outcome(engine.clone(), chunk, &language)
+            }))
+            .unwrap_or_else(|panic| {
+                Err(BeaError::MediaProcessing(format!(
+                    "ASR worker crashed on {}: {panic:?}",
+                    chunk.path.display()
+                )))
+            });
+            if outcome.is_err() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            if tx.send((index, outcome)).is_err() {
+                return;
+            }
+        });
+    }
+    drop(outcome_tx);
+
+    let mut segments = Vec::with_capacity(total);
+    let mut completed = 0usize;
+    for _ in 0..total {
+        let (index, outcome) = outcome_rx
+            .recv()
+            .map_err(|_| BeaError::MediaProcessing("ASR decode workers died unexpectedly".into()))?;
+        let chunk = &chunks[index];
+        let segment = match outcome {
+            Ok(outcome) => persist_chunk_outcome(conn, meeting_id, chunk, outcome)?,
+            Err(error) => {
+                stop.store(true, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        completed += 1;
+        segments.push(segment.clone());
+        on_progress(&segment, completed, total);
     }
     Ok(segments)
 }
@@ -1521,22 +1978,39 @@ pub struct SherpaDiarizationSegment {
 ///
 /// Multi-channel files are averaged to mono so every channel contributes.
 pub fn read_wav_samples_resampled(path: &Path, target_rate: u32) -> Option<(Vec<f32>, u32)> {
+    read_wav_samples_resampled_capped(path, target_rate, u64::MAX)
+}
+
+/// Like [`read_wav_samples_resampled`], but stops reading after `max_seconds`
+/// of audio. Low-RAM guard: a multi-hour import would otherwise load its full
+/// mono f32 timeline (~690 MB for 3 hours) before the diarization cap
+/// truncated it — the cap now bounds the *read*, not just the result.
+pub fn read_wav_samples_resampled_capped(
+    path: &Path,
+    target_rate: u32,
+    max_seconds: u64,
+) -> Option<(Vec<f32>, u32)> {
     let reader = hound::WavReader::open(path).ok()?;
     let spec = reader.spec();
     if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {
         return None;
     }
     let channels = usize::from(spec.channels.max(1));
+    let max_samples = max_seconds
+        .saturating_mul(u64::from(spec.sample_rate.max(1)))
+        .saturating_mul(channels as u64);
+    // Stream the file instead of materializing it: samples are folded into
+    // mono frames as they are read, so the peak holds one mono i16 buffer plus
+    // the f32 output — not a full interleaved i16 copy of the range on top.
     let mut frames: Vec<i16> = Vec::new();
-    for frame in reader
-        .into_samples::<i16>()
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?
-        .chunks(channels)
-    {
-        if frame.len() == channels {
-            let sum: i64 = frame.iter().map(|value| i64::from(*value)).sum();
+    let mut scratch: Vec<i16> = Vec::with_capacity(channels);
+    for sample in reader.into_samples::<i16>().take(max_samples as usize) {
+        let Ok(value) = sample else { return None };
+        scratch.push(value);
+        if scratch.len() == channels {
+            let sum: i64 = scratch.iter().map(|value| i64::from(*value)).sum();
             frames.push((sum / channels as i64).clamp(i16::MIN as i64, i16::MAX as i64) as i16);
+            scratch.clear();
         }
     }
     let resampled = resample_linear_i16(&frames, spec.sample_rate, target_rate);
@@ -1547,6 +2021,14 @@ pub fn read_wav_samples_resampled(path: &Path, target_rate: u32) -> Option<(Vec<
             .collect(),
         target_rate,
     ))
+}
+
+/// Duration in whole seconds straight from a WAV header — lets resume runs of
+/// imported media skip re-probing the already-normalized derived audio.
+pub fn wav_duration_seconds(path: &Path) -> Option<u64> {
+    let reader = hound::WavReader::open(path).ok()?;
+    let rate = u64::from(reader.spec().sample_rate.max(1));
+    Some(u64::from(reader.duration()) / rate)
 }
 
 /// Cheap silence gate: peak-amplitude scan of the *entire* chunk (a 60 s peak
@@ -2255,18 +2737,70 @@ pub fn transcribe_imported_media_with_progress<
     engine: E,
     on_progress: impl FnMut(&TranscriptSegment, usize, usize),
 ) -> Result<Vec<TranscriptSegment>, BeaError> {
-    let (metadata, audio_path) = match kind {
-        MediaKind::Audio => {
-            let metadata = pipeline.probe(input)?;
-            std::fs::create_dir_all(output_dir)
-                .map_err(|error| BeaError::MediaProcessing(error.to_string()))?;
-            let audio_path = output_dir.join("audio.wav");
-            pipeline.extract_audio(input, &audio_path)?;
+    let inputs = prepare_imported_media_chunks(input, kind, output_dir, pipeline)?;
+    transcribe_chunks_with_progress(conn, meeting_id, &inputs, language, engine, on_progress)
+}
+
+/// The cached normalized artifact is trusted only when it covers the source:
+/// an ffmpeg run that errored mid-extraction can still write a valid WAV
+/// trailer for a partial file, so its duration is cross-checked against the
+/// source. The 1 s tolerance absorbs the probe's ceil vs the WAV's floor.
+fn cached_audio_covers_source(cached_seconds: u64, source_seconds: u64) -> bool {
+    cached_seconds + 1 >= source_seconds.max(1)
+}
+
+/// A cached chunk WAV is trusted only when its header declares the full slice
+/// length: a slice interrupted by a crash can persist a shorter file (or a
+/// header hound cannot read), and decoding it as-is would silently drop part
+/// of that stretch. The 1 s tolerance absorbs floor rounding.
+fn chunk_needs_reslice(chunk_path: &Path, expected_seconds: u64) -> bool {
+    match wav_duration_seconds(chunk_path) {
+        Some(seconds) => seconds + 1 < expected_seconds,
+        None => true,
+    }
+}
+
+/// Normalizes imported media into `derived/<meeting>/audio.wav` and returns its
+/// fixed 28-second chunk grid. The normalized artifact is reused when present
+/// AND long enough to cover the source (an ffmpeg run killed or erroring
+/// mid-extraction can leave a valid-header but truncated WAV — reusing it would
+/// silently drop the media's tail from the transcript). Callers partition the
+/// grid against resume markers to skip decoded chunks.
+pub fn prepare_imported_media_chunks<P: MediaPipeline>(
+    input: &Path,
+    kind: &MediaKind,
+    output_dir: &Path,
+    pipeline: &P,
+) -> Result<Vec<AudioChunkInput>, BeaError> {
+    let cached = output_dir.join("audio.wav");
+    let cached_duration = cached.is_file().then(|| wav_duration_seconds(&cached)).flatten();
+    let cached_usable = match cached_duration {
+        Some(seconds) if seconds > 0 => pipeline
+            .probe(input)
+            .map(|metadata| cached_audio_covers_source(seconds, metadata.duration_seconds))
+            // The source can no longer be probed (moved/deleted): the cache is
+            // all we have — trust it rather than failing the run.
+            .unwrap_or(true),
+        _ => false,
+    };
+    let (total_seconds, audio_path) = match cached_duration {
+        Some(seconds) if cached_usable => (seconds, cached),
+        _ => {
+            let (metadata, audio_path) = match kind {
+                MediaKind::Audio => {
+                    let metadata = pipeline.probe(input)?;
+                    std::fs::create_dir_all(output_dir)
+                        .map_err(|error| BeaError::MediaProcessing(error.to_string()))?;
+                    let audio_path = output_dir.join("audio.wav");
+                    pipeline.extract_audio(input, &audio_path)?;
+                    (metadata.duration_seconds.max(1), audio_path)
+                }
+                MediaKind::Video => {
+                    let analysis = analyze_video(pipeline, input, output_dir, 5)?;
+                    (analysis.metadata.duration_seconds.max(1), analysis.audio_path)
+                }
+            };
             (metadata, audio_path)
-        }
-        MediaKind::Video => {
-            let analysis = analyze_video(pipeline, input, output_dir, 5)?;
-            (analysis.metadata, analysis.audio_path)
         }
     };
     // Split the normalized audio into bounded 28-second chunks. One chunk per
@@ -2274,7 +2808,6 @@ pub fn transcribe_imported_media_with_progress<
     // progress with segments streaming in as they finish. Whisper-family
     // engines only process the first 30 s of any input, so chunks must stay
     // under that ceiling (28 s + margin) or audio would be silently dropped.
-    let total_seconds = metadata.duration_seconds.max(1);
     let chunk_seconds = 28u64;
     let chunk_count = total_seconds.div_ceil(chunk_seconds);
     let chunks_dir = output_dir.join("audio-chunks");
@@ -2285,7 +2818,7 @@ pub fn transcribe_imported_media_with_progress<
         let start = index * chunk_seconds;
         let end = (start + chunk_seconds).min(total_seconds);
         let chunk_path = chunks_dir.join(format!("chunk-{index:04}.wav"));
-        if !chunk_path.is_file() {
+        if !chunk_path.is_file() || chunk_needs_reslice(&chunk_path, end - start) {
             run_ffmpeg(
                 pipeline.ffmpeg_path(),
                 &ffmpeg_slice_args(&audio_path, &chunk_path, start, end),
@@ -2297,7 +2830,7 @@ pub fn transcribe_imported_media_with_progress<
             end_seconds: end,
         });
     }
-    transcribe_chunks_with_progress(conn, meeting_id, &inputs, language, engine, on_progress)
+    Ok(inputs)
 }
 
 impl MediaPipeline for FfmpegPipeline {
@@ -2438,7 +2971,7 @@ pub fn ffmpeg_keyframe_args(
 pub fn run_ffmpeg(executable: &Path, args: &[String]) -> Result<(), BeaError> {
     let mut command = std::process::Command::new(executable);
     command.args(args);
-    hide_console_window(&mut command);
+    background_process(&mut command);
     let output = command
         .output()
         .map_err(|e| BeaError::MediaProcessing(e.to_string()))?;
@@ -2478,7 +3011,7 @@ pub struct ContextPack {
 
 pub fn open_database(path: impl AsRef<Path>) -> Result<Connection, BeaError> {
     let conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, duration_seconds INTEGER NOT NULL DEFAULT 0, language TEXT NOT NULL DEFAULT 'auto', asr_engine_id TEXT NOT NULL DEFAULT 'qwen-standard', last_error TEXT); CREATE TABLE IF NOT EXISTS transcript_segments (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, start_seconds INTEGER NOT NULL, end_seconds INTEGER NOT NULL, text TEXT NOT NULL, language_detected TEXT, language_confidence REAL, speaker INTEGER); CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(meeting_id UNINDEXED, segment_id UNINDEXED, text); CREATE TABLE IF NOT EXISTS recording_chunks (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, start_seconds INTEGER NOT NULL, end_seconds INTEGER NOT NULL, path TEXT NOT NULL, state TEXT NOT NULL, UNIQUE(meeting_id, ordinal)); CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, kind TEXT NOT NULL, state TEXT NOT NULL, progress REAL NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, error TEXT); CREATE TABLE IF NOT EXISTS media_sources (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, path TEXT NOT NULL, kind TEXT NOT NULL, duration_seconds INTEGER, copied INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS model_manifests (id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, runtime TEXT NOT NULL, languages TEXT NOT NULL, installed INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS provider_configs (id TEXT PRIMARY KEY, kind TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL, credential_ref TEXT, enabled INTEGER NOT NULL DEFAULT 1); CREATE TABLE IF NOT EXISTS usage_records (id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, estimated_cost REAL, operation TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS ledger_events (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS minutes (meeting_id TEXT PRIMARY KEY REFERENCES meetings(id) ON DELETE CASCADE, payload TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); ")?;
+    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, duration_seconds INTEGER NOT NULL DEFAULT 0, language TEXT NOT NULL DEFAULT 'auto', asr_engine_id TEXT NOT NULL DEFAULT 'qwen-standard', last_error TEXT); CREATE TABLE IF NOT EXISTS transcript_segments (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, start_seconds INTEGER NOT NULL, end_seconds INTEGER NOT NULL, text TEXT NOT NULL, language_detected TEXT, language_confidence REAL, speaker INTEGER); CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(meeting_id UNINDEXED, segment_id UNINDEXED, text); CREATE TABLE IF NOT EXISTS recording_chunks (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, start_seconds INTEGER NOT NULL, end_seconds INTEGER NOT NULL, path TEXT NOT NULL, state TEXT NOT NULL, UNIQUE(meeting_id, ordinal)); CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, kind TEXT NOT NULL, state TEXT NOT NULL, progress REAL NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, error TEXT); CREATE TABLE IF NOT EXISTS media_sources (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, path TEXT NOT NULL, kind TEXT NOT NULL, duration_seconds INTEGER, copied INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS model_manifests (id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, runtime TEXT NOT NULL, languages TEXT NOT NULL, installed INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS provider_configs (id TEXT PRIMARY KEY, kind TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL, credential_ref TEXT, enabled INTEGER NOT NULL DEFAULT 1); CREATE TABLE IF NOT EXISTS usage_records (id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, estimated_cost REAL, operation TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS ledger_events (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS minutes (meeting_id TEXT PRIMARY KEY REFERENCES meetings(id) ON DELETE CASCADE, payload TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS transcription_progress (meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, chunk_start INTEGER NOT NULL, chunk_end INTEGER NOT NULL, PRIMARY KEY(meeting_id, chunk_start)); ")?;
     conn.execute_batch("CREATE TABLE IF NOT EXISTS participants (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, name TEXT NOT NULL, role TEXT, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS context_events (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, kind TEXT NOT NULL, payload TEXT NOT NULL, confidence REAL NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS topics (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, label TEXT NOT NULL, summary TEXT, start_seconds INTEGER, end_seconds INTEGER); CREATE TABLE IF NOT EXISTS visual_evidence (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, timestamp_seconds INTEGER NOT NULL, path TEXT NOT NULL, thumbnail_path TEXT, ocr_text TEXT, perceptual_hash TEXT NOT NULL, description TEXT); CREATE TABLE IF NOT EXISTS action_items (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, event_id TEXT, owner TEXT, summary TEXT NOT NULL, due TEXT, status TEXT NOT NULL DEFAULT 'open', FOREIGN KEY(event_id) REFERENCES context_events(id) ON DELETE SET NULL); CREATE TABLE IF NOT EXISTS llm_runs (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, provider_id TEXT, model TEXT NOT NULL, operation TEXT NOT NULL, prompt_version TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, state TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_context_events_meeting ON context_events(meeting_id); CREATE INDEX IF NOT EXISTS idx_visual_evidence_meeting_time ON visual_evidence(meeting_id, timestamp_seconds); CREATE INDEX IF NOT EXISTS idx_action_items_meeting_status ON action_items(meeting_id, status); CREATE TABLE IF NOT EXISTS speaker_names (meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, speaker_index INTEGER NOT NULL, name TEXT NOT NULL, UNIQUE(meeting_id, speaker_index)); CREATE TABLE IF NOT EXISTS segment_speakers (segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE, meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE, speaker_index INTEGER NOT NULL, UNIQUE(segment_id, speaker_index));")?;
     // Backward-compatible column migrations: "duplicate column name" is the
     // normal already-migrated case, but any other failure (locked/corrupt DB)
@@ -2629,6 +3162,31 @@ pub fn clear_meeting_last_error(
         params![meeting_id],
     )?;
     Ok(())
+}
+
+pub const INTERRUPTED_TRANSCRIPTION_ERROR: &str = "Bea was closed while transcribing. Your finished work was saved — resume to continue from where it stopped.";
+
+/// Recovers meetings left in `processing` by a session that was killed mid-run
+/// (Bea closed accidentally, power loss, crash). Their finished chunks are
+/// persisted with resume markers, so they are re-labeled `failed` with a
+/// resume hint instead of sitting in `processing` forever. Returns how many
+/// meetings were recovered; runs once per app start.
+pub fn recover_interrupted_transcriptions(
+    database_path: impl AsRef<Path>,
+) -> Result<usize, BeaError> {
+    let conn = open_database(database_path)?;
+    let stuck = list_meetings(&conn)?
+        .into_iter()
+        .filter(|meeting| meeting.status == MeetingStatus::Processing)
+        .collect::<Vec<_>>();
+    for meeting in &stuck {
+        mark_meeting_failed(&conn, &meeting.id, INTERRUPTED_TRANSCRIPTION_ERROR)?;
+        conn.execute(
+            "UPDATE jobs SET state='failed',error=?2 WHERE id=(SELECT id FROM jobs WHERE meeting_id=?1 AND kind='transcription' ORDER BY rowid DESC LIMIT 1)",
+            params![meeting.id, INTERRUPTED_TRANSCRIPTION_ERROR],
+        )?;
+    }
+    Ok(stuck.len())
 }
 
 pub fn update_meeting_title(
@@ -2799,7 +3357,77 @@ pub fn clear_transcript(conn: &Connection, meeting_id: &str) -> Result<(), BeaEr
         "DELETE FROM transcript_fts WHERE meeting_id=?1",
         params![meeting_id],
     )?;
+    // A full re-transcription starts from zero: drop the resume markers too so
+    // the run re-decodes every chunk.
+    clear_transcription_progress(conn, meeting_id)
+}
+
+/// Records a chunk as fully transcribed. Written immediately after its segment
+/// is persisted, so an interrupted run resumes exactly where it stopped: a
+/// chunk with a marker is never decoded twice.
+pub fn mark_chunk_done(
+    conn: &Connection,
+    meeting_id: &str,
+    chunk_start: u64,
+    chunk_end: u64,
+) -> Result<(), BeaError> {
+    conn.execute(
+        "INSERT OR REPLACE INTO transcription_progress(meeting_id,chunk_start,chunk_end) VALUES (?1,?2,?3)",
+        params![meeting_id, chunk_start as i64, chunk_end as i64],
+    )?;
     Ok(())
+}
+
+/// Completed-chunk ranges for a meeting, ordered by start.
+pub fn list_done_chunks(conn: &Connection, meeting_id: &str) -> Result<Vec<(u64, u64)>, BeaError> {
+    let mut statement = conn.prepare(
+        "SELECT chunk_start,chunk_end FROM transcription_progress WHERE meeting_id=?1 ORDER BY chunk_start",
+    )?;
+    let rows = statement
+        .query_map(params![meeting_id], |row| {
+            Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Count of already-decoded chunks; drives the Resume button's visibility.
+pub fn count_done_chunks(conn: &Connection, meeting_id: &str) -> Result<usize, BeaError> {
+    Ok(conn
+        .query_row(
+            "SELECT COUNT(*) FROM transcription_progress WHERE meeting_id=?1",
+            params![meeting_id],
+            |row| row.get::<_, i64>(0),
+        )? as usize)
+}
+
+/// Removes all completion markers for a meeting (full re-transcription).
+pub fn clear_transcription_progress(conn: &Connection, meeting_id: &str) -> Result<(), BeaError> {
+    conn.execute(
+        "DELETE FROM transcription_progress WHERE meeting_id=?1",
+        params![meeting_id],
+    )?;
+    Ok(())
+}
+
+/// Partitions a chunk list against the completed-chunk markers. Both commands
+/// rebuild the same fixed 28-second grid every run, so exact `(start, end)`
+/// matches are stable across runs. Returns the chunks still to decode and how
+/// many were already done (for progress-report offsets).
+pub fn partition_chunks<'a>(
+    chunks: &'a [AudioChunkInput],
+    done: &[(u64, u64)],
+) -> (Vec<&'a AudioChunkInput>, usize) {
+    let is_done = |chunk: &AudioChunkInput| {
+        done.iter()
+            .any(|(start, end)| *start == chunk.start_seconds && *end == chunk.end_seconds)
+    };
+    let done_count = chunks.iter().filter(|chunk| is_done(chunk)).count();
+    let pending = chunks
+        .iter()
+        .filter(|chunk| !is_done(chunk))
+        .collect::<Vec<_>>();
+    (pending, done_count)
 }
 
 /// Removes specific transcript segments (meeting-scoped) together with their
@@ -5344,6 +5972,7 @@ pub fn verify_claim(claim: &str, evidence: &[Evidence]) -> VerifiedClaim {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
     /// A database created purely from 001_init.sql must expose the same
@@ -7336,5 +7965,264 @@ mod tests {
         // 9 batches × 500 = 4500 buffered; settle 4500 − 3200 = 1300.
         assert_eq!(released.len(), 1300);
         assert!(released.iter().all(|sample| *sample == 600));
+    }
+
+    #[test]
+    fn asr_thread_count_stays_at_half_cores_capped() {
+        // Strict utilization: half the logical cores, capped at 4, floored at 1.
+        assert_eq!(asr_thread_count_for(0), 1);
+        assert_eq!(asr_thread_count_for(1), 1);
+        assert_eq!(asr_thread_count_for(2), 1);
+        assert_eq!(asr_thread_count_for(3), 1);
+        assert_eq!(asr_thread_count_for(4), 2);
+        assert_eq!(asr_thread_count_for(8), 4);
+        assert_eq!(asr_thread_count_for(16), 4);
+    }
+
+    #[test]
+    fn turbo_requires_cores_and_ram() {
+        assert!(!turbo_supported_with(2, 32 * 1024 * 1024 * 1024));
+        assert!(!turbo_supported_with(4, 4 * 1024 * 1024 * 1024));
+        assert!(turbo_supported_with(4, 8 * 1024 * 1024 * 1024));
+        assert!(!turbo_supported_with(8, 7 * 1024 * 1024 * 1024 + 1));
+    }
+
+    #[test]
+    fn resume_markers_roundtrip_and_partition() {
+        let dir = tempdir().unwrap();
+        let conn = open_database(dir.path().join("db.sqlite")).unwrap();
+        conn.execute(
+            "INSERT INTO meetings(id,title,status,created_at) VALUES ('m1','Meeting','processing','now')",
+            [],
+        )
+        .unwrap();
+        mark_chunk_done(&conn, "m1", 0, 28).unwrap();
+        mark_chunk_done(&conn, "m1", 28, 56).unwrap();
+        assert_eq!(count_done_chunks(&conn, "m1").unwrap(), 2);
+        assert_eq!(list_done_chunks(&conn, "m1").unwrap(), vec![(0, 28), (28, 56)]);
+        // Other meetings are untouched.
+        assert_eq!(count_done_chunks(&conn, "other").unwrap(), 0);
+        let chunks = vec![
+            AudioChunkInput {
+                path: PathBuf::from("a.wav"),
+                start_seconds: 0,
+                end_seconds: 28,
+            },
+            AudioChunkInput {
+                path: PathBuf::from("b.wav"),
+                start_seconds: 28,
+                end_seconds: 56,
+            },
+            AudioChunkInput {
+                path: PathBuf::from("c.wav"),
+                start_seconds: 56,
+                end_seconds: 84,
+            },
+        ];
+        let (pending, done_count) = partition_chunks(&chunks, &[(0, 28), (28, 56)]);
+        assert_eq!(done_count, 2);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].start_seconds, 56);
+        assert_eq!(pending[0].end_seconds, 84);
+        // A full re-transcription starts from zero: clear_transcript drops the
+        // markers too.
+        clear_transcript(&conn, "m1").unwrap();
+        assert_eq!(count_done_chunks(&conn, "m1").unwrap(), 0);
+    }
+
+    #[test]
+    fn cached_audio_and_chunk_duration_guards() {
+        // The cached normalized artifact must cover the source (1 s tolerance
+        // absorbs the probe's ceil vs the WAV header's floor).
+        assert!(cached_audio_covers_source(3600, 3600));
+        assert!(cached_audio_covers_source(3600, 3601));
+        assert!(!cached_audio_covers_source(1800, 3600), "truncated cache must be rejected");
+        assert!(cached_audio_covers_source(1, 0));
+        // Chunk WAVs shorter than their slice are rebuilt; unreadable ones too.
+        let dir = tempdir().unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let short = dir.path().join("short.wav");
+        {
+            let mut writer = hound::WavWriter::create(&short, spec).unwrap();
+            for _ in 0..16_000 {
+                writer.write_sample(0i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        assert!(chunk_needs_reslice(&short, 28));
+        let corrupt = dir.path().join("corrupt.wav");
+        std::fs::write(&corrupt, b"not a wav").unwrap();
+        assert!(chunk_needs_reslice(&corrupt, 28));
+        let full = dir.path().join("full.wav");
+        {
+            let mut writer = hound::WavWriter::create(&full, spec).unwrap();
+            for _ in 0..16_000 * 28 {
+                writer.write_sample(0i16).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        assert!(!chunk_needs_reslice(&full, 28), "a full-length chunk is trusted");
+    }
+
+    /// Cheap in-memory engine for exercising the transcription loops without a
+    /// model. Fails the chunk whose start matches `fail_on`.
+    #[derive(Clone)]
+    struct StubEngine {
+        fail_on: Option<u64>,
+    }
+    impl AsrEngine for StubEngine {
+        fn kind(&self) -> AsrEngineKind {
+            AsrEngineKind::WhisperCompatibility
+        }
+        fn capabilities(&self) -> AsrCapabilities {
+            AsrCapabilities {
+                languages: vec![],
+                offline: true,
+                streaming: false,
+            }
+        }
+        fn transcribe(
+            &self,
+            chunk: &AudioChunkInput,
+            _language: &TranscriptLanguage,
+        ) -> Result<AsrResult, BeaError> {
+            if Some(chunk.start_seconds) == self.fail_on {
+                return Err(BeaError::MediaProcessing("stub decode failure".into()));
+            }
+            Ok(AsrResult {
+                text: format!("stub text {}", chunk.start_seconds),
+                language_detected: None,
+                confidence: None,
+            })
+        }
+    }
+
+    fn seed_meeting(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO meetings(id,title,status,created_at) VALUES (?1,'Meeting','processing','now')",
+            params![id],
+        )
+        .unwrap();
+    }
+
+    fn stub_chunks(dir: &std::path::Path, count: usize) -> Vec<AudioChunkInput> {
+        (0..count)
+            .map(|index| AudioChunkInput {
+                path: dir.join(format!("chunk-{index}.wav")),
+                start_seconds: (index * 28) as u64,
+                end_seconds: (index * 28 + 28) as u64,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parallel_multi_engine_transcribes_every_chunk_once() {
+        let dir = tempdir().unwrap();
+        let conn = open_database(dir.path().join("db.sqlite")).unwrap();
+        seed_meeting(&conn, "m1");
+        let chunks = stub_chunks(dir.path(), 12);
+        let progress: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let progress_ref = Arc::clone(&progress);
+        let segments = transcribe_chunks_multi_engine_with_progress(
+            &conn,
+            "m1",
+            &chunks,
+            &TranscriptLanguage::Auto,
+            vec![StubEngine { fail_on: None }, StubEngine { fail_on: None }],
+            |_segment, completed, total| {
+                progress.lock().unwrap().push((completed, total));
+            },
+        )
+        .unwrap();
+        assert_eq!(segments.len(), 12);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transcript_segments WHERE meeting_id='m1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 12, "each chunk persisted exactly once");
+        assert_eq!(count_done_chunks(&conn, "m1").unwrap(), 12);
+        let marks = progress_ref.lock().unwrap();
+        assert_eq!(marks.len(), 12);
+        assert!(marks.iter().all(|(_, total)| *total == 12));
+        // Completion counters are unique 1..=12 — no duplicated or skipped steps.
+        let mut seen = std::collections::HashSet::new();
+        for (completed, _) in marks.iter() {
+            assert!(seen.insert(*completed), "duplicate progress step {completed}");
+        }
+    }
+
+    #[test]
+    fn parallel_multi_engine_fails_loudly_on_chunk_error() {
+        let dir = tempdir().unwrap();
+        let conn = open_database(dir.path().join("db.sqlite")).unwrap();
+        seed_meeting(&conn, "m1");
+        let chunks = stub_chunks(dir.path(), 10);
+        let failing_chunk = 5 * 28;
+        let result = transcribe_chunks_multi_engine_with_progress(
+            &conn,
+            "m1",
+            &chunks,
+            &TranscriptLanguage::Auto,
+            vec![
+                StubEngine { fail_on: Some(failing_chunk) },
+                StubEngine { fail_on: Some(failing_chunk) },
+            ],
+            |_, _, _| {},
+        );
+        assert!(result.is_err(), "the stub failure must fail the job loudly");
+        // The failing chunk itself must never be persisted as a segment.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transcript_segments WHERE meeting_id='m1' AND start_seconds=?1",
+                params![failing_chunk],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn startup_recovery_relabels_processing_meetings() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let conn = open_database(&path).unwrap();
+        seed_meeting(&conn, "m1");
+        conn.execute(
+            "INSERT INTO meetings(id,title,status,created_at) VALUES ('m2','Ready','ready','now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs(id,meeting_id,kind,state,progress,attempts) VALUES ('j1','m1','transcription','running',0,1)",
+            [],
+        )
+        .unwrap();
+        let recovered = recover_interrupted_transcriptions(&path).unwrap();
+        assert_eq!(recovered, 1);
+        let status: String = conn
+            .query_row("SELECT status FROM meetings WHERE id='m1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(status, "failed");
+        let last_error: String = conn
+            .query_row("SELECT last_error FROM meetings WHERE id='m1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(last_error, INTERRUPTED_TRANSCRIPTION_ERROR);
+        let job_state: String = conn
+            .query_row("SELECT state FROM jobs WHERE id='j1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(job_state, "failed");
+        // A ready meeting is untouched by the recovery pass.
+        let ready_status: String = conn
+            .query_row("SELECT status FROM meetings WHERE id='m2'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ready_status, "ready");
     }
 }

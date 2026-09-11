@@ -57,3 +57,61 @@ git push origin master v1.1
 GitHub release assets are immutable. If a release is broken: delete the
 release and its tag, fix, and re-tag — `releases/latest/download/latest.json`
 then resolves to the previous good release again.
+
+## Transcription performance modes
+
+- **Thread budget** — one sherpa-onnx session uses half the logical cores
+  (`asr_thread_count`, capped at 4) and all transcription work (decodes,
+  diarization, ffmpeg children) runs at below-normal OS priority, so
+  transcription never starves the user's foreground apps.
+- **Faster transcription** (Settings toggle, default off) — builds two
+  *independent* sherpa-onnx sessions and decodes chunks in parallel. Gated to
+  4+ logical cores and 8+ GB RAM (`turbo_supported_with`); ignored while GPU
+  mode is active.
+- **GPU acceleration** (Settings toggle, default off) — asks sherpa-onnx for
+  the **DirectML** execution provider (any DirectX 12 GPU: NVIDIA/AMD/Intel).
+  The toggle is fail-safe: if no DirectML runtime is available the session
+  silently falls back to CPU and the Settings label shows the device the last
+  run actually used.
+
+### Enabling GPU (DirectML) in builds
+
+Official sherpa-onnx prebuilt libraries (k2-fsa releases, including the static
+CPU archive the `sherpa-onnx` Rust crate downloads) are **CPU-only** — there is
+no official DirectML/CUDA archive. To make the GPU toggle effective:
+
+1. Build sherpa-onnx from source with the DirectML execution provider, or
+   obtain a compatible DirectML shared build of the **same** sherpa-onnx
+   version pinned in `src-tauri/Cargo.toml` (mixing versions across the C API
+   is not safe):
+   `cmake -A x64 -DSHERPA_ONNX_ENABLE_DIRECTML=ON -DBUILD_SHARED_LIBS=ON ...`
+   The result ships `sherpa-onnx-c-api.dll`, `onnxruntime.dll` (~40 MB) and
+   `DirectML.dll` (~1 MB).
+2. Switch `src-tauri/Cargo.toml` to `sherpa-onnx = { version = "…", features = ["shared"] }`
+   and point `SHERPA_ONNX_LIB_DIR` at the extracted `lib/` directory before
+   building — the sys crate copies any DLLs next to the binary automatically
+   (`copy_windows_runtime_dlls`).
+3. Verify with `cargo run --release --example transcribe_probe_whisper -- <model_dir> <wav>`:
+   the Settings GPU label should then read `On · GPU` after a run (it reports
+   the device of the last built session).
+
+Until those libraries are bundled, the toggle exists but every run reports
+`Active: cpu` — by design, never a crash or a broken transcript.
+
+## Memory profile
+
+- **Whisper Turbo** ("Bea Standard · Whisper") is the heavyweight: its ONNX
+  session needs roughly the model size in RAM (~1.6 GB+, more if only fp16
+  files are installed). **Qwen ASR 0.6B INT8** uses roughly half. "Faster
+  transcription" (turbo) doubles the model RAM while enabled; **GPU mode**
+  shifts the model to GPU memory instead of system RAM.
+- RAM is ordered so the speaker-diarization models are loaded and dropped
+  **before** the ASR session is built — the two never coexist at peak — and the
+  process working set is trimmed right after each run (`trim_process_memory`)
+  so freed model pages return to the OS immediately.
+- The engine already prefers the smallest (int8) model file present in the
+  package (`prefixed_model_file` smallest-match). When upstream publishes an
+  int8-only Whisper Turbo package, adding its manifest halves the footprint
+  with no code change.
+- The Settings → Transcription "Memory" row shows bea.exe plus helper
+  processes (ffmpeg/ffprobe/tesseract/WebView runtime) live, for verification.

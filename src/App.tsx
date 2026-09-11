@@ -18,7 +18,7 @@ import './styles.css';
 
 const initialProvider: ProviderConfig = { id: 'primary', kind: 'OpenRouter', base_url: 'https://openrouter.ai/api/v1', model: '', credential_ref: null, enabled: false, reasoning_effort: 'off' };
 export const initialEngines: AsrEngineDescriptor[] = [
-  { id: 'whisper-compatibility', name: 'Bea Standard · Whisper', description: 'Broad language coverage and reliable Taglish transcription.', languages: '99 languages · EN · FIL · Taglish', size: 'Turbo · 1.6 GB', status: 'missing', recommended: true, detail: 'sherpa-onnx · local' },
+  { id: 'whisper-compatibility', name: 'Bea Standard · Whisper', description: 'Broad language coverage and reliable Taglish transcription. Largest RAM footprint — Qwen ASR uses roughly half.', languages: '99 languages · EN · FIL · Taglish', size: 'Turbo · 1.6 GB', status: 'missing', recommended: true, detail: 'sherpa-onnx · local' },
   { id: 'qwen-standard', name: 'Qwen ASR', description: 'Fast local transcription for English, Filipino, and Taglish.', languages: 'EN · FIL · Taglish', size: '0.6B · 1.2 GB', status: 'missing', detail: 'sherpa-onnx · INT8' },
   { id: 'nemotron-multilingual', name: 'Nemotron multilingual', description: 'Low-latency multilingual streaming with a 560ms profile.', languages: 'Multilingual', size: '0.6B · 1.1 GB', status: 'missing', detail: 'Nemotron 3.5 · 560ms' },
 ];
@@ -234,17 +234,19 @@ export default function App() {
     }
   }
   async function recording(meeting: Meeting, action: 'start' | 'pause' | 'resume' | 'stop', deviceIds?: string[]) { const command = { start: 'start_recording_command', pause: 'pause_recording_command', resume: 'resume_recording_command', stop: 'stop_recording_command' }[action]; try { const result = await invoke<{ end_seconds?: number }[]>(command, { meetingId: meeting.id, ...(action === 'start' ? { deviceIds: deviceIds ?? [] } : {}) }); const nextStatus: Meeting['status'] = action === 'start' ? 'recording' : action === 'pause' ? 'paused' : action === 'resume' ? 'recording' : 'processing'; setMeetings((current) => current.map((item) => item.id === meeting.id ? { ...item, status: nextStatus, duration_seconds: result?.at(-1)?.end_seconds ?? item.duration_seconds } : item)); if (action === 'stop') { await runTranscription(meeting, meeting.language, 'transcribe_recording_command', { meetingId: meeting.id, language: meeting.language }); } else setNotice(`Recording ${action}ed.`); } catch (error) { setNotice(`Unable to ${action} recording: ${String(error)}`); window.dispatchEvent(new CustomEvent('bea:notice', { detail: { message: `Unable to ${action} recording: ${String(error)}` } })); } }
-  async function retryTranscription(meeting: Meeting) {
+  async function retryTranscription(meeting: Meeting, resume = false) {
     // Imported files must re-run the media pipeline (ffmpeg normalize → ASR);
     // recorded meetings replay their stored chunks. Without this split,
     // retrying an imported meeting failed with "no completed recording chunks".
+    // `resume` keeps every already-decoded chunk and decodes only the rest;
+    // a full retry (default) starts from zero instead.
     const media = await invoke<Array<{ path: string; kind: string }>>('list_media_command', { meetingId: meeting.id }).catch(() => []);
     const source = media.find((item) => item.path);
     if (source) {
       const kind = (source.kind === 'video' ? 'video' : 'audio') as 'video' | 'audio';
-      await runTranscription(meeting, meeting.language, 'process_imported_media_command', { meetingId: meeting.id, path: source.path, kind, language: meeting.language });
+      await runTranscription(meeting, meeting.language, 'process_imported_media_command', { meetingId: meeting.id, path: source.path, kind, language: meeting.language, resume });
     } else {
-      await runTranscription(meeting, meeting.language, 'transcribe_recording_command', { meetingId: meeting.id, language: meeting.language });
+      await runTranscription(meeting, meeting.language, 'transcribe_recording_command', { meetingId: meeting.id, language: meeting.language, resume });
     }
   }
   async function renameMeeting(meeting: Meeting, title: string) { try { await invoke('rename_meeting_command', { meetingId: meeting.id, title }); } catch { /* local preview */ } setMeetings((current) => { const next = current.map((item) => item.id === meeting.id ? { ...item, title } : item); saveMeetings(next); return next; }); setNotice('Meeting renamed.'); }
@@ -280,7 +282,7 @@ export default function App() {
   }
 
   if (!setupComplete) return <SetupFlow status={{ ...setupStatus, tools: setupStatus.tools.map((tool) => repairing.includes(tool.id) ? { ...tool, status: 'repairing' } : tool) }} provider={provider} apiKey={apiKey} step={setupStep} onStep={setSetupStep} onSelectEngine={selectEngine} onInstallEngine={installEngine} onImportEngine={importEngine} onRepairTools={repairTools} onProviderChange={changeProvider} onApiKeyChange={setApiKey} onTestProvider={testProvider} onComplete={completeSetup} notice={notice} engineProgress={engineProgress} />;
-  if (route.screen === 'meeting' && selectedMeeting) return <MeetingWorkspace key={selectedMeeting.id} meeting={selectedMeeting} onBack={() => { window.location.hash = '#library'; }} onNotice={setNotice} onImport={importMedia} onImportVtt={importVtt} onRecording={recording} onMeetingStatus={(id, status) => setMeetings((items) => items.map((item) => item.id === id ? { ...item, status } : item))} onRetryTranscription={retryTranscription} onRepairTools={repairTools} repairing={repairing} busy={transcribing === selectedMeeting.id} transcribeProgress={transcribing === selectedMeeting.id ? transcriptionProgress : null} liveSegments={liveSegments[selectedMeeting.id] ?? []} />;
+  if (route.screen === 'meeting' && selectedMeeting) return <MeetingWorkspace key={selectedMeeting.id} meeting={selectedMeeting} onBack={() => { window.location.hash = '#library'; }} onNotice={setNotice} onImport={importMedia} onImportVtt={importVtt} onRecording={recording} onMeetingStatus={(id, status) => setMeetings((items) => items.map((item) => item.id === id ? { ...item, status } : item))} onRetryTranscription={retryTranscription} onResumeTranscription={() => void retryTranscription(selectedMeeting, true)} onRepairTools={repairTools} repairing={repairing} busy={transcribing === selectedMeeting.id} transcribeProgress={transcribing === selectedMeeting.id ? transcriptionProgress : null} liveSegments={liveSegments[selectedMeeting.id] ?? []} />;
   if (route.screen === 'settings') return <SettingsScreen notice={notice} onDismissNotice={() => setNotice(null)} status={setupStatus} provider={provider} apiKey={apiKey} onBack={() => { window.location.hash = '#library'; }} onRefresh={refreshRuntime} onRepair={repairTools} repairing={repairing} onProviderChange={changeProvider} onApiKeyChange={setApiKey} onTest={testProvider} onSelectEngine={selectEngine} onInstallEngine={installEngine} onReset={() => { localStorage.removeItem('bea.setup-complete'); setSetupComplete(false); setSetupStep(0); }} onDeleteAllData={() => void deleteAllData()} onClearAiMemory={() => void clearAiMemory()} />;
   return <Library notice={notice} onDismissNotice={() => setNotice(null)} meetings={meetings} selectedId={librarySelection ?? meetings[0]?.id ?? null} onSelect={setLibrarySelection} onOpen={(meeting) => { setLibrarySelection(meeting.id); window.location.hash = `#meeting/${meeting.id}`; }} onCreate={createMeeting} onImport={importMedia} onImportVtt={importVtt} onRename={renameMeeting} onDelete={deleteMeeting} onSettings={openSettings} runtimeReady={Boolean(runtime?.can_transcribe_locally || setupStatus.engines.some((engine) => engine.id === selectedEngine && engine.status === 'ready'))} selectedEngineName={selectedEngineName} />;
 }
@@ -321,6 +323,30 @@ function SettingsScreen({ notice, onDismissNotice, status, provider, apiKey, onB
     invoke<string[]>('discover_provider_models_command', { provider, apiKey }).then(setDiscoveredIds).catch(() => setDiscoveredIds([]));
   }, [provider.kind, provider.base_url, provider.id, apiKey]);
 
+  // Transcription performance toggles ("Faster transcription" turbo decoding
+  // and the GPU/DirectML device) with the device the last run actually used.
+  const [transcriptionSettings, setTranscriptionSettings] = useState<{ parallel_decode: boolean; gpu_enabled: boolean; active_device: string; turbo_supported: boolean; cores: number } | null>(null);
+  const [transcriptionSettingError, setTranscriptionSettingError] = useState<string | null>(null);
+  const refreshTranscriptionSettings = useCallback(() => {
+    invoke<{ parallel_decode: boolean; gpu_enabled: boolean; active_device: string; turbo_supported: boolean; cores: number }>('get_transcription_settings_command').then(setTranscriptionSettings).catch(() => setTranscriptionSettings(null));
+  }, []);
+  useEffect(refreshTranscriptionSettings, [refreshTranscriptionSettings]);
+  // In-app memory readout so RAM reductions (model overlap removal, post-run
+  // trim) are verifiable without Task Manager.
+  const [memoryUsage, setMemoryUsage] = useState<{ bea_mb: number; helper_processes: Array<[string, number]> } | null>(null);
+  const refreshMemoryUsage = useCallback(() => {
+    invoke<{ bea_mb: number; helper_processes: Array<[string, number]> }>('get_memory_usage_command').then(setMemoryUsage).catch(() => setMemoryUsage(null));
+  }, []);
+  useEffect(refreshMemoryUsage, [refreshMemoryUsage]);
+  function saveTranscriptionSetting(setting: 'parallel_decode' | 'gpu_enabled', enabled: boolean) {
+    const command = setting === 'parallel_decode' ? 'set_transcription_parallel_command' : 'set_transcription_gpu_command';
+    setTranscriptionSettingError(null);
+    setTranscriptionSettings((current) => (current ? { ...current, [setting]: enabled } : current));
+    invoke(command, { enabled })
+      .then(() => { refreshTranscriptionSettings(); refreshMemoryUsage(); })
+      .catch((error) => setTranscriptionSettingError(`Could not save the setting: ${String(error)}`));
+  }
+
   const modelOptions = provider.kind === 'OpenRouter' ? openRouterModels.map((m) => m.id) : discoveredIds;
 
   return (
@@ -349,6 +375,20 @@ function SettingsScreen({ notice, onDismissNotice, status, provider, apiKey, onB
               <span className={`state-label ${engine.status === 'ready' ? 'ready' : 'attention'}`}>{status.selectedEngine === engine.id ? 'In use' : engine.status === 'ready' ? 'Installed · Select' : 'Install package'}</span>
             </button>
           ))}
+          {transcriptionSettings && (
+            <>
+              <button type="button" className={`settings-engine ${transcriptionSettings.parallel_decode ? 'selected' : ''}`} aria-pressed={transcriptionSettings.parallel_decode} onClick={() => saveTranscriptionSetting('parallel_decode', !transcriptionSettings.parallel_decode)}>
+                <span><Icon name="spark" size={15} /><strong>Faster transcription</strong><small>Two decoders in parallel — about twice as fast, about twice the model memory. Recommended with 8 GB+ RAM and 4+ CPU cores; Bea falls back to single decoding otherwise.</small></span>
+                <span className={`state-label ${transcriptionSettings.parallel_decode ? 'ready' : 'attention'}`}>{transcriptionSettings.parallel_decode ? 'On' : 'Off'}</span>
+              </button>
+              <button type="button" className={`settings-engine ${transcriptionSettings.gpu_enabled ? 'selected' : ''}`} onClick={() => saveTranscriptionSetting('gpu_enabled', !transcriptionSettings.gpu_enabled)} aria-pressed={transcriptionSettings.gpu_enabled}>
+                <span><Icon name="headphones" size={15} /><strong>GPU acceleration</strong><small>Runs the decoder on a DirectX 12 GPU (NVIDIA, AMD, or Intel) and moves the model off system RAM. Bea falls back to the CPU automatically when no GPU is available.</small></span>
+                <span className={`state-label ${transcriptionSettings.gpu_enabled ? 'ready' : 'attention'}`}>{transcriptionSettings.gpu_enabled ? (transcriptionSettings.active_device === 'directml' ? 'On · GPU' : 'On · last run: CPU') : 'Off'}</span>
+              </button>
+              {transcriptionSettingError && <small className="field-help">{transcriptionSettingError}</small>}
+              {memoryUsage && <div className="settings-row"><span className="setup-status"><Icon name="grid" size={14} /></span><span><strong>Memory</strong><small>Bea {memoryUsage.bea_mb} MB · helpers {memoryUsage.helper_processes.reduce((sum, [, mb]) => sum + mb, 0)} MB. Measured live — trim happens right after each transcription.</small></span></div>}
+            </>
+          )}
         </section>
         <UpdateSettingsSection />
         <section className="settings-section provider-settings">
