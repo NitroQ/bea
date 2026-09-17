@@ -2870,6 +2870,18 @@ async fn process_imported_media_command(
     if let Err(error) = ensure_speaker_models(&state, &app).await {
         eprintln!("speaker-diarization models unavailable: {error}");
     }
+    // Mark the meeting as Processing so that recover_interrupted_transcriptions
+    // can pick it up if Bea is closed before transcription finishes.
+    {
+        let db = open_database(&state.database_path).map_err(command_error)?;
+        bea_core::set_meeting_status(
+            &db,
+            &status_meeting_id,
+            bea_core::MeetingStatus::Processing,
+            0,
+        )
+        .map_err(command_error)?;
+    }
     let worker =
         tauri::async_runtime::spawn_blocking(move || -> Result<Vec<TranscriptSegment>, String> {
             let database = open_database(&database_path).map_err(command_error)?;
@@ -2921,6 +2933,14 @@ async fn process_imported_media_command(
                     .iter()
                     .find(|turn| midpoint >= turn.start && midpoint < turn.end)
                     .map(|turn| turn.speaker);
+                // Persist the label the moment the chunk lands so an
+                // interrupted run keeps speaker attribution for everything
+                // already decoded (resume relabels the rest).
+                let _ = bea_core::update_segment_speaker(
+                    &database,
+                    &segment.id,
+                    labeled.speaker,
+                );
                 let _ = app.emit(
                     "transcription-progress",
                     serde_json::json!({
@@ -2958,7 +2978,7 @@ async fn process_imported_media_command(
             };
             // Persist speaker labels on the stored segments (the transcribe
             // loop already wrote them without labels).
-            Ok(decoded
+            let labeled = decoded
                 .into_iter()
                 .map(|mut segment| {
                     let midpoint = (segment.start_seconds + segment.end_seconds) as f32 / 2.0;
@@ -2973,7 +2993,28 @@ async fn process_imported_media_command(
                     );
                     segment
                 })
-                .collect())
+                .collect::<Vec<_>>();
+            // Chunks finished by an interrupted earlier run were persisted
+            // without labels — relabel EVERY stored segment against the
+            // full-meeting turns so a resumed meeting keeps consistent
+            // speaker attribution everywhere.
+            if let Ok(stored) = bea_core::list_transcript(&database, &worker_meeting_id) {
+                for segment in &stored {
+                    let midpoint = (segment.start_seconds + segment.end_seconds) as f32 / 2.0;
+                    let speaker = turns
+                        .iter()
+                        .find(|turn| midpoint >= turn.start && midpoint < turn.end)
+                        .map(|turn| turn.speaker);
+                    if segment.speaker != speaker {
+                        let _ = bea_core::update_segment_speaker(
+                            &database,
+                            &segment.id,
+                            speaker,
+                        );
+                    }
+                }
+            }
+            Ok(labeled)
         })
         .await;
     // The ONNX sessions were dropped inside the worker; hand the freed pages
@@ -4272,6 +4313,14 @@ async fn transcribe_recording_command(
             let mut progress = |segment: &TranscriptSegment, completed: usize, _: usize| {
                 let mut labeled = segment.clone();
                 labeled.speaker = speaker_at(segment);
+                // Persist the label the moment the chunk lands so an
+                // interrupted run keeps speaker attribution for everything
+                // already decoded (resume relabels the rest).
+                let _ = bea_core::update_segment_speaker(
+                    &database,
+                    &segment.id,
+                    labeled.speaker,
+                );
                 let _ = app.emit(
                     "transcription-progress",
                     serde_json::json!({
@@ -4309,7 +4358,7 @@ async fn transcribe_recording_command(
             };
             // Persist speaker labels on the stored segments (the transcribe
             // loop already wrote them without labels).
-            Ok(decoded
+            let labeled = decoded
                 .into_iter()
                 .map(|mut segment| {
                     segment.speaker = speaker_at(&segment);
@@ -4320,7 +4369,24 @@ async fn transcribe_recording_command(
                     );
                     segment
                 })
-                .collect())
+                .collect::<Vec<_>>();
+            // Chunks finished by an interrupted earlier run were persisted
+            // without labels — relabel EVERY stored segment against the
+            // full-meeting turns so a resumed meeting keeps consistent
+            // speaker attribution everywhere.
+            if let Ok(stored) = bea_core::list_transcript(&database, &worker_meeting_id) {
+                for segment in &stored {
+                    let speaker = speaker_at(segment);
+                    if segment.speaker != speaker {
+                        let _ = bea_core::update_segment_speaker(
+                            &database,
+                            &segment.id,
+                            speaker,
+                        );
+                    }
+                }
+            }
+            Ok(labeled)
         })
         .await;
     // The ONNX sessions were dropped inside the worker; hand the freed pages

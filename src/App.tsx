@@ -43,6 +43,7 @@ export default function App() {
   const [repairing, setRepairing] = useState<Array<'ffmpeg' | 'tesseract'>>([]);
   const [engineProgress, setEngineProgress] = useState<EngineProgress | null>(null);
   const [transcribing, setTranscribing] = useState<string | null>(null);
+  const [transcriptionStartedAt, setTranscriptionStartedAt] = useState<number | null>(null);
   const [transcriptionProgress, setTranscriptionProgress] = useState<{ completed: number; total: number } | null>(null);
   const [liveSegments, setLiveSegments] = useState<Record<string, TranscriptSegment[]>>({});
   const [generatingMinutes, setGeneratingMinutes] = useState<Record<string, true>>({});
@@ -211,6 +212,7 @@ export default function App() {
   async function createMeeting(title: string, language: TranscriptLanguage, engine: AsrEngineId) { let meeting: Meeting; try { meeting = await invoke<Meeting>('create_meeting_command', { title, language, asrEngineId: engine }); } catch { meeting = { id: crypto.randomUUID(), title, status: 'draft', duration_seconds: 0, language, created_at: new Date().toISOString(), asr_engine_id: engine }; } meeting = { ...meeting, asr_engine_id: engine }; setMeetings((current) => { const next = [meeting, ...current]; saveMeetings(next); return next; }); window.location.hash = `#meeting/${meeting.id}`; setNotice('Meeting created. Add a recording or import media to start.'); }
   async function runTranscription(meeting: Meeting, language: TranscriptLanguage, command: string, args: Record<string, unknown>) {
     setTranscribing(meeting.id);
+    setTranscriptionStartedAt(Date.now());
     setTranscriptionProgress(null);
     setMeetings((current) => current.map((item) => item.id === meeting.id ? { ...item, status: 'processing' } : item));
     try {
@@ -224,6 +226,7 @@ export default function App() {
       window.dispatchEvent(new CustomEvent('bea:notice', { detail: { message: `Transcription failed: ${String(error)}` } }));
     } finally {
       setTranscribing(null);
+      setTranscriptionStartedAt(null);
       setTranscriptionProgress(null);
       // Refetch the persisted transcript BEFORE dropping the streamed live
       // segments so the transcript never shows a gap between run end and the
@@ -315,7 +318,7 @@ export default function App() {
   }
 
   if (!setupComplete) return <SetupFlow status={{ ...setupStatus, tools: setupStatus.tools.map((tool) => repairing.includes(tool.id) ? { ...tool, status: 'repairing' } : tool) }} provider={provider} apiKey={apiKey} step={setupStep} onStep={setSetupStep} onSelectEngine={selectEngine} onInstallEngine={installEngine} onImportEngine={importEngine} onRepairTools={repairTools} onProviderChange={changeProvider} onApiKeyChange={setApiKey} onTestProvider={testProvider} onComplete={completeSetup} notice={notice} engineProgress={engineProgress} />;
-  if (route.screen === 'meeting' && selectedMeeting) return <MeetingWorkspace key={selectedMeeting.id} meeting={selectedMeeting} onBack={() => { window.location.hash = '#library'; }} onNotice={setNotice} onImport={importMedia} onImportVtt={importVtt} onRecording={recording} onMeetingStatus={(id, status) => setMeetings((items) => items.map((item) => item.id === id ? { ...item, status } : item))} onRetryTranscription={retryTranscription} onResumeTranscription={() => void retryTranscription(selectedMeeting, true)} onRepairTools={repairTools} repairing={repairing} busy={transcribing === selectedMeeting.id} transcribeProgress={transcribing === selectedMeeting.id ? transcriptionProgress : null} liveSegments={liveSegments[selectedMeeting.id] ?? []} generating={Boolean(generatingMinutes[selectedMeeting.id])} onGenerateMinutes={startMinutesGeneration} onCancelMinutesGeneration={cancelMinutesGeneration} />;
+  if (route.screen === 'meeting' && selectedMeeting) return <MeetingWorkspace key={selectedMeeting.id} meeting={selectedMeeting} onBack={() => { window.location.hash = '#library'; }} onNotice={setNotice} onImport={importMedia} onImportVtt={importVtt} onRecording={recording} onMeetingStatus={(id, status) => setMeetings((items) => items.map((item) => item.id === id ? { ...item, status } : item))} onRetryTranscription={retryTranscription} onResumeTranscription={() => void retryTranscription(selectedMeeting, true)} onRepairTools={repairTools} repairing={repairing} busy={transcribing === selectedMeeting.id} transcriptionStartedAt={transcribing === selectedMeeting.id ? transcriptionStartedAt : null} transcribeProgress={transcribing === selectedMeeting.id ? transcriptionProgress : null} liveSegments={liveSegments[selectedMeeting.id] ?? []} generating={Boolean(generatingMinutes[selectedMeeting.id])} onGenerateMinutes={startMinutesGeneration} onCancelMinutesGeneration={cancelMinutesGeneration} />;
   if (route.screen === 'settings') return <SettingsScreen notice={notice} onDismissNotice={() => setNotice(null)} status={setupStatus} provider={provider} apiKey={apiKey} onBack={() => { window.location.hash = '#library'; }} onRefresh={refreshRuntime} onRepair={repairTools} repairing={repairing} onProviderChange={changeProvider} onApiKeyChange={setApiKey} onTest={testProvider} onSelectEngine={selectEngine} onInstallEngine={installEngine} onReset={() => { localStorage.removeItem('bea.setup-complete'); setSetupComplete(false); setSetupStep(0); }} onDeleteAllData={() => void deleteAllData()} onClearAiMemory={() => void clearAiMemory()} />;
   return <Library notice={notice} onDismissNotice={() => setNotice(null)} meetings={meetings} selectedId={librarySelection ?? meetings[0]?.id ?? null} onSelect={setLibrarySelection} onOpen={(meeting) => { setLibrarySelection(meeting.id); window.location.hash = `#meeting/${meeting.id}`; }} onCreate={createMeeting} onImport={importMedia} onImportVtt={importVtt} onRename={renameMeeting} onDelete={deleteMeeting} onSettings={openSettings} runtimeReady={Boolean(runtime?.can_transcribe_locally || setupStatus.engines.some((engine) => engine.id === selectedEngine && engine.status === 'ready'))} selectedEngineName={selectedEngineName} generatingMinutes={generatingMinutes} />;
 }
