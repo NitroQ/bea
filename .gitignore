@@ -40,6 +40,7 @@ scripts/regenerate_minutes.py
 .DS_Store
 Thumbs.db
 Desktop.ini
+signing-key.pem
 
 # Editors / IDEs
 .idea/

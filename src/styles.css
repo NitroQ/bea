@@ -227,6 +227,7 @@ select option { background: #0e151d; color: var(--text); }
 .meeting-row-copy { display: grid; gap: 4px; min-width: 0; }
 .meeting-row-copy strong { overflow: hidden; font-size: 12px; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
 .meeting-row-copy small, .meeting-row-status { color: var(--quiet); font-size: 10px; }
+.minutes-badge { color: var(--amber); font-size: 10px; }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--quiet); }
 .status-dot.ready { background: var(--teal); }
 .status-dot.recording { background: var(--red); }
@@ -272,17 +273,9 @@ select option { background: #0e151d; color: var(--text); }
 .workspace-header-actions { display: flex; align-items: center; gap: 8px; }
 .record-button { display: inline-flex; align-items: center; gap: 7px; min-height: 36px; padding: 0 13px; border: 1px solid #d18484aa; border-radius: var(--radius); color: #f0b4b4; background: #d15f5f16; font-size: 12px; font-weight: 600; }
 .record-button:hover, .record-button.active { border-color: var(--red); background: #d15f5f25; }
-.overview-page { padding-top: 42px; }
-.overview-hero { display: grid; grid-template-columns: 1fr 270px; gap: 60px; align-items: center; min-height: 237px; padding-bottom: 38px; border-bottom: 1px solid var(--line-soft); }
-.overview-hero h2, .minutes-heading h2 { margin: 13px 0 10px; font-size: 27px; letter-spacing: -.045em; font-weight: 620; }
-.overview-hero p, .minutes-heading p { max-width: 500px; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
-.overview-hero-actions { display: flex; gap: 8px; margin-top: 26px; }
-.overview-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 29px; }
-.overview-cards > div { display: grid; align-content: start; gap: 7px; min-height: 151px; padding: 15px; border: 1px solid var(--line-soft); background: #111821; }
-.overview-card-icon { display: grid; place-items: center; width: 27px; height: 27px; color: var(--teal); border-radius: 6px; background: #84e2c512; }
-.overview-cards strong { margin-top: 12px; font-size: 24px; font-weight: 550; }
-.overview-cards span:not(.overview-card-icon) { color: var(--muted); font-size: 10px; }
-.overview-cards button, .inspector-link { display: inline-flex; align-items: center; gap: 5px; width: fit-content; margin-top: auto; padding: 0; border: 0; color: var(--teal); background: transparent; font-size: 10px; }
+.minutes-heading h2 { margin: 13px 0 10px; font-size: 27px; letter-spacing: -.045em; font-weight: 620; }
+.minutes-heading p { max-width: 500px; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.inspector-link { display: inline-flex; align-items: center; gap: 5px; width: fit-content; margin-top: auto; padding: 0; border: 0; color: var(--teal); background: transparent; font-size: 10px; }
 .workspace-grid { display: grid; grid-template-columns: minmax(0, 1fr) 254px; gap: 33px; padding-top: 25px; }
 .editor-column { min-width: 0; }
 .player { padding: 15px 16px 12px; border: 1px solid var(--line); background: #111922; }
@@ -471,8 +464,7 @@ select option { background: #0e151d; color: var(--text); }
   .workspace-header-actions { margin-top: 17px; flex-wrap: wrap; }
   .workspace-grid { display: block; }
   .workspace-inspector { display: none; }
-  .overview-hero { display: block; }
-  .overview-cards, .minutes-columns { grid-template-columns: 1fr; }
+  .minutes-columns { grid-template-columns: 1fr; }
   .transcript-toolbar { display: block; }
   .transcript-toolbar .search-field { margin-top: 15px; }
   .transcript-editor { max-height: none; }
@@ -638,9 +630,6 @@ select option { background: #0e151d; color: var(--text); }
 .workspace-title-lockup { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .settings-title-lockup { display: flex; align-items: center; gap: 14px; }
 .settings-header > .settings-title-lockup { flex: 1; }
-.overview-hero-copy { display: flex; gap: 18px; align-items: flex-start; min-width: 0; }
-.overview-hero-copy > .bea-avatar { margin-top: 8px; }
-.overview-hero-copy h2 { margin: 13px 0 10px; }
 .chat-empty-bea { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
 
 /* --- Workspace sidebar back button --- */

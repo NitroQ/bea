@@ -45,6 +45,8 @@ export default function App() {
   const [transcribing, setTranscribing] = useState<string | null>(null);
   const [transcriptionProgress, setTranscriptionProgress] = useState<{ completed: number; total: number } | null>(null);
   const [liveSegments, setLiveSegments] = useState<Record<string, TranscriptSegment[]>>({});
+  const [generatingMinutes, setGeneratingMinutes] = useState<Record<string, true>>({});
+  const minutesGenerationRef = useRef<Record<string, Promise<void>>>({});
 
   const setupStatus = useMemo(() => setupFromRuntime(runtime, selectedEngine, setupVerified, installedEngines), [runtime, selectedEngine, setupVerified, installedEngines]);
   const selectedMeeting = meetings.find((meeting) => meeting.id === route.meetingId) ?? null;
@@ -105,6 +107,37 @@ export default function App() {
   /// Notice that also reaches the meeting workspace's toast (App notices are
   /// invisible there, which made tool installs look like silent no-ops).
   function emitNotice(message: string) { setNotice(message); window.dispatchEvent(new CustomEvent('bea:notice', { detail: { message } })); }
+
+  /// Background minutes generation: runs as an App-level task so it survives
+  /// navigation from the meeting workspace to the library page.
+  async function startMinutesGeneration(meeting: Meeting): Promise<void> {
+    // Single-flight per meeting: return the existing promise if one is in flight.
+    if (meeting.id in minutesGenerationRef.current) return minutesGenerationRef.current[meeting.id];
+    setGeneratingMinutes((cur) => ({ ...cur, [meeting.id]: true }));
+    emitNotice(`Generating "${meeting.title}" minutes in the background…`);
+    const task = invoke<Minutes>('generate_minutes_command', { meetingId: meeting.id })
+      .then((generated) => {
+        const generic = !generated.title.trim() || /^(meeting minutes|minutes)$/i.test(generated.title.trim());
+        const minutes = generic ? { ...generated, title: meeting.title } : generated;
+        window.dispatchEvent(new CustomEvent('bea:minutes-generated', { detail: { meetingId: meeting.id, minutes } }));
+        emitNotice('Minutes generated from the timestamped transcript.');
+      })
+      .catch((error) => {
+        if (/cancelled:/i.test(String(error))) return;
+        emitNotice(`Minutes could not be generated for "${meeting.title}": ${String(error)}`);
+      })
+      .finally(() => {
+        delete minutesGenerationRef.current[meeting.id];
+        setGeneratingMinutes((cur) => { const next = { ...cur }; delete next[meeting.id]; return next; });
+      });
+    minutesGenerationRef.current[meeting.id] = task;
+    return task;
+  }
+
+  function cancelMinutesGeneration(meetingId: string) {
+    void invoke('cancel_minutes_generation_command', { meetingId }).catch(() => undefined);
+  }
+
   async function repairTools(ids: Array<'ffmpeg' | 'tesseract'>) {
     setRepairing(ids);
     const inDesktop = Boolean((window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
@@ -282,9 +315,9 @@ export default function App() {
   }
 
   if (!setupComplete) return <SetupFlow status={{ ...setupStatus, tools: setupStatus.tools.map((tool) => repairing.includes(tool.id) ? { ...tool, status: 'repairing' } : tool) }} provider={provider} apiKey={apiKey} step={setupStep} onStep={setSetupStep} onSelectEngine={selectEngine} onInstallEngine={installEngine} onImportEngine={importEngine} onRepairTools={repairTools} onProviderChange={changeProvider} onApiKeyChange={setApiKey} onTestProvider={testProvider} onComplete={completeSetup} notice={notice} engineProgress={engineProgress} />;
-  if (route.screen === 'meeting' && selectedMeeting) return <MeetingWorkspace key={selectedMeeting.id} meeting={selectedMeeting} onBack={() => { window.location.hash = '#library'; }} onNotice={setNotice} onImport={importMedia} onImportVtt={importVtt} onRecording={recording} onMeetingStatus={(id, status) => setMeetings((items) => items.map((item) => item.id === id ? { ...item, status } : item))} onRetryTranscription={retryTranscription} onResumeTranscription={() => void retryTranscription(selectedMeeting, true)} onRepairTools={repairTools} repairing={repairing} busy={transcribing === selectedMeeting.id} transcribeProgress={transcribing === selectedMeeting.id ? transcriptionProgress : null} liveSegments={liveSegments[selectedMeeting.id] ?? []} />;
+  if (route.screen === 'meeting' && selectedMeeting) return <MeetingWorkspace key={selectedMeeting.id} meeting={selectedMeeting} onBack={() => { window.location.hash = '#library'; }} onNotice={setNotice} onImport={importMedia} onImportVtt={importVtt} onRecording={recording} onMeetingStatus={(id, status) => setMeetings((items) => items.map((item) => item.id === id ? { ...item, status } : item))} onRetryTranscription={retryTranscription} onResumeTranscription={() => void retryTranscription(selectedMeeting, true)} onRepairTools={repairTools} repairing={repairing} busy={transcribing === selectedMeeting.id} transcribeProgress={transcribing === selectedMeeting.id ? transcriptionProgress : null} liveSegments={liveSegments[selectedMeeting.id] ?? []} generating={Boolean(generatingMinutes[selectedMeeting.id])} onGenerateMinutes={startMinutesGeneration} onCancelMinutesGeneration={cancelMinutesGeneration} />;
   if (route.screen === 'settings') return <SettingsScreen notice={notice} onDismissNotice={() => setNotice(null)} status={setupStatus} provider={provider} apiKey={apiKey} onBack={() => { window.location.hash = '#library'; }} onRefresh={refreshRuntime} onRepair={repairTools} repairing={repairing} onProviderChange={changeProvider} onApiKeyChange={setApiKey} onTest={testProvider} onSelectEngine={selectEngine} onInstallEngine={installEngine} onReset={() => { localStorage.removeItem('bea.setup-complete'); setSetupComplete(false); setSetupStep(0); }} onDeleteAllData={() => void deleteAllData()} onClearAiMemory={() => void clearAiMemory()} />;
-  return <Library notice={notice} onDismissNotice={() => setNotice(null)} meetings={meetings} selectedId={librarySelection ?? meetings[0]?.id ?? null} onSelect={setLibrarySelection} onOpen={(meeting) => { setLibrarySelection(meeting.id); window.location.hash = `#meeting/${meeting.id}`; }} onCreate={createMeeting} onImport={importMedia} onImportVtt={importVtt} onRename={renameMeeting} onDelete={deleteMeeting} onSettings={openSettings} runtimeReady={Boolean(runtime?.can_transcribe_locally || setupStatus.engines.some((engine) => engine.id === selectedEngine && engine.status === 'ready'))} selectedEngineName={selectedEngineName} />;
+  return <Library notice={notice} onDismissNotice={() => setNotice(null)} meetings={meetings} selectedId={librarySelection ?? meetings[0]?.id ?? null} onSelect={setLibrarySelection} onOpen={(meeting) => { setLibrarySelection(meeting.id); window.location.hash = `#meeting/${meeting.id}`; }} onCreate={createMeeting} onImport={importMedia} onImportVtt={importVtt} onRename={renameMeeting} onDelete={deleteMeeting} onSettings={openSettings} runtimeReady={Boolean(runtime?.can_transcribe_locally || setupStatus.engines.some((engine) => engine.id === selectedEngine && engine.status === 'ready'))} selectedEngineName={selectedEngineName} generatingMinutes={generatingMinutes} />;
 }
 
 function parseHash(): { screen: 'library' | 'meeting' | 'settings'; meetingId?: string } { const hash = window.location.hash.replace(/^#/, ''); if (hash === 'settings') return { screen: 'settings' }; if (hash.startsWith('meeting/')) return { screen: 'meeting', meetingId: hash.slice('meeting/'.length) }; return { screen: 'library' }; }
