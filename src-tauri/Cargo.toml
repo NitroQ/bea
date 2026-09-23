@@ -1,6 +1,6 @@
 [package]
 name = "bea-core"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 license = "AGPL-3.0"
 
@@ -47,3 +47,38 @@ tauri-build = { version = "2", features = [] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1.53.1", features = ["rt", "macros", "time"] }
+
+# These examples are manual dev probes (microphone smoke, accuracy probes,
+# etc.). They link against the C-runtime-backed `sherpa_onnx_sys` static lib
+# and hit the MSVC `LIBCMT` conflict when cargo compiles the example test
+# binaries. Mark `test = false` so `cargo test` skips them; they still build
+# and run via `cargo run --example <name>`.
+[[example]]
+name = "microphone_smoke"
+test = false
+bench = false
+
+[[example]]
+name = "transcribe_probe"
+test = false
+bench = false
+
+[[example]]
+name = "transcribe_probe_whisper"
+test = false
+bench = false
+
+[[example]]
+name = "accuracy_probe"
+test = false
+bench = false
+
+[[example]]
+name = "accuracy_probe_whisper"
+test = false
+bench = false
+
+[[example]]
+name = "resource_probe"
+test = false
+bench = false

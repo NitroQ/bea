@@ -4,7 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use bea_core::{
-    call_provider, create_job, create_meeting_with_engine, delete_meeting, estimate_tokens,
+    create_job, create_meeting_with_engine, delete_meeting, estimate_tokens,
     export_minutes, extract_ledger_events, generate_minutes, get_app_setting,
     import_media, inspect_asr_model_package, inspect_runtime, install_qwen_model_package,
     install_sherpa_model_package, list_audio_input_devices, list_completed_recording_chunks,
@@ -89,10 +89,14 @@ fn command_error(error: impl std::fmt::Display) -> String {
 
 /// Builds the engine sessions for one transcription run:
 /// - one decoder by default (strict utilization baseline);
-/// - two *independent* sessions when "Faster transcription" is enabled and the
-///   machine carries it (4+ cores, 8+ GB RAM) — GPU mode keeps one session;
-/// - the DirectML provider when the GPU toggle is on. Session-creation
-///   failures fall back to CPU inside the constructors.
+/// - 2-6 *independent* sessions when "Faster transcription" is enabled —
+///   scaled to the machine (cores/4, clamped by a per-session RAM budget) so
+///   many-core CPUs stop idling; GPU mode keeps one session;
+/// - the DirectML provider only when the process actually ships the DirectML
+///   runtime — a CPU-only build would silently downgrade the GPU request to a
+///   2-thread CPU session, so the toggle falls back to the full CPU turbo
+///   path instead. Session-creation failures fall back to CPU inside the
+///   constructors.
 fn load_transcription_engines(
     database: &rusqlite::Connection,
     model_root: &std::path::Path,
@@ -104,13 +108,19 @@ fn load_transcription_engines(
     let parallel_enabled = get_app_setting(database, "asr_parallel_decode")
         .map(|value| value.as_deref() == Some("1"))
         .unwrap_or(false);
-    let device = if gpu_enabled {
+    let gpu_usable = gpu_enabled && bea_core::directml_runtime_available();
+    if gpu_enabled && !gpu_usable {
+        eprintln!(
+            "DirectML runtime missing; GPU transcription decodes on CPU with full turbo parallelism instead"
+        );
+    }
+    let device = if gpu_usable {
         AsrDevice::DirectML
     } else {
         AsrDevice::Cpu
     };
-    let wanted = if parallel_enabled && device == AsrDevice::Cpu && bea_core::turbo_supported() {
-        2
+    let wanted = if parallel_enabled && device == AsrDevice::Cpu {
+        bea_core::turbo_session_count()
     } else {
         1
     };
@@ -122,7 +132,9 @@ fn load_transcription_engines(
                 if engines.is_empty() {
                     return Err(command_error(error));
                 }
-                eprintln!("second ASR engine unavailable; decoding single-threaded: {error}");
+                eprintln!(
+                    "an ASR engine session was unavailable; decoding with fewer sessions: {error}"
+                );
                 break;
             }
         }
@@ -1735,10 +1747,12 @@ fn preview_provider_context_command(
     let database = open_database(&state.database_path).map_err(command_error)?;
     let transcript = list_transcript(&database, &meeting_id).map_err(command_error)?;
     let events = extract_ledger_events(&transcript);
-    let pack = bea_core::pack_context_mode(&events, 12_000, ContextMode::Balanced);
+    // Truthful disclosure: report the cost of ALL extracted events — long
+    // meetings are windowed across every part (see call_provider_long_meeting),
+    // so the preview must not pretend only one request's worth is processed.
     Ok(ProviderContextPreview {
-        evidence_count: pack.evidence_count,
-        estimated_input_tokens: pack.estimated_input_tokens,
+        evidence_count: events.iter().map(|event| event.evidence.len()).sum(),
+        estimated_input_tokens: events.iter().map(bea_core::event_token_cost).sum(),
         disclosure: "Only packed transcript text and timestamped evidence will be sent. Raw audio and video stay local.".into(),
     })
 }
@@ -1843,11 +1857,25 @@ async fn generate_minutes_command(
                         }
                     }
                 }
-                let pack = bea_core::pack_context_mode(&events, 12_000, ContextMode::Balanced);
+                let pack = bea_core::pack_context_mode(
+                    &events,
+                    bea_core::MINUTES_CONTEXT_BUDGET_TOKENS,
+                    ContextMode::Maximum,
+                );
                 let effective_model =
                     effective_meeting_model(&database, &meeting_id, &provider.model);
                 let effective_reasoning =
                     effective_meeting_reasoning(&database, &meeting_id, &provider.reasoning_effort);
+                // Cancellation checkpoint shared by every stage (before the
+                // first request, between long-meeting windows, before the
+                // reduce pass): the wizard's Close stops the run.
+                let was_cancelled = || {
+                    state
+                        .cancelled_minutes
+                        .lock()
+                        .map(|set| set.contains(&meeting_id))
+                        .unwrap_or(false)
+                };
                 let request = LlmRequest {
                     model: effective_model,
                     system: format!("{}\n{}", MEETING_SECRETARY_SYSTEM_PROMPT, meeting_context),
@@ -1856,20 +1884,30 @@ async fn generate_minutes_command(
                     max_output_tokens: MINUTES_MAX_OUTPUT_TOKENS,
                     reasoning_effort: effective_reasoning,
                 };
-                // Cancellation checkpoint: the wizard's Close stops the run
-                // before the (possibly long) provider request is even sent.
-                let was_cancelled = || {
-                    state
-                        .cancelled_minutes
-                        .lock()
-                        .map(|set| set.contains(&meeting_id))
-                        .unwrap_or(false)
-                };
                 if was_cancelled() {
-                    return Err("cancelled: minutes generation was closed before it finished".into());
+                    return Err(
+                        "cancelled: minutes generation was closed before it finished".into(),
+                    );
                 }
+                let mut input_tokens_used = pack.estimated_input_tokens as u64;
                 let remote_result = if vision_images.is_empty() {
-                    call_provider(&provider, &request, Some(&api_key)).await
+                    // Minutes for meetings of any length: a meeting whose
+                    // events fit one request takes the one-shot path; longer
+                    // meetings are windowed across the WHOLE transcript (the
+                    // old 12k-token pack silently dropped everything past the
+                    // first ~20-30 minutes of a 3-hour meeting).
+                    bea_core::call_provider_long_meeting(
+                        &provider,
+                        &request,
+                        &events,
+                        Some(&api_key),
+                        &was_cancelled,
+                    )
+                    .await
+                    .map(|(generated, input_tokens)| {
+                        input_tokens_used = input_tokens;
+                        generated
+                    })
                 } else {
                     // Vision path: send the frame images inline and parse the
                     // minutes JSON out of the free-text reply. A malformed
@@ -1907,7 +1945,10 @@ async fn generate_minutes_command(
                         // The reply arrived after the user closed the wizard:
                         // discard it instead of saving half-wanted minutes.
                         if was_cancelled() {
-                            return Err("cancelled: minutes generation was closed before it finished".into());
+                            return Err(
+                                "cancelled: minutes generation was closed before it finished"
+                                    .into(),
+                            );
                         }
                         let output_tokens = estimate_tokens(
                             &serde_json::to_string(&remote_minutes).unwrap_or_default(),
@@ -1917,7 +1958,7 @@ async fn generate_minutes_command(
                             &UsageRecord {
                                 provider_id: provider.id,
                                 model: provider.model,
-                                input_tokens: pack.estimated_input_tokens as u64,
+                                input_tokens: input_tokens_used,
                                 output_tokens,
                                 estimated_cost: None,
                                 operation: "minutes".into(),
@@ -2895,29 +2936,44 @@ async fn process_imported_media_command(
                 &pipeline,
             )
             .map_err(command_error)?;
-            // Diarize the whole normalized meeting once (if the speaker models
-            // are present) so every chunk can be attributed to a speaker. The
-            // read is capped at the same 60 minutes as recordings — a
-            // multi-hour import must not spike RAM. Failures degrade
-            // gracefully to unlabeled speakers.
+            // Diarize the whole normalized meeting (when the speaker models
+            // are present) on its OWN thread so the potentially minutes-long
+            // full-meeting pass overlaps decoding instead of gating it — ASR
+            // never depends on speaker turns. The read is capped at the same
+            // 60 minutes as recordings — a multi-hour import must not spike
+            // RAM. Failures degrade gracefully to unlabeled speakers, and
+            // chunks that decode before the turns arrive stream unlabeled and
+            // are relabeled by the final passes below (pyannote's ~35 MB of
+            // models coexisting with the ASR sessions is negligible).
             const DIARIZATION_MAX_SECONDS: u64 = 60 * 60;
             let audio_path = std::path::Path::new(&output_dir).join("audio.wav");
-            let turns = bea_core::read_wav_samples_resampled_capped(
-                &audio_path,
-                16_000,
-                DIARIZATION_MAX_SECONDS,
-            )
-            .map(|(samples, _)| samples)
-            .and_then(|samples| {
-                bea_core::run_at_below_normal(|| {
-                    bea_core::SpeakerDiarizer::from_models_dir(&model_root)
-                        .and_then(|diarizer| diarizer.process_wave(&samples))
+            let turns_cell: std::sync::Arc<
+                std::sync::Mutex<Option<Vec<bea_core::SherpaDiarizationSegment>>>,
+            > = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let diarization_model_root = model_root.clone();
+            let turns_for_cell = std::sync::Arc::clone(&turns_cell);
+            let diarization = std::thread::spawn(move || {
+                let turns = bea_core::read_wav_samples_resampled_capped(
+                    &audio_path,
+                    16_000,
+                    DIARIZATION_MAX_SECONDS,
+                )
+                .map(|(samples, _)| samples)
+                .and_then(|samples| {
+                    bea_core::run_at_below_normal(|| {
+                        bea_core::SpeakerDiarizer::from_models_dir(&diarization_model_root)
+                            .and_then(|diarizer| diarizer.process_wave(&samples))
+                    })
                 })
-            })
-            .unwrap_or_default();
-            // RAM order: diarize BEFORE loading the ASR engine so the small
-            // pyannote models are dropped before Whisper's session is built —
-            // the two model stacks never coexist at peak.
+                .unwrap_or_default();
+                // Publish as soon as ready so the rest of this run's progress
+                // events carry speaker labels too.
+                if let Ok(mut guard) = turns_for_cell.lock() {
+                    *guard = Some(turns.clone());
+                }
+                turns
+            });
+            let progress_turns = std::sync::Arc::clone(&turns_cell);
             let engines = load_transcription_engines(&database, &model_root, &engine_id)?;
             // Resume runs keep every decoded chunk (resume markers) and decode
             // only the rest; fresh runs clear the transcript and start from zero.
@@ -2926,13 +2982,17 @@ async fn process_imported_media_command(
             let total_chunks = inputs.len();
             let language_hint = language_from_code(&language);
             let mut progress = |segment: &TranscriptSegment, completed: usize, _: usize| {
-                // Attribute the segment to the speaker active at its midpoint.
+                // Attribute the segment to the speaker active at its midpoint
+                // (best-effort while the diarization thread is still running).
                 let midpoint = (segment.start_seconds + segment.end_seconds) as f32 / 2.0;
+                let turns = progress_turns.lock().ok().and_then(|guard| guard.clone());
                 let mut labeled = segment.clone();
-                labeled.speaker = turns
-                    .iter()
-                    .find(|turn| midpoint >= turn.start && midpoint < turn.end)
-                    .map(|turn| turn.speaker);
+                labeled.speaker = turns.as_ref().and_then(|turns| {
+                    turns
+                        .iter()
+                        .find(|turn| midpoint >= turn.start && midpoint < turn.end)
+                        .map(|turn| turn.speaker)
+                });
                 // Persist the label the moment the chunk lands so an
                 // interrupted run keeps speaker attribution for everything
                 // already decoded (resume relabels the rest).
@@ -2976,6 +3036,9 @@ async fn process_imported_media_command(
                 )
                 .map_err(command_error)?
             };
+            // Diarization finished while chunks were decoding; collect the
+            // turns for the final labeling passes below.
+            let turns = diarization.join().unwrap_or_default();
             // Persist speaker labels on the stored segments (the transcribe
             // loop already wrote them without labels).
             let labeled = decoded
@@ -4249,60 +4312,76 @@ async fn transcribe_recording_command(
     let worker =
         tauri::async_runtime::spawn_blocking(move || -> Result<Vec<TranscriptSegment>, String> {
             let database = open_database(&database_path).map_err(command_error)?;
-            // Diarize the full recorded meeting once: concatenate every chunk's
-            // samples (resampled to 16 kHz — microphone devices commonly run at
-            // 44.1/48 kHz and diarization models expect 16 kHz), then attribute
-            // each transcript segment to the speaker active at its midpoint.
-            // Failures here degrade gracefully to unlabeled speakers.
+            // Diarize the full recorded meeting on its OWN thread so the
+            // minutes-long pass overlaps decoding: concatenate every chunk's
+            // samples (resampled to 16 kHz — microphone devices commonly run
+            // at 44.1/48 kHz and diarization models expect 16 kHz), then
+            // attribute each transcript segment to the speaker active at its
+            // midpoint. Chunks that decode before the turns arrive stream
+            // unlabeled and are relabeled by the final passes below.
+            // Failures degrade gracefully to unlabeled speakers.
             // Diarization memory guard: cap the concatenated audio at the
             // first 60 minutes (16 kHz mono f32 ≈ 230 GB-equivalent would
             // otherwise be unbounded for hour-long meetings).
-            // RAM order: diarize BEFORE loading the ASR engine so the small
-            // pyannote models are dropped before Whisper's session is built —
-            // the two model stacks never coexist at peak.
             const DIARIZATION_MAX_SECONDS: f32 = 60.0 * 60.0;
             const DIARIZATION_MAX_SAMPLES: usize =
                 (DIARIZATION_MAX_SECONDS * 16_000.0) as usize;
-            let mut meeting_samples: Vec<f32> = Vec::new();
-            let mut truncated = false;
-            'collect: for input in &inputs {
-                if let Some((samples, _)) =
-                    bea_core::read_wav_samples_resampled_capped(&input.path, 16_000, u64::MAX)
-                {
-                    let remaining = DIARIZATION_MAX_SAMPLES - meeting_samples.len();
-                    if samples.len() > remaining {
-                        meeting_samples.extend_from_slice(&samples[..remaining]);
-                        truncated = true;
-                        break 'collect;
+            let turns_cell: std::sync::Arc<
+                std::sync::Mutex<Option<Vec<bea_core::SherpaDiarizationSegment>>>,
+            > = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let diarization_inputs = inputs.clone();
+            let diarization_model_root = model_root.clone();
+            let turns_for_cell = std::sync::Arc::clone(&turns_cell);
+            let diarization = std::thread::spawn(move || {
+                let mut meeting_samples: Vec<f32> = Vec::new();
+                let mut truncated = false;
+                'collect: for input in &diarization_inputs {
+                    if let Some((samples, _)) =
+                        bea_core::read_wav_samples_resampled_capped(&input.path, 16_000, u64::MAX)
+                    {
+                        let remaining = DIARIZATION_MAX_SAMPLES - meeting_samples.len();
+                        if samples.len() > remaining {
+                            meeting_samples.extend_from_slice(&samples[..remaining]);
+                            truncated = true;
+                            break 'collect;
+                        }
+                        meeting_samples.extend(samples);
                     }
-                    meeting_samples.extend(samples);
                 }
-            }
-            if truncated {
-                eprintln!(
-                    "diarization input truncated to the first {DIARIZATION_MAX_SECONDS:.0} minutes of audio"
-                );
-            }
-            let turns = if meeting_samples.is_empty() {
-                Vec::new()
-            } else {
-                // Strict utilization: diarization is a full-meeting CPU pass;
-                // run it below normal priority like every other decode.
-                bea_core::run_at_below_normal(|| {
-                    bea_core::SpeakerDiarizer::from_models_dir(&model_root)
-                        .and_then(|diarizer| diarizer.process_wave(&meeting_samples))
-                })
-                .unwrap_or_default()
-            };
+                if truncated {
+                    eprintln!(
+                        "diarization input truncated to the first {DIARIZATION_MAX_SECONDS:.0} minutes of audio"
+                    );
+                }
+                let turns = if meeting_samples.is_empty() {
+                    Vec::new()
+                } else {
+                    // Strict utilization: diarization is a full-meeting CPU
+                    // pass; run it below normal priority like every other
+                    // decode.
+                    bea_core::run_at_below_normal(|| {
+                        bea_core::SpeakerDiarizer::from_models_dir(&diarization_model_root)
+                            .and_then(|diarizer| diarizer.process_wave(&meeting_samples))
+                    })
+                    .unwrap_or_default()
+                };
+                // Publish as soon as ready so the rest of this run's progress
+                // events carry speaker labels too.
+                if let Ok(mut guard) = turns_for_cell.lock() {
+                    *guard = Some(turns.clone());
+                }
+                turns
+            });
             let speaker_at = |segment: &TranscriptSegment| -> Option<u32> {
                 let midpoint = (segment.start_seconds + segment.end_seconds) as f32 / 2.0;
-                turns
-                    .iter()
-                    .find(|turn| midpoint >= turn.start && midpoint < turn.end)
-                    .map(|turn| turn.speaker)
+                let turns = turns_cell.lock().ok().and_then(|guard| guard.clone());
+                turns.as_ref().and_then(|turns| {
+                    turns
+                        .iter()
+                        .find(|turn| midpoint >= turn.start && midpoint < turn.end)
+                        .map(|turn| turn.speaker)
+                })
             };
-            // The diarizer (and its models) was dropped above — only now is the
-            // heavyweight ASR session built, so the peaks never stack.
             let engines = load_transcription_engines(&database, &model_root, &engine_id)?;
             // Resume runs keep every decoded chunk (resume markers) and decode
             // only the rest; fresh runs clear the transcript and start from zero.
@@ -4356,6 +4435,9 @@ async fn transcribe_recording_command(
                 )
                 .map_err(command_error)?
             };
+            // Diarization finished while chunks were decoding; wait for its
+            // turns so the final labeling passes below see every speaker.
+            let _ = diarization.join();
             // Persist speaker labels on the stored segments (the transcribe
             // loop already wrote them without labels).
             let labeled = decoded
@@ -4447,12 +4529,20 @@ fn get_transcription_settings_command(
     } else {
         "cpu"
     };
+    // Session preview for the Settings copy: how many decoders a fresh run
+    // would actually use with the current toggles and hardware.
+    let turbo_sessions = if parallel_decode && (!gpu_enabled || directml_runtime) {
+        bea_core::turbo_session_count()
+    } else {
+        1
+    };
     Ok(serde_json::json!({
         "parallel_decode": parallel_decode,
         "gpu_enabled": gpu_enabled,
         "directml_runtime_available": directml_runtime,
         "active_device": active_device,
         "turbo_supported": bea_core::turbo_supported(),
+        "turbo_sessions": turbo_sessions,
         "cores": std::thread::available_parallelism()
             .map(|cores| cores.get())
             .unwrap_or(0),

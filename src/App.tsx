@@ -361,10 +361,10 @@ function SettingsScreen({ notice, onDismissNotice, status, provider, apiKey, onB
 
   // Transcription performance toggles ("Faster transcription" turbo decoding
   // and the GPU/DirectML device) with the device the last run actually used.
-  const [transcriptionSettings, setTranscriptionSettings] = useState<{ parallel_decode: boolean; gpu_enabled: boolean; active_device: string; turbo_supported: boolean; cores: number } | null>(null);
+  const [transcriptionSettings, setTranscriptionSettings] = useState<{ parallel_decode: boolean; gpu_enabled: boolean; active_device: string; turbo_supported: boolean; turbo_sessions: number; cores: number } | null>(null);
   const [transcriptionSettingError, setTranscriptionSettingError] = useState<string | null>(null);
   const refreshTranscriptionSettings = useCallback(() => {
-    invoke<{ parallel_decode: boolean; gpu_enabled: boolean; active_device: string; turbo_supported: boolean; cores: number }>('get_transcription_settings_command').then(setTranscriptionSettings).catch(() => setTranscriptionSettings(null));
+    invoke<{ parallel_decode: boolean; gpu_enabled: boolean; active_device: string; turbo_supported: boolean; turbo_sessions: number; cores: number }>('get_transcription_settings_command').then(setTranscriptionSettings).catch(() => setTranscriptionSettings(null));
   }, []);
   useEffect(refreshTranscriptionSettings, [refreshTranscriptionSettings]);
   // In-app memory readout so RAM reductions (model overlap removal, post-run
@@ -414,7 +414,7 @@ function SettingsScreen({ notice, onDismissNotice, status, provider, apiKey, onB
           {transcriptionSettings && (
             <>
               <button type="button" className={`settings-engine ${transcriptionSettings.parallel_decode ? 'selected' : ''}`} aria-pressed={transcriptionSettings.parallel_decode} onClick={() => saveTranscriptionSetting('parallel_decode', !transcriptionSettings.parallel_decode)}>
-                <span><Icon name="spark" size={15} /><strong>Faster transcription</strong><small>Two decoders in parallel — about twice as fast, about twice the model memory. Recommended with 8 GB+ RAM and 4+ CPU cores; Bea falls back to single decoding otherwise.</small></span>
+                <span><Icon name="spark" size={15} /><strong>Faster transcription</strong><small>Up to {transcriptionSettings.turbo_sessions} decoders in parallel, sized to this machine's cores and memory ({transcriptionSettings.cores} cores detected). More decoders, proportionally faster — a 3-hour meeting can finish in about 30 minutes on a many-core CPU.</small></span>
                 <span className={`state-label ${transcriptionSettings.parallel_decode ? 'ready' : 'attention'}`}>{transcriptionSettings.parallel_decode ? 'On' : 'Off'}</span>
               </button>
               <button type="button" className={`settings-engine ${transcriptionSettings.gpu_enabled ? 'selected' : ''}`} onClick={() => saveTranscriptionSetting('gpu_enabled', !transcriptionSettings.gpu_enabled)} aria-pressed={transcriptionSettings.gpu_enabled}>

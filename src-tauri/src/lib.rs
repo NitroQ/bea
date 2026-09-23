@@ -264,6 +264,33 @@ pub fn turbo_supported() -> bool {
     turbo_supported_with(available_cores(), total_physical_ram())
 }
 
+/// How many *independent* decoder sessions "Faster transcription" should run.
+/// The old behavior hardcoded two sessions, which starves many-core CPUs (each
+/// session keeps the conservative intra-op budget of cores/2 capped at 4
+/// threads — on a 28-core machine two sessions used 8 of 28 cores). Sessions
+/// now scale with cores (cores/4, clamped 2..=6) and stay bounded by a
+/// per-session RAM budget (~1.2 GB working set per whisper-class model
+/// instance) with 4 GB reserved for the OS, the UI, and diarization. Pure so
+/// tests can exercise the matrix without hardware.
+pub fn turbo_session_count_with(cores: usize, total_ram_bytes: u64) -> usize {
+    if !turbo_supported_with(cores, total_ram_bytes) {
+        return 1;
+    }
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const SESSION_RAM_BUDGET: u64 = (1.2 * GIB as f64) as u64;
+    const OS_HEADROOM: u64 = 4 * GIB;
+    let ram_sessions = total_ram_bytes
+        .saturating_sub(OS_HEADROOM)
+        .saturating_div(SESSION_RAM_BUDGET)
+        .max(1) as usize;
+    let core_sessions = (cores / 4).clamp(2, 6);
+    core_sessions.min(ram_sessions)
+}
+
+pub fn turbo_session_count() -> usize {
+    turbo_session_count_with(available_cores(), total_physical_ram())
+}
+
 fn total_physical_ram() -> u64 {
     let mut system = sysinfo::System::new();
     system.refresh_memory();
@@ -2814,18 +2841,39 @@ pub fn prepare_imported_media_chunks<P: MediaPipeline>(
     std::fs::create_dir_all(&chunks_dir)
         .map_err(|error| BeaError::MediaProcessing(error.to_string()))?;
     let mut inputs = Vec::with_capacity(chunk_count as usize);
-    for index in 0..chunk_count {
+    // The whole grid is (re)built in ONE ffmpeg segment pass whenever any
+    // chunk is missing or truncated (fresh import, or a crashed earlier
+    // slice). A complete valid grid is trusted outright, so a resume skips
+    // slicing entirely. One stream-copy pass over the normalized WAV costs
+    // seconds; the previous per-chunk spawn loop cost ~440 sequential ffmpeg
+    // processes for a 3-hour meeting before the first chunk could decode.
+    let grid_entry = |index: u64| {
         let start = index * chunk_seconds;
         let end = (start + chunk_seconds).min(total_seconds);
-        let chunk_path = chunks_dir.join(format!("chunk-{index:04}.wav"));
-        if !chunk_path.is_file() || chunk_needs_reslice(&chunk_path, end - start) {
-            run_ffmpeg(
-                pipeline.ffmpeg_path(),
-                &ffmpeg_slice_args(&audio_path, &chunk_path, start, end),
-            )?;
-        }
+        (
+            chunks_dir.join(format!("chunk-{index:04}.wav")),
+            start,
+            end,
+        )
+    };
+    let grid_complete = (0..chunk_count).all(|index| {
+        let (path, start, end) = grid_entry(index);
+        path.is_file() && !chunk_needs_reslice(&path, end - start)
+    });
+    if !grid_complete {
+        run_ffmpeg(
+            pipeline.ffmpeg_path(),
+            &ffmpeg_segment_args(
+                &audio_path,
+                &chunks_dir.join("chunk-%04d.wav"),
+                chunk_seconds,
+            ),
+        )?;
+    }
+    for index in 0..chunk_count {
+        let (path, start, end) = grid_entry(index);
         inputs.push(AudioChunkInput {
-            path: chunk_path,
+            path,
             start_seconds: start,
             end_seconds: end,
         });
@@ -2929,29 +2977,26 @@ pub fn ffmpeg_audio_args(input: &Path, output: &Path) -> Vec<String> {
     ]
 }
 
-/// ffmpeg arguments that cut `[start, end)` seconds out of an existing WAV
-/// without re-encoding (both are PCM, so a stream copy is exact).
-pub fn ffmpeg_slice_args(
-    input: &Path,
-    output: &Path,
-    start_seconds: u64,
-    end_seconds: u64,
-) -> Vec<String> {
-    // `-ss` before `-i` resets output timestamps, so an output-side `-to`
-    // measures from zero and copies far more than the intended window. Using
-    // a duration (`-t end-start`) keeps every chunk exactly its slice length.
-    let duration = end_seconds.saturating_sub(start_seconds).max(1);
+/// ffmpeg arguments that split a whole WAV into a fixed-length chunk grid in
+/// ONE process (`-f segment`). Slicing 3 hours at 28 s per chunk used to spawn
+/// ~440 sequential ffmpeg processes before the first chunk could even decode;
+/// a single segment pass does the same work in seconds.
+pub fn ffmpeg_segment_args(input: &Path, chunk_pattern: &Path, chunk_seconds: u64) -> Vec<String> {
     vec![
         "-y".into(),
-        "-ss".into(),
-        start_seconds.to_string(),
         "-i".into(),
         input.to_string_lossy().into_owned(),
-        "-t".into(),
-        duration.to_string(),
+        "-f".into(),
+        "segment".into(),
+        "-segment_time".into(),
+        chunk_seconds.to_string(),
+        // Restart each segment's timestamps at zero so chunk N covers exactly
+        // [N*chunk, (N+1)*chunk) — matching the grid the caller builds.
+        "-reset_timestamps".into(),
+        "1".into(),
         "-c".into(),
         "copy".into(),
-        output.to_string_lossy().into_owned(),
+        chunk_pattern.to_string_lossy().into_owned(),
     ]
 }
 pub fn ffmpeg_keyframe_args(
@@ -3739,6 +3784,177 @@ pub fn pack_context_mode(
         estimated_input_tokens: used,
         evidence_count,
     }
+}
+
+/// Per-request input budget for minutes generation, in estimated tokens. A
+/// meeting whose extracted events exceed this is generated in consecutive
+/// windows (see `call_provider_long_meeting`) instead of being truncated —
+/// the old 12k one-shot pack silently dropped everything past the first
+/// ~20-30 minutes of a 3-hour meeting. 48k input + 8k output fits the
+/// 128k-context class OpenRouter serves for minutes models.
+pub const MINUTES_CONTEXT_BUDGET_TOKENS: usize = 48_000;
+/// Output cap per window and reduce request. Small replies never truncate;
+/// the single-window one-shot path keeps the larger MINUTES_MAX_OUTPUT_TOKENS
+/// budget declared in main.rs.
+pub const MINUTES_WINDOW_OUTPUT_TOKENS: u32 = 8_000;
+
+/// Rough token cost of one ledger event as serialized into a request
+/// (summary plus every evidence quote).
+pub fn event_token_cost(event: &LedgerEvent) -> usize {
+    let text = format!(
+        "{} {}",
+        event.summary,
+        event
+            .evidence
+            .iter()
+            .map(|e| e.quote.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    estimate_tokens(&text)
+}
+
+/// Splits events into consecutive windows that each fit `budget_tokens`.
+/// Every event lands in exactly one window — nothing is dropped; a single
+/// event larger than the budget forms its own (over-budget) window rather
+/// than being discarded.
+pub fn split_event_windows(events: &[LedgerEvent], budget_tokens: usize) -> Vec<Vec<LedgerEvent>> {
+    let mut windows: Vec<Vec<LedgerEvent>> = Vec::new();
+    let mut used = 0usize;
+    let mut current: Vec<LedgerEvent> = Vec::new();
+    for event in events {
+        let cost = event_token_cost(event);
+        if !current.is_empty() && used + cost > budget_tokens {
+            windows.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        used += cost;
+        current.push(event.clone());
+    }
+    if !current.is_empty() {
+        windows.push(current);
+    }
+    windows
+}
+
+/// Normalized dedupe key for summaries and headings: lowercased, punctuation
+/// stripped, whitespace collapsed. "Ship the beta build on Friday." and
+/// "ship  the  beta build on friday" collapse to the same key.
+fn summary_key(text: &str) -> String {
+    text.chars()
+        .filter(|ch| ch.is_alphanumeric() || *ch == ' ')
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Splits text into sentences on terminal punctuation, keeping the
+/// punctuation attached to each sentence.
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        current.push_str(word);
+        current.push(' ');
+        if word.ends_with('.') || word.ends_with('!') || word.ends_with('?') {
+            let sentence = current.trim().to_string();
+            if !sentence.is_empty() {
+                sentences.push(sentence);
+            }
+            current.clear();
+        }
+    }
+    let rest = current.trim().to_string();
+    if !rest.is_empty() {
+        sentences.push(rest);
+    }
+    sentences
+}
+
+/// Appends window items to an accumulating section, collapsing duplicates
+/// (same normalized summary) into one entry whose evidence unions both
+/// sides — consecutive windows overlap at chunk boundaries, and the same
+/// decision restated 40 minutes later must not appear twice. Keeps the
+/// higher confidence and fills missing owner/due; evidence is capped so a
+/// heavily-repeated point cannot bloat the reduce payload.
+pub fn merge_ledger_items(target: &mut Vec<LedgerEvent>, incoming: Vec<LedgerEvent>) {
+    for event in incoming {
+        let key = summary_key(&event.summary);
+        if key.is_empty() {
+            continue;
+        }
+        match target.iter_mut().find(|e| summary_key(&e.summary) == key) {
+            Some(existing) => {
+                for evidence in event.evidence {
+                    let duplicate = existing.evidence.iter().any(|e| {
+                        e.start_seconds == evidence.start_seconds
+                            && e.end_seconds == evidence.end_seconds
+                            && e.quote == evidence.quote
+                    });
+                    if !duplicate && existing.evidence.len() < 6 {
+                        existing.evidence.push(evidence);
+                    }
+                }
+                if event.confidence > existing.confidence {
+                    existing.confidence = event.confidence;
+                }
+                if existing.owner.is_none() {
+                    existing.owner = event.owner;
+                }
+                if existing.due.is_none() {
+                    existing.due = event.due;
+                }
+            }
+            None => target.push(event),
+        }
+    }
+}
+
+/// Merges one window's minutes into the accumulating draft: ledger sections
+/// append with dedupe, agenda keeps first-seen order without duplicate
+/// headings, the first non-empty title wins, and summaries join sentence-wise
+/// (the reduce pass rewrites the joined text into one executive summary).
+pub fn merge_window_minutes(minutes: &mut Minutes, window: Minutes) {
+    if minutes.title.trim().is_empty() && !window.title.trim().is_empty() {
+        minutes.title = window.title;
+    }
+    if !window.summary.trim().is_empty() {
+        let mut combined = minutes.summary.trim().to_string();
+        for sentence in split_sentences(&window.summary) {
+            let key = summary_key(&sentence);
+            if key.is_empty() || summary_key(&combined).contains(&key) {
+                continue;
+            }
+            if combined.is_empty() {
+                combined = sentence;
+            } else {
+                combined.push(' ');
+                combined.push_str(&sentence);
+            }
+        }
+        minutes.summary = combined;
+    }
+    for item in window.agenda {
+        let key = summary_key(&item.heading);
+        if !key.is_empty()
+            && !minutes
+                .agenda
+                .iter()
+                .any(|a| summary_key(&a.heading) == key)
+        {
+            minutes.agenda.push(item);
+        }
+    }
+    for observation in window.visual_observations {
+        if !minutes.visual_observations.contains(&observation) {
+            minutes.visual_observations.push(observation);
+        }
+    }
+    merge_ledger_items(&mut minutes.decisions, window.decisions);
+    merge_ledger_items(&mut minutes.action_items, window.action_items);
+    merge_ledger_items(&mut minutes.unresolved, window.unresolved);
 }
 
 pub fn parse_minutes_json(raw: &str) -> Result<Minutes, BeaError> {
@@ -5413,6 +5629,244 @@ pub async fn call_provider(
     }
 }
 
+/// Clock label (h:mm:ss / mm:ss) for long-meeting window headers.
+fn clock_span(seconds: u64) -> String {
+    let h = seconds / 3600;
+    let m = (seconds % 3600) / 60;
+    let s = seconds % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// Time span covered by a window's evidence, for the part header.
+fn window_span_seconds(window: &[LedgerEvent]) -> (u64, u64) {
+    let start = window
+        .first()
+        .and_then(|e| e.evidence.first())
+        .map(|e| e.start_seconds)
+        .unwrap_or(0);
+    let end = window
+        .last()
+        .and_then(|e| e.evidence.last())
+        .map(|e| e.end_seconds)
+        .unwrap_or(start);
+    (start, end)
+}
+
+/// Sends one window's minutes request; when the provider rejects it (e.g. a
+/// smaller-context model choking on the window), the window is split in half
+/// and each half retried, depth-bounded, so a long meeting still completes.
+/// A half-set where neither side yields anything re-surfaces the original
+/// error instead of returning empty minutes.
+async fn rescued_window_minutes(
+    provider: &ProviderConfig,
+    window_request: &LlmRequest,
+    window: &[LedgerEvent],
+    api_key: Option<&str>,
+    depth: u32,
+) -> Result<Minutes, BeaError> {
+    match call_provider(provider, window_request, api_key).await {
+        Ok(minutes) => Ok(minutes),
+        Err(error) => {
+            if depth >= 4 || window.len() < 2 {
+                return Err(error);
+            }
+            let mid = window.len() / 2;
+            let (left, right) = window.split_at(mid);
+            let mut merged = Minutes::default();
+            for half in [left, right] {
+                let half_request = LlmRequest {
+                    model: window_request.model.clone(),
+                    system: window_request.system.clone(),
+                    user: serde_json::to_string(half)
+                        .map_err(|e| BeaError::InvalidModelOutput(e.to_string()))?,
+                    json_schema: window_request.json_schema.clone(),
+                    max_output_tokens: window_request.max_output_tokens,
+                    reasoning_effort: window_request.reasoning_effort.clone(),
+                };
+                if let Ok(part) = Box::pin(rescued_window_minutes(
+                    provider,
+                    &half_request,
+                    half,
+                    api_key,
+                    depth + 1,
+                ))
+                .await
+                {
+                    merge_window_minutes(&mut merged, part);
+                }
+            }
+            let merged_items =
+                merged.decisions.len() + merged.action_items.len() + merged.unresolved.len();
+            if merged.title.trim().is_empty()
+                && merged.summary.trim().is_empty()
+                && merged_items == 0
+            {
+                return Err(error);
+            }
+            Ok(merged)
+        }
+    }
+}
+
+/// Builds the final reduce request: the model receives the deduplicated draft
+/// (evidence pruned to two quotes per item so the payload stays bounded) and
+/// returns one coherent set of minutes for the WHOLE meeting. The draft's
+/// entry counts are stated explicitly — a reduce pass that silently drops
+/// half the points is the exact "long meetings lose data" failure this path
+/// exists to prevent.
+fn build_reduce_request(base: &LlmRequest, draft: &Minutes, parts: usize) -> LlmRequest {
+    let mut pruned = draft.clone();
+    for item in pruned
+        .decisions
+        .iter_mut()
+        .chain(pruned.action_items.iter_mut())
+        .chain(pruned.unresolved.iter_mut())
+    {
+        item.evidence.truncate(2);
+    }
+    pruned.agenda.truncate(48);
+    let draft_counts = (
+        pruned.decisions.len(),
+        pruned.action_items.len(),
+        pruned.unresolved.len(),
+    );
+    LlmRequest {
+        model: base.model.clone(),
+        system: base.system.clone(),
+        user: format!(
+            "=== DRAFT MINUTES (auto-merged from {parts} consecutive parts of one meeting) ===\n{}\n\nProduce the FINAL minutes for the WHOLE meeting:\n- The draft holds {} decisions, {} action items, and {} unresolved questions. Return AT LEAST one final entry per draft entry — merge two entries ONLY when they state the same point about the same subject; never combine different topics into one entry and never drop an entry to appear concise.\n- Write a short specific title and an executive summary covering the WHOLE meeting (early, middle, and late parts).\n- Keep the complete agenda in discussion order.\n- Keep the strongest evidence quotes with their exact timestamps.",
+            serde_json::to_string(&pruned).unwrap_or_else(|_| "{}".to_string()),
+            draft_counts.0,
+            draft_counts.1,
+            draft_counts.2
+        ),
+        json_schema: base.json_schema.clone(),
+        max_output_tokens: MINUTES_WINDOW_OUTPUT_TOKENS,
+        reasoning_effort: base.reasoning_effort.clone(),
+    }
+}
+
+/// Fills empty fields of the reduced minutes from the draft so a reduce pass
+/// that dropped sections cannot shrink the result below what the windows
+/// actually extracted.
+fn fill_missing_minutes(target: &mut Minutes, fallback: &Minutes) {
+    if target.title.trim().is_empty() {
+        target.title = fallback.title.clone();
+    }
+    if target.summary.trim().is_empty() {
+        target.summary = fallback.summary.clone();
+    }
+    if target.agenda.is_empty() {
+        target.agenda = fallback.agenda.clone();
+    }
+    if target.decisions.is_empty() {
+        target.decisions = fallback.decisions.clone();
+    }
+    if target.action_items.is_empty() {
+        target.action_items = fallback.action_items.clone();
+    }
+    if target.unresolved.is_empty() {
+        target.unresolved = fallback.unresolved.clone();
+    }
+}
+
+/// Minutes generation that covers meetings of ANY length. Events within one
+/// request budget take the normal one-shot path unchanged; longer meetings
+/// are generated map-reduce style — consecutive event windows covering the
+/// whole meeting (map), merged with dedupe, then a final reduce pass that
+/// rewrites the draft into one coherent set of minutes. The old behavior
+/// packed only the first 12k tokens, silently dropping everything after the
+/// first ~20-30 minutes of a 3-hour meeting. Returns the minutes plus the
+/// estimated total input tokens sent (for usage accounting).
+pub async fn call_provider_long_meeting(
+    provider: &ProviderConfig,
+    base: &LlmRequest,
+    events: &[LedgerEvent],
+    api_key: Option<&str>,
+    should_cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<(Minutes, u64), BeaError> {
+    let windows = split_event_windows(events, MINUTES_CONTEXT_BUDGET_TOKENS);
+    let mut estimated_input: u64 = windows
+        .iter()
+        .map(|w| w.iter().map(event_token_cost).sum::<usize>() as u64)
+        .sum();
+    if windows.len() <= 1 {
+        let minutes = call_provider(provider, base, api_key).await?;
+        return Ok((minutes, estimated_input));
+    }
+    let total = windows.len();
+    let mut draft = Minutes::default();
+    let mut last_error: Option<BeaError> = None;
+    for (index, window) in windows.iter().enumerate() {
+        if should_cancel() {
+            return Err(BeaError::InvalidState(
+                "cancelled: minutes generation was closed before it finished".into(),
+            ));
+        }
+        let (start, end) = window_span_seconds(window);
+        let window_request = LlmRequest {
+            model: base.model.clone(),
+            system: format!(
+                "{}\n\n=== LONG MEETING — PART {} OF {} (covers {}) ===\nThis is part {} of {} of one long meeting. Extract ONLY what this part contains: decisions, action items, unresolved questions, and agenda topics, with exact evidence quotes and timestamps from THIS part. Other parts carry the rest of the meeting — do not invent items for them.",
+                base.system,
+                index + 1,
+                total,
+                format!("{}–{}", clock_span(start), clock_span(end)),
+                index + 1,
+                total
+            ),
+            user: serde_json::to_string(window)
+                .map_err(|e| BeaError::InvalidModelOutput(e.to_string()))?,
+            json_schema: base.json_schema.clone(),
+            max_output_tokens: MINUTES_WINDOW_OUTPUT_TOKENS,
+            reasoning_effort: base.reasoning_effort.clone(),
+        };
+        match rescued_window_minutes(provider, &window_request, window, api_key, 0).await {
+            Ok(part) => merge_window_minutes(&mut draft, part),
+            Err(error) => {
+                // One failed part must not sink the whole meeting; if every
+                // part fails, the recorded error is surfaced below.
+                last_error.get_or_insert(error);
+            }
+        }
+    }
+    let draft_items = draft.decisions.len() + draft.action_items.len() + draft.unresolved.len();
+    if draft.title.trim().is_empty() && draft.summary.trim().is_empty() && draft_items == 0 {
+        return Err(last_error.unwrap_or_else(|| {
+            BeaError::InvalidModelOutput("windowed minutes generation produced nothing".into())
+        }));
+    }
+    if should_cancel() {
+        return Err(BeaError::InvalidState(
+            "cancelled: minutes generation was closed before it finished".into(),
+        ));
+    }
+    let reduce_request = build_reduce_request(base, &draft, total);
+    estimated_input += estimate_tokens(&reduce_request.user) as u64;
+    let final_minutes = match call_provider(provider, &reduce_request, api_key).await {
+        Ok(reduced) => {
+            // A reduce pass that drops more than a quarter of the extracted
+            // points is distrusted — the draft (complete, if rougher) is used
+            // instead. Missing data is worse than rougher wording.
+            let reduced_items =
+                reduced.decisions.len() + reduced.action_items.len() + reduced.unresolved.len();
+            if reduced_items * 4 >= draft_items * 3 {
+                let mut reduced = reduced;
+                fill_missing_minutes(&mut reduced, &draft);
+                reduced
+            } else {
+                draft
+            }
+        }
+        Err(_) => draft,
+    };
+    Ok((final_minutes, estimated_input))
+}
+
 /// Like `call_provider` but returns the assistant's free-text reply instead of
 /// parsing minutes JSON. Used by the meeting chat.
 pub async fn call_provider_text(
@@ -6906,6 +7360,179 @@ mod tests {
         assert!(parse_minutes_json("Sorry, I cannot output JSON today.").is_err());
         assert!(parse_minutes_json("not json at all").is_err());
     }
+
+    // ---- long-meeting windowing (map-reduce minutes) ----
+
+    fn window_test_event(summary: &str, quote_chars: usize, start: u64) -> LedgerEvent {
+        LedgerEvent {
+            kind: "decision".into(),
+            summary: summary.to_string(),
+            owner: None,
+            due: None,
+            confidence: 0.8,
+            evidence: vec![Evidence {
+                start_seconds: start,
+                end_seconds: start + 30,
+                quote: "q".repeat(quote_chars),
+                title: summary.to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn split_event_windows_covers_every_event_exactly_once() {
+        // ~250 tokens per event → a 4k budget forces several windows.
+        let events: Vec<LedgerEvent> = (0..100)
+            .map(|i| window_test_event(&format!("Point {i} about the budget review"), 900, i * 120))
+            .collect();
+        let windows = split_event_windows(&events, 4_000);
+        assert!(windows.len() > 1, "expected multiple windows");
+        let flattened: Vec<String> = windows
+            .iter()
+            .flatten()
+            .map(|event| event.summary.clone())
+            .collect();
+        let expected: Vec<String> = events.iter().map(|e| e.summary.clone()).collect();
+        assert_eq!(flattened, expected, "every event must land in one window");
+        for window in &windows {
+            let cost: usize = window.iter().map(event_token_cost).sum();
+            assert!(
+                cost <= 4_000 || window.len() == 1,
+                "window over budget must be a single oversized event, got {} events / {} tokens",
+                window.len(),
+                cost
+            );
+        }
+    }
+
+    #[test]
+    fn split_event_windows_keeps_a_single_oversized_event_whole() {
+        let huge = window_test_event("one gigantic point", 40_000, 0);
+        let windows =
+            split_event_windows(&[huge.clone(), window_test_event("small", 10, 60)], 1_000);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0][0].summary, huge.summary);
+        assert_eq!(windows[1][0].summary, "small");
+    }
+
+    #[test]
+    fn merge_ledger_items_dedupes_repeated_decisions_and_unions_evidence() {
+        let mut target = vec![LedgerEvent {
+            kind: "decision".into(),
+            summary: "Ship the beta build on Friday.".into(),
+            owner: None,
+            due: None,
+            confidence: 0.8,
+            evidence: vec![Evidence {
+                start_seconds: 10,
+                end_seconds: 20,
+                quote: "we ship friday".into(),
+                title: String::new(),
+            }],
+        }];
+        // Same point restated in a later window: different case/punctuation,
+        // evidence from another timestamp.
+        merge_ledger_items(
+            &mut target,
+            vec![LedgerEvent {
+                kind: "decision".into(),
+                summary: "ship  the BETA build on Friday".into(),
+                owner: Some("Maria".into()),
+                due: None,
+                confidence: 0.9,
+                evidence: vec![Evidence {
+                    start_seconds: 5_400,
+                    end_seconds: 5_420,
+                    quote: "confirmed the friday ship".into(),
+                    title: String::new(),
+                }],
+            }],
+        );
+        assert_eq!(target.len(), 1, "duplicate must collapse into one entry");
+        assert_eq!(
+            target[0].evidence.len(),
+            2,
+            "evidence unions across windows"
+        );
+        assert_eq!(target[0].confidence, 0.9, "higher confidence wins");
+        assert_eq!(
+            target[0].owner.as_deref(),
+            Some("Maria"),
+            "missing owner is filled"
+        );
+    }
+
+    #[test]
+    fn merge_window_minutes_keeps_distinct_points_from_every_part() {
+        let mut minutes = Minutes::default();
+        merge_window_minutes(
+            &mut minutes,
+            Minutes {
+                title: "Policy Review".into(),
+                summary: "The board confirmed the trim schedule.".into(),
+                agenda: vec![AgendaItem {
+                    heading: "Trimester policy".into(),
+                    start_seconds: Some(0),
+                    end_seconds: None,
+                }],
+                visual_observations: vec![],
+                decisions: vec![window_test_event("Decision one", 10, 0)],
+                action_items: vec![window_test_event("Action one", 10, 60)],
+                unresolved: vec![],
+            },
+        );
+        merge_window_minutes(
+            &mut minutes,
+            Minutes {
+                title: "Policy Review (part 2)".into(), // first title wins
+                summary: "Part two covered faculty loading. The board confirmed the trim schedule."
+                    .into(),
+                agenda: vec![
+                    AgendaItem {
+                        heading: "Trimester policy".into(), // duplicate heading
+                        start_seconds: Some(3_600),
+                        end_seconds: None,
+                    },
+                    AgendaItem {
+                        heading: "Faculty loading".into(),
+                        start_seconds: Some(3_600),
+                        end_seconds: None,
+                    },
+                ],
+                visual_observations: vec!["Slide at 4000s shows the load table".into()],
+                decisions: vec![
+                    window_test_event("decision one ", 10, 0), // duplicate
+                    window_test_event("Decision two", 10, 3_700),
+                ],
+                action_items: vec![],
+                unresolved: vec![window_test_event("Still pending the CHED reply", 10, 3_800)],
+            },
+        );
+        assert_eq!(minutes.title, "Policy Review");
+        assert_eq!(
+            minutes.decisions.len(),
+            2,
+            "duplicate dropped, distinct kept"
+        );
+        assert_eq!(minutes.action_items.len(), 1);
+        assert_eq!(minutes.unresolved.len(), 1, "part-two unresolved survives");
+        assert_eq!(
+            minutes.agenda.len(),
+            2,
+            "agenda appends in order without duplicates"
+        );
+        assert_eq!(minutes.agenda[1].heading, "Faculty loading");
+        // Summary gains the part-two sentence but not the repeated one.
+        assert!(minutes.summary.contains("faculty loading"));
+        assert_eq!(minutes.summary.matches("trim schedule").count(), 1);
+    }
+
+    #[test]
+    fn window_clock_labels_render_hh_mm_ss() {
+        assert_eq!(super::clock_span(86), "1:26");
+        assert_eq!(super::clock_span(4_500), "1:15:00");
+        assert_eq!(super::clock_span(10_960), "3:02:40");
+    }
     #[test]
     fn failed_minutes_error_attaches_reply_snippet() {
         let error = BeaError::InvalidModelOutput(
@@ -7985,6 +8612,25 @@ mod tests {
         assert!(!turbo_supported_with(4, 4 * 1024 * 1024 * 1024));
         assert!(turbo_supported_with(4, 8 * 1024 * 1024 * 1024));
         assert!(!turbo_supported_with(8, 7 * 1024 * 1024 * 1024 + 1));
+    }
+
+    #[test]
+    fn turbo_sessions_scale_with_cores_within_ram_budget() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // Hardware below the turbo gate stays single-session.
+        assert_eq!(turbo_session_count_with(2, 32 * GIB), 1);
+        assert_eq!(turbo_session_count_with(4, 7 * GIB), 1);
+        // Legacy floor: a 4-core machine still gets the historical two sessions.
+        assert_eq!(turbo_session_count_with(4, 8 * GIB), 2);
+        assert_eq!(turbo_session_count_with(8, 16 * GIB), 2);
+        // Many-core machines scale up, capped at 6 sessions.
+        assert_eq!(turbo_session_count_with(12, 16 * GIB), 3);
+        assert_eq!(turbo_session_count_with(16, 32 * GIB), 4);
+        assert_eq!(turbo_session_count_with(28, 32 * GIB), 6);
+        assert_eq!(turbo_session_count_with(64, 64 * GIB), 6);
+        // RAM binds before cores on small-memory machines: 8 GB keeps 4 GB
+        // headroom, leaving room for ~3 model instances.
+        assert_eq!(turbo_session_count_with(28, 8 * GIB), 3);
     }
 
     #[test]
