@@ -7,22 +7,32 @@ export const LOCAL_PRESETS: { id: LocalServerPreset; label: string; base_url: st
 ];
 
 /// Shared dropdown options so Setup and Settings render the identical picker.
+/// ChatGPT sign-in leads because it is the default on a fresh workspace: it
+/// needs no API key, so setup finishes with a browser login and nothing else.
 export const PROVIDER_KIND_OPTIONS: Array<{ value: ProviderKind; label: string }> = [
+  { value: 'OpenAiOAuth', label: 'OpenAI (ChatGPT sign-in) · default' },
   { value: 'OpenRouter', label: 'OpenRouter' },
   { value: 'OpenAiCompatible', label: 'OpenAI-compatible' },
   { value: 'ClaudeCompatible', label: 'Claude-compatible proxy' },
   { value: 'Local', label: 'Local server (LM Studio / Ollama / llama.cpp)' },
-  { value: 'OpenAiOAuth', label: 'OpenAI (ChatGPT sign-in)' },
 ];
+
+/// The kind a workspace starts on before anyone touches the picker.
+export const DEFAULT_PROVIDER_KIND: ProviderKind = 'OpenAiOAuth';
 
 /// Kind-switch contract used by Setup and Settings alike: reset the base URL
 /// for the new kind and prefill a valid Codex minutes model (the ChatGPT
 /// picker otherwise renders its first option while the state stays empty).
+/// Leaving the OAuth kind clears a Codex slug: no other provider serves those
+/// ids, so carrying one forward would only fail the connection test.
 export const withProviderKind = (provider: ProviderConfig, kind: ProviderKind): ProviderConfig => ({
   ...provider,
   kind,
   base_url: DEFAULT_BASE_URLS[kind] ?? '',
-  model: kind === 'OpenAiOAuth' && !provider.model ? CODEX_FALLBACK_MODELS[0] : provider.model,
+  model: kind === 'OpenAiOAuth'
+    ? provider.model || CODEX_FALLBACK_MODELS[0]
+    : provider.kind === 'OpenAiOAuth' && CODEX_FALLBACK_MODELS.includes(provider.model) ? ''
+    : provider.model,
 });
 
 export const DEFAULT_BASE_URLS: Record<ProviderKind, string> = {

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CODEX_FALLBACK_MODELS,
   DEFAULT_BASE_URLS,
+  DEFAULT_PROVIDER_KIND,
   LOCAL_PRESETS,
   PROVIDER_KIND_OPTIONS,
   codexModelOptionsOrFallback,
@@ -42,6 +43,19 @@ describe('withProviderKind', () => {
   });
   it('preserves an existing model when switching kinds', () => {
     expect(withProviderKind(base, 'OpenAiCompatible').model).toBe(base.model);
+  });
+  it('clears a Codex slug when leaving ChatGPT sign-in', () => {
+    // No other provider serves these ids, so carrying one over would leave a
+    // model the connection test can only reject.
+    const oauth: ProviderConfig = { ...base, kind: 'OpenAiOAuth', model: CODEX_FALLBACK_MODELS[0] };
+    expect(withProviderKind(oauth, 'OpenRouter').model).toBe('');
+  });
+});
+
+describe('DEFAULT_PROVIDER_KIND', () => {
+  it('starts a new workspace on ChatGPT sign-in, listed first', () => {
+    expect(DEFAULT_PROVIDER_KIND).toBe('OpenAiOAuth');
+    expect(PROVIDER_KIND_OPTIONS[0].value).toBe('OpenAiOAuth');
   });
 });
 

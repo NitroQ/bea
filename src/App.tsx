@@ -4,7 +4,7 @@ import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import type { AsrEngineDescriptor, AsrEngineId, Meeting, Minutes, OpenRouterModelInfo, ProviderConfig, RuntimeAvailability, SetupStatus, TranscriptLanguage, TranscriptSegment } from './types';
 import { REASONING_EFFORTS } from './types';
-import { CODEX_FALLBACK_MODELS, LOCAL_PRESETS, PROVIDER_KIND_OPTIONS, providerPersistsImmediately, withProviderKind } from './providerPresets';
+import { CODEX_FALLBACK_MODELS, DEFAULT_BASE_URLS, DEFAULT_PROVIDER_KIND, LOCAL_PRESETS, PROVIDER_KIND_OPTIONS, providerPersistsImmediately, withProviderKind } from './providerPresets';
 import { loadMeetings, saveMeetings } from './meetingStore';
 import SetupFlow, { type EngineProgress } from './SetupFlow';
 import Library from './Library';
@@ -17,7 +17,9 @@ import BeaAvatar from './BeaAvatar';
 import { UpdateSettingsSection } from './UpdateSettings';
 import './styles.css';
 
-const initialProvider: ProviderConfig = { id: 'primary', kind: 'OpenRouter', base_url: 'https://openrouter.ai/api/v1', model: '', credential_ref: null, enabled: false, reasoning_effort: 'off' };
+// ChatGPT sign-in is the landing option: no key to paste, so the first run
+// only needs a browser login. Switching to another kind is one dropdown away.
+const initialProvider: ProviderConfig = { id: 'primary', kind: DEFAULT_PROVIDER_KIND, base_url: DEFAULT_BASE_URLS[DEFAULT_PROVIDER_KIND], model: CODEX_FALLBACK_MODELS[0], credential_ref: null, enabled: false, reasoning_effort: 'off' };
 export const initialEngines: AsrEngineDescriptor[] = [
   { id: 'whisper-compatibility', name: 'Bea Standard · Whisper', description: 'Broad language coverage and reliable Taglish transcription. Largest RAM footprint — Qwen ASR uses roughly half.', languages: '99 languages · EN · FIL · Taglish', size: 'Turbo · 1.6 GB', status: 'missing', recommended: true, detail: 'sherpa-onnx · local' },
   { id: 'qwen-standard', name: 'Qwen ASR', description: 'Fast local transcription for English, Filipino, and Taglish.', languages: 'EN · FIL · Taglish', size: '0.6B · 1.2 GB', status: 'missing', detail: 'sherpa-onnx · INT8' },

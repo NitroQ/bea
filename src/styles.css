@@ -97,10 +97,15 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .setup-row-state { justify-items: start; }
 .setup-note { display: flex; gap: 10px; align-items: flex-start; margin-top: 28px; padding: 13px 15px; border: 1px solid var(--line-soft); border-radius: var(--radius); color: var(--muted); font-size: 11px; line-height: 1.5; }
 .setup-note svg { flex: 0 0 auto; color: var(--teal); margin-top: 1px; }
-.engine-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 42px; }
+.engine-picker-heading { display: flex; justify-content: space-between; align-items: end; margin-top: 42px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.engine-picker-heading h2 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
+.engine-picker-heading p { margin: 0; color: var(--quiet); font-size: 11px; }
+.engine-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 18px; }
 .engine-card { position: relative; min-height: 215px; display: flex; flex-direction: column; align-items: flex-start; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); color: var(--text); background: var(--surface); text-align: left; transition: border .16s ease, background .16s ease; }
 .engine-card:hover, .engine-card.selected { border-color: #5bd0acaa; background: #1a2b2c; }
 .engine-card-top { display: flex; align-items: center; gap: 7px; width: 100%; }
+.engine-radio { display: grid; place-items: center; width: 15px; height: 15px; flex: 0 0 auto; border: 1px solid var(--line); border-radius: 50%; color: #0b1516; }
+.engine-card.selected .engine-radio { border-color: var(--teal-strong); background: var(--teal); }
 .engine-icon { display: grid; place-items: center; width: 27px; height: 27px; color: var(--teal); background: #84e2c514; border-radius: 7px; }
 .engine-card .state-label { margin-left: auto; }
 .engine-card strong { margin-top: 22px; font-size: 13px; font-weight: 600; }
@@ -109,7 +114,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .engine-card-bottom { display: flex; justify-content: space-between; align-items: center; width: 100%; margin-top: 15px; padding-top: 11px; border-top: 1px solid var(--line-soft); color: var(--quiet); font-size: 10px; }
 .engine-card-bottom .text-button { margin-left: auto; }
 .engine-recommended { color: var(--teal); font-size: 9px; letter-spacing: .04em; }
-.engine-selected { position: absolute; top: 13px; right: 13px; color: var(--teal); }
+.engine-selected { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; color: var(--teal); font-weight: 600; }
+.engine-pick-hint { margin-left: auto; color: var(--quiet); }
 .engine-card.busy { cursor: progress; }
 .engine-card.busy .engine-icon svg { animation: engine-spin 1.1s linear infinite; }
 @keyframes engine-spin { to { transform: rotate(360deg); } }
