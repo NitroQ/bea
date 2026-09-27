@@ -7,7 +7,8 @@ your click on the in-app banner ("Install & restart").
 
 ## How it works
 
-1. Pushing tag `vX.Y` (e.g. `v1.0`) triggers `.github/workflows/release.yml`.
+1. Pushing tag `vX.Y.Z` (e.g. `v1.0.3`) triggers
+   `.github/workflows/release.yml`.
 2. CI builds the frontend, builds + **signs** the NSIS/MSI bundles with
    `TAURI_SIGNING_PRIVATE_KEY` (GitHub Secret), generates `latest.json` via
    `scripts/latest-json.mjs`, and attaches everything to the release.
@@ -21,36 +22,38 @@ your click on the in-app banner ("Install & restart").
 
 ```bash
 # 1. Bump version in package.json AND src-tauri/tauri.conf.json AND
-#    src-tauri/Cargo.toml (keep all three identical, X.Y.Z).
-#    Tag vX.Y maps to app version X.Y.0.
+#    src-tauri/Cargo.toml (keep all three identical, X.Y.Z). The tag is the
+#    version with a `v` prefix.
 # 2. Commit the bump, then:
-git tag v1.1
-git push origin master v1.1
+git tag v1.1.0
+git push origin master v1.1.0
 # 3. Watch Actions → release. When green, the release page has:
 #    latest.json, Bea_1.1.0_x64-setup.exe(.sig), Bea_1.1.0_x64_en-US.msi
 ```
 
 ## Versioning rules
 
-- Tags are **two digits only**: `v1.0`, `v1.1`. Three-component tags
-  (`v1.0.1`) are rejected by both the workflow trigger and
-  `scripts/latest-json.mjs`. Need a hotfix? Ship `v1.1` (or widen the tag
-  regex later).
-- Internal versions must stay `X.Y.Z` (Cargo/npm semver) — `X.Y` tags map to
-  `X.Y.0`.
+- Tags are **three components**, matching the internal version: `v1.0.0`,
+  `v0.3.4`. Two-component tags (`v1.0`) are rejected by both the workflow
+  trigger and `scripts/latest-json.mjs`.
 - `src/version.test.ts` fails the suite if `package.json` and
   `tauri.conf.json` drift apart.
+- `scripts/latest-json.mjs <tag>` takes the full `vX.Y.Z` tag and writes that
+  version verbatim into `latest.json` — the updater compares it against the
+  running app, so a truncated version would silently hide the release.
 
 ## Security
 
 - Bundles are minisign-verified; unsigned or tampered downloads are refused.
 - The update endpoint is pinned (HTTPS, this repo only).
-- The signing private key lives in `~/.tauri/bea.key` (never committed) and in
-  the repo's GitHub Secrets (`TAURI_SIGNING_PRIVATE_KEY`,
+- The signing private key lives in `~/.tauri/bea-0.3.1.key` (never committed)
+  and in the repo's GitHub Secrets (`TAURI_SIGNING_PRIVATE_KEY`,
   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — empty since the key has no password).
-- **Back up `~/.tauri/bea.key` somewhere safe.** Losing it means users can't
-  verify any future update; you'd have to ship a new pubkey, which requires a
-  one-time manual install.
+  The old `~/.tauri/bea.key` is stale; v0.3.2 rotated the key and the pubkey in
+  `tauri.conf.json` is the new one.
+- **Back up `~/.tauri/bea-0.3.1.key` somewhere safe.** Losing it means users
+  can't verify any future update; you'd have to ship a new pubkey, which
+  requires a one-time manual install.
 
 ## Rollback
 

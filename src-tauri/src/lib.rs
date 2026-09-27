@@ -96,7 +96,12 @@ pub fn process_memory_snapshot() -> ProcessMemorySnapshot {
     }
 
     let bea_mb = working_set_of(unsafe { GetCurrentProcess() }).unwrap_or(0) / (1024 * 1024);
-    let watched = ["ffmpeg.exe", "ffprobe.exe", "tesseract.exe", "msedgewebview2.exe"];
+    let watched = [
+        "ffmpeg.exe",
+        "ffprobe.exe",
+        "tesseract.exe",
+        "msedgewebview2.exe",
+    ];
     let mut helper_processes: Vec<(String, u64)> = Vec::new();
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -938,33 +943,33 @@ impl Qwen3AsrEngine {
         let config = OfflineRecognizerConfig {
             model_config: OfflineModelConfig {
                 qwen3_asr: OfflineQwen3ASRModelConfig {
-                conv_frontend: Some(required[0].to_string_lossy().into_owned()),
-                encoder: Some(required[1].to_string_lossy().into_owned()),
-                decoder: Some(required[2].to_string_lossy().into_owned()),
-                tokenizer: Some(required[3].to_string_lossy().into_owned()),
-                // The KV budget must cover the prompt scaffold (~50 tokens), one audio
-                // token per ~0.5s of audio, and the generated text (max 512).
-                // sherpa's 512 default truncates a 60-second chunk down to a
-                // fraction of a second — the transcript then collapses to
-                // scaffold text like "language". Chunks are fixed at 28 s
-                // (≈ 56 audio tokens), so 50 + 56 + 512 ≈ 620: 1024 covers the
-                // worst case with headroom while halving the KV cache RAM.
-                // Revisit if chunk_seconds ever changes.
-                max_total_len: 1024,
-                max_new_tokens: 512,
-                temperature: 1e-6,
-                top_p: 0.8,
-                seed: 42,
-                hotwords: None,
+                    conv_frontend: Some(required[0].to_string_lossy().into_owned()),
+                    encoder: Some(required[1].to_string_lossy().into_owned()),
+                    decoder: Some(required[2].to_string_lossy().into_owned()),
+                    tokenizer: Some(required[3].to_string_lossy().into_owned()),
+                    // The KV budget must cover the prompt scaffold (~50 tokens), one audio
+                    // token per ~0.5s of audio, and the generated text (max 512).
+                    // sherpa's 512 default truncates a 60-second chunk down to a
+                    // fraction of a second — the transcript then collapses to
+                    // scaffold text like "language". Chunks are fixed at 28 s
+                    // (≈ 56 audio tokens), so 50 + 56 + 512 ≈ 620: 1024 covers the
+                    // worst case with headroom while halving the KV cache RAM.
+                    // Revisit if chunk_seconds ever changes.
+                    max_total_len: 1024,
+                    max_new_tokens: 512,
+                    temperature: 1e-6,
+                    top_p: 0.8,
+                    seed: 42,
+                    hotwords: None,
+                },
+                num_threads: match device {
+                    AsrDevice::Cpu => asr_thread_count() as i32,
+                    AsrDevice::DirectML => gpu_assist_thread_count() as i32,
+                },
+                provider: Some(device.provider_string().into()),
+                ..OfflineModelConfig::default()
             },
-            num_threads: match device {
-                AsrDevice::Cpu => asr_thread_count() as i32,
-                AsrDevice::DirectML => gpu_assist_thread_count() as i32,
-            },
-            provider: Some(device.provider_string().into()),
-            ..OfflineModelConfig::default()
-        },
-        ..OfflineRecognizerConfig::default()
+            ..OfflineRecognizerConfig::default()
         };
         let recognizer = match OfflineRecognizer::create(&config) {
             Some(recognizer) => recognizer,
@@ -1098,10 +1103,7 @@ fn is_degenerate_asr_text(raw: &str, language: &TranscriptLanguage) -> Option<&'
                 continue;
             }
             let pattern = &words[..span];
-            let repeats = words
-                .chunks(span)
-                .filter(|chunk| *chunk == pattern)
-                .count();
+            let repeats = words.chunks(span).filter(|chunk| *chunk == pattern).count();
             if repeats * span >= 6 && repeats * span * 10 >= words.len() * 9 {
                 return Some("repetition-loop");
             }
@@ -1257,23 +1259,23 @@ impl WhisperCompatibilityEngine {
         let config = OfflineRecognizerConfig {
             model_config: OfflineModelConfig {
                 whisper: OfflineWhisperModelConfig {
-                encoder: Some(encoder.to_string_lossy().into_owned()),
-                decoder: Some(decoder.to_string_lossy().into_owned()),
-                language: None,
-                task: Some("transcribe".into()),
-                tail_paddings: 8000,
-                enable_token_timestamps: false,
-                enable_segment_timestamps: true,
+                    encoder: Some(encoder.to_string_lossy().into_owned()),
+                    decoder: Some(decoder.to_string_lossy().into_owned()),
+                    language: None,
+                    task: Some("transcribe".into()),
+                    tail_paddings: 8000,
+                    enable_token_timestamps: false,
+                    enable_segment_timestamps: true,
+                },
+                tokens: Some(tokens.to_string_lossy().into_owned()),
+                num_threads: match device {
+                    AsrDevice::Cpu => asr_thread_count() as i32,
+                    AsrDevice::DirectML => gpu_assist_thread_count() as i32,
+                },
+                provider: Some(device.provider_string().into()),
+                ..OfflineModelConfig::default()
             },
-            tokens: Some(tokens.to_string_lossy().into_owned()),
-            num_threads: match device {
-                AsrDevice::Cpu => asr_thread_count() as i32,
-                AsrDevice::DirectML => gpu_assist_thread_count() as i32,
-            },
-            provider: Some(device.provider_string().into()),
-            ..OfflineModelConfig::default()
-        },
-        ..OfflineRecognizerConfig::default()
+            ..OfflineRecognizerConfig::default()
         };
         let recognizer = match OfflineRecognizer::create(&config) {
             Some(recognizer) => recognizer,
@@ -1824,9 +1826,7 @@ pub fn transcribe_chunks_with_progress<E: AsrEngine + Clone + Send + 'static>(
 /// `Sync`). Out-of-order completion is fine — segments carry their own
 /// timestamps. Any chunk error fails the job loudly (same contract as the
 /// sequential path); resume markers let a later run skip finished chunks.
-pub fn transcribe_chunks_multi_engine_with_progress<
-    E: AsrEngine + Clone + Send + 'static,
->(
+pub fn transcribe_chunks_multi_engine_with_progress<E: AsrEngine + Clone + Send + 'static>(
     conn: &Connection,
     meeting_id: &str,
     chunks: &[AudioChunkInput],
@@ -1836,9 +1836,14 @@ pub fn transcribe_chunks_multi_engine_with_progress<
 ) -> Result<Vec<TranscriptSegment>, BeaError> {
     if engines.len() <= 1 {
         return match engines.into_iter().next() {
-            Some(engine) => {
-                transcribe_chunks_with_progress(conn, meeting_id, chunks, language, engine, on_progress)
-            }
+            Some(engine) => transcribe_chunks_with_progress(
+                conn,
+                meeting_id,
+                chunks,
+                language,
+                engine,
+                on_progress,
+            ),
             None => Ok(Vec::new()),
         };
     }
@@ -1852,7 +1857,8 @@ pub fn transcribe_chunks_multi_engine_with_progress<
     let queue = Arc::new(Mutex::new(VecDeque::from_iter(0..total)));
     let stop = Arc::new(AtomicBool::new(false));
     let owned_chunks = Arc::new(chunks.to_vec());
-    let (outcome_tx, outcome_rx) = std::sync::mpsc::channel::<(usize, Result<ChunkOutcome, BeaError>)>();
+    let (outcome_tx, outcome_rx) =
+        std::sync::mpsc::channel::<(usize, Result<ChunkOutcome, BeaError>)>();
 
     for engine in engines {
         let queue = Arc::clone(&queue);
@@ -1899,9 +1905,9 @@ pub fn transcribe_chunks_multi_engine_with_progress<
     let mut segments = Vec::with_capacity(total);
     let mut completed = 0usize;
     for _ in 0..total {
-        let (index, outcome) = outcome_rx
-            .recv()
-            .map_err(|_| BeaError::MediaProcessing("ASR decode workers died unexpectedly".into()))?;
+        let (index, outcome) = outcome_rx.recv().map_err(|_| {
+            BeaError::MediaProcessing("ASR decode workers died unexpectedly".into())
+        })?;
         let chunk = &chunks[index];
         let segment = match outcome {
             Ok(outcome) => persist_chunk_outcome(conn, meeting_id, chunk, outcome)?,
@@ -2261,16 +2267,22 @@ pub struct AudioInputDevice {
     pub kind: &'static str,
 }
 
-fn enumerate_input_devices(host: &cpal::Host, capture: bool, prefix: &str) -> Vec<AudioInputDevice> {
+fn enumerate_input_devices(
+    host: &cpal::Host,
+    capture: bool,
+    prefix: &str,
+) -> Vec<AudioInputDevice> {
     let iterator = if capture {
         host.input_devices()
     } else {
         host.output_devices()
     };
     let default_name = if capture {
-        host.default_input_device().and_then(|device| device.name().ok())
+        host.default_input_device()
+            .and_then(|device| device.name().ok())
     } else {
-        host.default_output_device().and_then(|device| device.name().ok())
+        host.default_output_device()
+            .and_then(|device| device.name().ok())
     };
     let Ok(iterator) = iterator else {
         return Vec::new();
@@ -2304,12 +2316,14 @@ pub fn list_audio_input_devices() -> Result<Vec<AudioInputDevice>, BeaError> {
 /// Resolves a device id produced by `list_audio_input_devices` ("input-N" or
 /// "output-N") back to a concrete cpal device. `None` yields the default
 /// microphone, keeping the pre-device-picker behaviour.
-pub fn resolve_audio_device(device_id: Option<&str>) -> Result<(cpal::Device, &'static str), BeaError> {
+pub fn resolve_audio_device(
+    device_id: Option<&str>,
+) -> Result<(cpal::Device, &'static str), BeaError> {
     let host = cpal::default_host();
     let Some(device_id) = device_id else {
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| BeaError::MediaProcessing("no default microphone is available".into()))?;
+        let device = host.default_input_device().ok_or_else(|| {
+            BeaError::MediaProcessing("no default microphone is available".into())
+        })?;
         return Ok((device, "mic"));
     };
     let (kind, index_text) = device_id
@@ -2321,7 +2335,11 @@ pub fn resolve_audio_device(device_id: Option<&str>) -> Result<(cpal::Device, &'
     let capture = match kind {
         "input" => true,
         "output" => false,
-        _ => return Err(BeaError::MediaProcessing(format!("unknown device id {device_id}"))),
+        _ => {
+            return Err(BeaError::MediaProcessing(format!(
+                "unknown device id {device_id}"
+            )))
+        }
     };
     let mut iterator = if capture {
         host.input_devices()
@@ -2329,9 +2347,9 @@ pub fn resolve_audio_device(device_id: Option<&str>) -> Result<(cpal::Device, &'
         host.output_devices()
     }
     .map_err(|error| BeaError::MediaProcessing(error.to_string()))?;
-    let device = iterator
-        .nth(index)
-        .ok_or_else(|| BeaError::MediaProcessing(format!("device {device_id} is no longer available")))?;
+    let device = iterator.nth(index).ok_or_else(|| {
+        BeaError::MediaProcessing(format!("device {device_id} is no longer available"))
+    })?;
     Ok((device, if capture { "mic" } else { "output" }))
 }
 
@@ -2424,12 +2442,19 @@ impl AudioMixer {
             return Vec::new();
         }
         // 1. Convert to master rate/channels as i16.
-        let converted = convert_to_master(samples, src_rate, src_channels, self.master_rate, self.master_channels);
+        let converted = convert_to_master(
+            samples,
+            src_rate,
+            src_channels,
+            self.master_rate,
+            self.master_channels,
+        );
         if converted.is_empty() {
             return Vec::new();
         }
         // 2. Position of this batch's first master frame.
-        let target = source_frames * self.master_rate as u64 / src_rate as u64 * self.master_channels as u64;
+        let target =
+            source_frames * self.master_rate as u64 / src_rate as u64 * self.master_channels as u64;
         if target + converted.len() as u64 <= self.buffer_start {
             // Older than everything we already flushed — drop.
             return Vec::new();
@@ -2800,7 +2825,10 @@ pub fn prepare_imported_media_chunks<P: MediaPipeline>(
     pipeline: &P,
 ) -> Result<Vec<AudioChunkInput>, BeaError> {
     let cached = output_dir.join("audio.wav");
-    let cached_duration = cached.is_file().then(|| wav_duration_seconds(&cached)).flatten();
+    let cached_duration = cached
+        .is_file()
+        .then(|| wav_duration_seconds(&cached))
+        .flatten();
     let cached_usable = match cached_duration {
         Some(seconds) if seconds > 0 => pipeline
             .probe(input)
@@ -2824,7 +2852,10 @@ pub fn prepare_imported_media_chunks<P: MediaPipeline>(
                 }
                 MediaKind::Video => {
                     let analysis = analyze_video(pipeline, input, output_dir, 5)?;
-                    (analysis.metadata.duration_seconds.max(1), analysis.audio_path)
+                    (
+                        analysis.metadata.duration_seconds.max(1),
+                        analysis.audio_path,
+                    )
                 }
             };
             (metadata, audio_path)
@@ -2850,11 +2881,7 @@ pub fn prepare_imported_media_chunks<P: MediaPipeline>(
     let grid_entry = |index: u64| {
         let start = index * chunk_seconds;
         let end = (start + chunk_seconds).min(total_seconds);
-        (
-            chunks_dir.join(format!("chunk-{index:04}.wav")),
-            start,
-            end,
-        )
+        (chunks_dir.join(format!("chunk-{index:04}.wav")), start, end)
     };
     let grid_complete = (0..chunk_count).all(|index| {
         let (path, start, end) = grid_entry(index);
@@ -3094,6 +3121,11 @@ pub fn open_database(path: impl AsRef<Path>) -> Result<Connection, BeaError> {
             return Err(BeaError::Database(error));
         }
     }
+    // Known context window per model, learned from the provider catalog (or
+    // entered by hand for a local server). Prompt budgets are derived from
+    // this instead of a constant, so a 4k local model and a 1.3M-context model
+    // each get a prompt they can actually accept.
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS model_context_windows (model TEXT PRIMARY KEY, context_tokens INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'catalog', updated_at TEXT NOT NULL);")?;
     Ok(conn)
 }
 
@@ -3198,10 +3230,7 @@ pub fn mark_meeting_failed(
 }
 
 /// Clears the failure reason once a later run succeeds.
-pub fn clear_meeting_last_error(
-    conn: &Connection,
-    meeting_id: &str,
-) -> Result<(), BeaError> {
+pub fn clear_meeting_last_error(conn: &Connection, meeting_id: &str) -> Result<(), BeaError> {
     conn.execute(
         "UPDATE meetings SET last_error=NULL WHERE id=?1",
         params![meeting_id],
@@ -3438,12 +3467,11 @@ pub fn list_done_chunks(conn: &Connection, meeting_id: &str) -> Result<Vec<(u64,
 
 /// Count of already-decoded chunks; drives the Resume button's visibility.
 pub fn count_done_chunks(conn: &Connection, meeting_id: &str) -> Result<usize, BeaError> {
-    Ok(conn
-        .query_row(
-            "SELECT COUNT(*) FROM transcription_progress WHERE meeting_id=?1",
-            params![meeting_id],
-            |row| row.get::<_, i64>(0),
-        )? as usize)
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM transcription_progress WHERE meeting_id=?1",
+        params![meeting_id],
+        |row| row.get::<_, i64>(0),
+    )? as usize)
 }
 
 /// Removes all completion markers for a meeting (full re-transcription).
@@ -3495,16 +3523,22 @@ pub fn delete_transcript_segments(
         .join(",");
     let ids: Vec<String> = segment_ids.iter().map(|id| id.to_string()).collect();
     let deleted = conn.execute(
-        &format!(
-            "DELETE FROM transcript_segments WHERE meeting_id=?1 AND id IN ({placeholders})"
+        &format!("DELETE FROM transcript_segments WHERE meeting_id=?1 AND id IN ({placeholders})"),
+        params_from_iter(
+            std::iter::once(meeting_id.to_string())
+                .into_iter()
+                .chain(ids.clone()),
         ),
-        params_from_iter(std::iter::once(meeting_id.to_string()).into_iter().chain(ids.clone())),
     )?;
     conn.execute(
         &format!(
             "DELETE FROM transcript_fts WHERE meeting_id=?1 AND segment_id IN ({placeholders})"
         ),
-        params_from_iter(std::iter::once(meeting_id.to_string()).into_iter().chain(ids)),
+        params_from_iter(
+            std::iter::once(meeting_id.to_string())
+                .into_iter()
+                .chain(ids),
+        ),
     )?;
     Ok(deleted)
 }
@@ -3719,6 +3753,166 @@ pub fn pack_context(events: &[LedgerEvent], budget: usize) -> Vec<LedgerEvent> {
 
 pub fn estimate_tokens(text: &str) -> usize {
     text.chars().count().div_ceil(4)
+}
+
+/// Context window assumed for an unknown *hosted* model. Deliberately small: an
+/// unknown model is more likely to be a tight deployment that rejects a 128k
+/// prompt than a hosted model that would merely be under-used.
+pub const DEFAULT_CONTEXT_TOKENS: usize = 32_000;
+
+/// Context window assumed for an unknown *local* server. Ollama, LM Studio and
+/// llama.cpp all publish model ids but never the `num_ctx` the server was
+/// launched with, so the small end is the only safe assumption; the user raises
+/// it in Settings when they know the server was started with a larger window.
+pub const DEFAULT_LOCAL_CONTEXT_TOKENS: usize = 8_000;
+
+/// Floor applied to a *declared* window. A real 4k model (llama-2, small 4-bit
+/// quant builds) must be allowed to say so — inflating it to 8k would push the
+/// prompt straight past what the server accepts. The floor only exists to stop
+/// a nonsensical report (0, 1, a typo) from collapsing the prompt.
+pub const MIN_CONTEXT_TOKENS: usize = 2_048;
+
+/// Sanity ceiling for a *declared* window, not an operational cap.
+///
+/// Real models span 4k to 2M (Gemini 1.5 is 2M, Llama 4 and Gemini 2.5 are 1M,
+/// GPT-4.1 is ~1.05M), so this sits well above the largest of them: capping at
+/// 400k would clamp the 500k/1M/1.3M models Bea is meant to cater for down to a
+/// window the provider would reject the prompt for. It only guards against a
+/// corrupt or hostile value — a genuine 1.3M window passes through untouched and
+/// gets a prompt sized to it.
+pub const MAX_CONTEXT_TOKENS: usize = 4_000_000;
+
+/// Resolves a model's context window.
+///
+/// Preference order:
+/// 1. A window learned from the provider catalog (persisted by the frontend
+///    when the model is picked) or entered by hand for a local server.
+/// 2. A built-in table of well-known model families, so a known model still
+///    behaves correctly before/without a catalog fetch.
+/// 3. A conservative per-provider default.
+///
+/// Provider catalogs are authoritative and win over the table; the table is a
+/// safety net for local servers, which publish no context metadata at all.
+///
+/// The returned value is the model's real advertised window, clamped only to
+/// reject nonsense, so every budget derived from it scales the way the user
+/// expects: a 256k model budgets for 256k, a 1.3M model for 1.3M.
+pub fn resolve_context_tokens(conn: &Connection, model: &str, kind: &ProviderKind) -> usize {
+    let model = model.trim();
+    // A read failure falls through to the fallbacks rather than propagating: it
+    // only ever makes the budget smaller, which under-fills a large window
+    // instead of overflowing a small one.
+    if let Ok(Some(tokens)) = get_model_context_window(conn, model) {
+        return tokens.clamp(MIN_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS);
+    }
+    if let Some(tokens) = known_context_tokens(model, kind) {
+        return tokens.clamp(MIN_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS);
+    }
+    match kind {
+        // A local server's window is set by however it was launched (Ollama's
+        // default num_ctx, LM Studio's loaded context, llama.cpp's -c). Nothing
+        // in /v1/models reports it, so assume a small window rather than
+        // overflowing it; Settings lets the user state the real one.
+        ProviderKind::Local => DEFAULT_LOCAL_CONTEXT_TOKENS,
+        _ => DEFAULT_CONTEXT_TOKENS,
+    }
+}
+
+/// Reads a persisted catalog/hand-entered context window for a model.
+pub fn get_model_context_window(conn: &Connection, model: &str) -> Result<Option<usize>, BeaError> {
+    let mut statement =
+        conn.prepare("SELECT context_tokens FROM model_context_windows WHERE model=?1")?;
+    let mut rows = statement.query(params![model])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get::<_, i64>(0)? as usize)),
+        None => Ok(None),
+    }
+}
+
+/// Records a model's context window so prompt budgets can follow it.
+pub fn set_model_context_window(
+    conn: &Connection,
+    model: &str,
+    context_tokens: usize,
+    source: &str,
+) -> Result<(), BeaError> {
+    conn.execute(
+        "INSERT OR REPLACE INTO model_context_windows(model,context_tokens,source,updated_at) VALUES (?1,?2,?3,?4)",
+        params![
+            model,
+            context_tokens as i64,
+            source,
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+/// Forgets a recorded context window, so the model falls back to the built-in
+/// table and then to the conservative provider default. Clearing the field in
+/// Settings has to actually remove the row, otherwise "blank means automatic"
+/// would keep using the window the user just erased.
+pub fn clear_model_context_window(conn: &Connection, model: &str) -> Result<(), BeaError> {
+    conn.execute(
+        "DELETE FROM model_context_windows WHERE model=?1",
+        params![model.trim()],
+    )?;
+    Ok(())
+}
+
+/// Context windows for model families whose size is well known and stable.
+/// Matched as substrings of the model id, so provider-prefixed ids
+/// ("openai/gpt-4o", "anthropic/claude-…") resolve too. Ordered most specific
+/// first — "gpt-4.1" must win over the bare "gpt-4" rule.
+const KNOWN_CONTEXT_WINDOWS: &[(&str, usize)] = &[
+    // 1M-class
+    ("gemini-3", 1_000_000),
+    ("gemini-2.5", 1_000_000),
+    ("gemini-2.0", 1_000_000),
+    ("gemini-1.5", 2_000_000),
+    ("gpt-5", 400_000),
+    ("grok-4", 256_000),
+    ("grok-3", 131_072),
+    ("command-r-plus", 128_000),
+    ("llama-4", 1_000_000),
+    ("qwen3", 262_144),
+    ("deepseek-v3", 131_072),
+    ("mistral-large", 131_072),
+    // 200k-class
+    ("claude", 200_000),
+    ("gpt-4.1", 1_047_576),
+    ("gpt-4o", 128_000),
+    ("gpt-4-turbo", 128_000),
+    ("gpt-4", 8_192),
+    ("o3", 200_000),
+    ("o1", 200_000),
+    // Small / local
+    ("llama-3", 8_192),
+    ("llama2", 4_096),
+    ("llama-2", 4_096),
+    ("mistral-7b", 32_000),
+    ("phi-3", 128_000),
+    ("gemma-2", 8_192),
+];
+
+/// Best-effort context window for a known model family. Returns `None` for an
+/// unknown id so the caller can fall back to a conservative default.
+pub fn known_context_tokens(model: &str, kind: &ProviderKind) -> Option<usize> {
+    let model = model.trim().to_ascii_lowercase();
+    if model.is_empty() {
+        return None;
+    }
+    // A local server runs a specific build whose window the user chose at
+    // launch; assume the small end regardless of the family name, because the
+    // same "llama-3" tag is 8k in Ollama by default and 128k in llama.cpp with
+    // -c 131072. A user who needs more sets it in Settings.
+    if matches!(kind, ProviderKind::Local) {
+        return None;
+    }
+    KNOWN_CONTEXT_WINDOWS
+        .iter()
+        .find(|(needle, _)| model.contains(needle))
+        .map(|(_, tokens)| *tokens)
 }
 
 /// Human-readable speaker legend + optional custom minutes format, prepended
@@ -4057,7 +4251,11 @@ fn normalize_minutes_value(value: &mut serde_json::Value) {
 /// appends every bracket needed to reach a top-level close. A `null`-suffixed
 /// string tail (cut inside a quote) is shortened to the last complete element.
 fn balance_truncated_json(text: &str) -> Option<String> {
-    let trimmed = text.trim().trim_start_matches("```json").trim_start_matches("```").trim();
+    let trimmed = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim();
     if !trimmed.starts_with('{') || trimmed.ends_with('}') {
         return None; // nothing to salvage
     }
@@ -4749,7 +4947,7 @@ pub fn extract_model_archive(source: &Path, destination: &Path) -> Result<(), Be
             let mut entry = archive
                 .by_index(index)
                 .map_err(|e| BeaError::InvalidState(e.to_string()))?;
-            let Some(name) = entry.enclosed_name()else {
+            let Some(name) = entry.enclosed_name() else {
                 return Err(BeaError::InvalidState(
                     "model archive contains an unsafe path".into(),
                 ));
@@ -4877,8 +5075,8 @@ pub fn load_provider(conn: &Connection, id: &str) -> Result<Option<ProviderConfi
             },
         )
         .optional()?;
-    Ok(
-        row.map(|(id, kind, base_url, model, credential_ref, enabled, reasoning_effort)| {
+    Ok(row.map(
+        |(id, kind, base_url, model, credential_ref, enabled, reasoning_effort)| {
             let kind = match kind.as_str() {
                 "openrouter" => ProviderKind::OpenRouter,
                 "openai_compatible" => ProviderKind::OpenAiCompatible,
@@ -4898,8 +5096,8 @@ pub fn load_provider(conn: &Connection, id: &str) -> Result<Option<ProviderConfi
                     .map(|value| normalize_reasoning_effort(&value).to_string())
                     .unwrap_or_else(default_reasoning_effort),
             }
-        }),
-    )
+        },
+    ))
 }
 
 pub fn build_provider_request(provider: &ProviderConfig, request: &LlmRequest) -> ProviderRequest {
@@ -5289,8 +5487,11 @@ async fn post_provider_json(
             let error = provider_error_from_status(&status.to_string(), &raw);
             // Quota walls (usage_limit_reached) don't clear within a retry
             // window — fail fast instead of burning attempts on backoff.
-            let retriable = status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
-            if retriable && !matches!(error, BeaError::UsageLimit(_)) && attempt + 1 < PROVIDER_MAX_ATTEMPTS
+            let retriable =
+                status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+            if retriable
+                && !matches!(error, BeaError::UsageLimit(_))
+                && attempt + 1 < PROVIDER_MAX_ATTEMPTS
             {
                 last_error = Some(error);
                 continue;
@@ -5315,8 +5516,7 @@ async fn post_provider_json(
         }
         return parse_provider_payload(&raw);
     }
-    Err(last_error
-        .unwrap_or_else(|| BeaError::ProviderRequest("provider request failed".into())))
+    Err(last_error.unwrap_or_else(|| BeaError::ProviderRequest("provider request failed".into())))
 }
 
 /// Unwraps the assistant reply of a provider payload: Responses-API
@@ -5359,7 +5559,11 @@ fn minutes_from_payload(
 
 /// Builds the follow-up request that asks the model to repair its own
 /// malformed minutes JSON. Pure so the prompt contract is unit-testable.
-fn minutes_correction_request(original: &LlmRequest, broken: &str, parse_error: &str) -> LlmRequest {
+fn minutes_correction_request(
+    original: &LlmRequest,
+    broken: &str,
+    parse_error: &str,
+) -> LlmRequest {
     LlmRequest {
         model: original.model.clone(),
         system: "You repair malformed JSON meeting minutes. Reply with ONLY the corrected JSON object matching the schema, in compact single-line form (no pretty-printing, no extra whitespace) — no markdown fences, no commentary, no explanations.".to_string(),
@@ -5435,7 +5639,10 @@ pub async fn repair_minutes_reply(
 /// fill) so no single reply is large enough to truncate, even for meetings
 /// whose one-shot minutes exceed the model's output budget.
 const MINUTES_SECTIONS: [(&[&str], &str); 3] = [
-    (&["title", "summary", "agenda"], "title, summary, and agenda"),
+    (
+        &["title", "summary", "agenda"],
+        "title, summary, and agenda",
+    ),
     (&["decisions"], "decisions"),
     (
         &["action_items", "unresolved"],
@@ -6373,6 +6580,202 @@ fn xml_escape(value: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
 }
+// ---------------------------------------------------------------------------
+// Chat + table exports
+// ---------------------------------------------------------------------------
+
+/// One stored question/answer exchange. The chat log persists both halves in a
+/// single `context_events` row as `Q: <question>\nA: <answer>`, so the reader
+/// below is the only place that format needs to be understood.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatTurn {
+    pub question: String,
+    pub answer: String,
+    pub created_at: String,
+}
+
+/// Splits a persisted `Q: ...\nA: ...` payload. Returns None when the payload
+/// is not a chat exchange (e.g. a user-added context note).
+pub fn parse_chat_payload(payload: &str) -> Option<(String, String)> {
+    let rest = payload.strip_prefix("Q: ")?;
+    let (question, answer) = rest.split_once("\nA: ")?;
+    Some((question.to_string(), answer.to_string()))
+}
+
+/// RFC3339 in the database is friendlier to read as a local-style stamp in an
+/// exported document. Unparseable values are passed through unchanged.
+fn chat_timestamp_label(created_at: &str) -> String {
+    match DateTime::parse_from_rfc3339(created_at) {
+        Ok(parsed) => parsed
+            .with_timezone(&Utc)
+            .format("%Y-%m-%d %H:%M UTC")
+            .to_string(),
+        Err(_) => created_at.to_string(),
+    }
+}
+
+pub fn export_chat_markdown(meeting_title: &str, turns: &[ChatTurn]) -> String {
+    let mut out = format!("# {} — chat\n\n", meeting_title.trim());
+    if turns.is_empty() {
+        out.push_str("_No questions asked yet._\n");
+        return out;
+    }
+    for turn in turns {
+        let at = chat_timestamp_label(&turn.created_at);
+        out.push_str(&format!(
+            "### You · {at}\n\n{}\n\n",
+            turn.question.trim_end()
+        ));
+        out.push_str(&format!("### Bea · {at}\n\n{}\n\n", turn.answer.trim_end()));
+    }
+    out
+}
+
+pub fn export_chat_text(meeting_title: &str, turns: &[ChatTurn]) -> String {
+    let mut out = format!("{} — chat\n\n", meeting_title.trim());
+    if turns.is_empty() {
+        out.push_str("No questions asked yet.\n");
+        return out;
+    }
+    for turn in turns {
+        let at = chat_timestamp_label(&turn.created_at);
+        out.push_str(&format!("{at} You:\n{}\n\n", turn.question.trim_end()));
+        out.push_str(&format!("{at} Bea:\n{}\n\n", turn.answer.trim_end()));
+    }
+    out
+}
+
+/// Widest row wins so ragged Markdown tables still produce a rectangular file.
+fn table_width(headers: &[String], rows: &[Vec<String>]) -> usize {
+    rows.iter()
+        .map(|row| row.len())
+        .chain(std::iter::once(headers.len()))
+        .max()
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// RFC 4180 quoting plus a leading-apostrophe guard: a cell starting with
+/// `=`, `+`, `-` or `@` is executed as a formula by Excel and Sheets.
+fn csv_cell(value: &str) -> String {
+    let guarded = match value.chars().next() {
+        Some('=') | Some('+') | Some('-') | Some('@') => format!("'{value}"),
+        _ => value.to_string(),
+    };
+    if guarded.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", guarded.replace('"', "\"\""))
+    } else {
+        guarded
+    }
+}
+
+/// UTF-8 BOM plus CRLF line endings: what Excel and Google Sheets expect when a
+/// CSV is opened by double-clicking it.
+pub fn export_table_csv(headers: &[String], rows: &[Vec<String>]) -> String {
+    let width = table_width(headers, rows);
+    let mut out = String::from("\u{feff}");
+    let push_row = |cells: &[String], out: &mut String| {
+        let line = (0..width)
+            .map(|index| csv_cell(cells.get(index).map(String::as_str).unwrap_or("")))
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push_str(&line);
+        out.push_str("\r\n");
+    };
+    if !headers.is_empty() {
+        push_row(headers, &mut out);
+    }
+    for row in rows {
+        push_row(row, &mut out);
+    }
+    out
+}
+
+/// 0 -> A, 25 -> Z, 26 -> AA (spreadsheet column references).
+fn xlsx_column_name(mut index: usize) -> String {
+    let mut name = String::new();
+    loop {
+        name.insert(0, (b'A' + (index % 26) as u8) as char);
+        if index < 26 {
+            return name;
+        }
+        index = index / 26 - 1;
+    }
+}
+
+/// XLSX is a ZIP of OOXML parts. Cells use inline strings, which keeps the
+/// package to four small files with no `sharedStrings.xml` bookkeeping.
+pub fn export_table_xlsx(headers: &[String], rows: &[Vec<String>]) -> Result<Vec<u8>, BeaError> {
+    use std::io::{Cursor, Write};
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    let width = table_width(headers, rows);
+    let mut sheet = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>",
+    );
+    let sheet_row = |cells: &[String], number: usize, sheet: &mut String| {
+        sheet.push_str(&format!("<row r=\"{number}\">"));
+        for index in 0..width {
+            let value = cells.get(index).map(String::as_str).unwrap_or("");
+            sheet.push_str(&format!(
+                "<c r=\"{}{}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">{}</t></is></c>",
+                xlsx_column_name(index),
+                number,
+                xml_escape(value)
+            ));
+        }
+        sheet.push_str("</row>");
+    };
+    let mut number = 1usize;
+    if !headers.is_empty() {
+        sheet_row(headers, number, &mut sheet);
+        number += 1;
+    }
+    for row in rows {
+        sheet_row(row, number, &mut sheet);
+        number += 1;
+    }
+    sheet.push_str("</sheetData></worksheet>");
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mut zip = ZipWriter::new(&mut cursor);
+    let options = SimpleFileOptions::default();
+    let part = |zip: &mut ZipWriter<&mut Cursor<Vec<u8>>>,
+                name: &str,
+                body: &str|
+     -> Result<(), BeaError> {
+        zip.start_file(name, options)
+            .map_err(|e| BeaError::InvalidState(e.to_string()))?;
+        zip.write_all(body.as_bytes())
+            .map_err(|e| BeaError::InvalidState(e.to_string()))
+    };
+    part(
+        &mut zip,
+        "[Content_Types].xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/><Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/></Types>",
+    )?;
+    part(
+        &mut zip,
+        "_rels/.rels",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>",
+    )?;
+    part(
+        &mut zip,
+        "xl/workbook.xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"Chat table\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>",
+    )?;
+    part(
+        &mut zip,
+        "xl/_rels/workbook.xml.rels",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>",
+    )?;
+    part(&mut zip, "xl/worksheets/sheet1.xml", &sheet)?;
+    zip.finish()
+        .map_err(|e| BeaError::InvalidState(e.to_string()))?;
+    Ok(cursor.into_inner())
+}
+
 fn append_events(out: &mut String, heading: &str, events: &[LedgerEvent]) {
     out.push_str(&format!("\n## {heading}\n\n"));
     if events.is_empty() {
@@ -6556,8 +6959,19 @@ mod tests {
         // OCR fallback path: no images sent; the caller embeds the OCR text in
         // the user text, which travels as a plain string.
         let user_text = "=== VISUAL CONTEXT (OCR) ===\nslide showing Q3 budget\n\nuser question";
-        let fallback = build_multimodal_body(&provider, "system", user_text, &[], 1_000, "off", &provider.model);
-        assert!(fallback["messages"][1]["content"].as_str().unwrap().contains("slide showing Q3 budget"));
+        let fallback = build_multimodal_body(
+            &provider,
+            "system",
+            user_text,
+            &[],
+            1_000,
+            "off",
+            &provider.model,
+        );
+        assert!(fallback["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("slide showing Q3 budget"));
     }
     #[test]
     fn minutes_serializes_agenda_and_exports_it() {
@@ -6587,7 +7001,10 @@ mod tests {
         assert!(markdown.contains("Budget review"));
         // Sections are separated by a blank line — the summary must never
         // squash into the next heading ("Summary.\n## Agenda").
-        assert!(markdown.contains("Summary.\n\n## Agenda"), "got: {markdown:?}");
+        assert!(
+            markdown.contains("Summary.\n\n## Agenda"),
+            "got: {markdown:?}"
+        );
         assert!(!markdown.contains(".\n## "), "got: {markdown:?}");
     }
     #[test]
@@ -6711,7 +7128,12 @@ mod tests {
                 owner: None,
                 due: None,
                 confidence: 0.85,
-                evidence: vec![Evidence { start_seconds: 10, end_seconds: 20, quote: "q".into(), title: String::new() }],
+                evidence: vec![Evidence {
+                    start_seconds: 10,
+                    end_seconds: 20,
+                    quote: "q".into(),
+                    title: String::new(),
+                }],
             },
             LedgerEvent {
                 kind: "action".into(),
@@ -6719,13 +7141,33 @@ mod tests {
                 owner: None,
                 due: None,
                 confidence: 0.8,
-                evidence: vec![Evidence { start_seconds: 30, end_seconds: 40, quote: "q".into(), title: String::new() }],
+                evidence: vec![Evidence {
+                    start_seconds: 30,
+                    end_seconds: 40,
+                    quote: "q".into(),
+                    title: String::new(),
+                }],
             },
         ];
         let minutes = generate_minutes("Council", &events);
-        assert!(minutes.summary.contains("Decided: The passing grade is set to 2.0"), "summary: {}", minutes.summary);
-        assert!(minutes.summary.contains("Action items: Submit the revision to CHED"), "summary: {}", minutes.summary);
-        assert!(!minutes.summary.contains("1 key decision recorded"), "count-template must be gone");
+        assert!(
+            minutes
+                .summary
+                .contains("Decided: The passing grade is set to 2.0"),
+            "summary: {}",
+            minutes.summary
+        );
+        assert!(
+            minutes
+                .summary
+                .contains("Action items: Submit the revision to CHED"),
+            "summary: {}",
+            minutes.summary
+        );
+        assert!(
+            !minutes.summary.contains("1 key decision recorded"),
+            "count-template must be gone"
+        );
         let empty = generate_minutes("Empty", &[]);
         assert!(empty.summary.contains("No formal decisions"));
     }
@@ -6995,6 +7437,162 @@ mod tests {
         assert_eq!(pack.evidence_count, 1);
         assert_eq!(estimate_tokens("1234"), 1);
     }
+
+    #[test]
+    fn known_model_families_resolve_to_their_real_window() {
+        let hosted = ProviderKind::OpenRouter;
+        // 1M-class, 500k/256k-class and small models must all differ.
+        assert_eq!(
+            known_context_tokens("google/gemini-2.5-pro", &hosted),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            known_context_tokens("gemini-2.0-flash", &hosted),
+            Some(1_000_000)
+        );
+        assert_eq!(known_context_tokens("openai/gpt-5", &hosted), Some(400_000));
+        assert_eq!(known_context_tokens("x-ai/grok-4", &hosted), Some(256_000));
+        assert_eq!(
+            known_context_tokens("anthropic/claude-sonnet-4", &hosted),
+            Some(200_000)
+        );
+        assert_eq!(
+            known_context_tokens("openai/gpt-4o", &hosted),
+            Some(128_000)
+        );
+        assert_eq!(known_context_tokens("openai/gpt-4", &hosted), Some(8_192));
+        // Case and provider prefixes must not matter.
+        assert_eq!(
+            known_context_tokens("ANTHROPIC/CLAUDE-3-5-SONNET", &hosted),
+            Some(200_000)
+        );
+        // More specific families must win over the shorter prefix they contain.
+        assert_eq!(
+            known_context_tokens("openai/gpt-4.1-mini", &hosted),
+            Some(1_047_576)
+        );
+        assert_eq!(
+            known_context_tokens("openai/gpt-4-turbo", &hosted),
+            Some(128_000)
+        );
+        // Unknown and empty ids fall through to the conservative default.
+        assert_eq!(known_context_tokens("some/new-model-2099", &hosted), None);
+        assert_eq!(known_context_tokens("", &hosted), None);
+    }
+
+    #[test]
+    fn a_local_server_never_guesses_from_the_model_name() {
+        // The same "llama-3" tag is 8k in Ollama by default and 128k in
+        // llama.cpp launched with -c 131072, so a local id must not resolve.
+        assert_eq!(
+            known_context_tokens("llama3:8b", &ProviderKind::Local),
+            None
+        );
+        assert_eq!(known_context_tokens("gpt-4o", &ProviderKind::Local), None);
+    }
+
+    #[test]
+    fn a_recorded_window_wins_over_the_built_in_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE model_context_windows (model TEXT PRIMARY KEY, context_tokens INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'catalog', updated_at TEXT NOT NULL);")
+            .unwrap();
+        // gpt-4o is 128k in the table; the catalog says this deployment is 8k.
+        set_model_context_window(&conn, "gpt-4o", 8_000, "catalog").unwrap();
+        assert_eq!(
+            resolve_context_tokens(&conn, "gpt-4o", &ProviderKind::OpenRouter),
+            8_000
+        );
+        // A re-record replaces the old value.
+        set_model_context_window(&conn, "gpt-4o", 400_000, "manual").unwrap();
+        assert_eq!(
+            resolve_context_tokens(&conn, "gpt-4o", &ProviderKind::OpenRouter),
+            400_000
+        );
+        // Clearing it is what "leave the field blank" means: the record has to
+        // disappear so the built-in table takes over again.
+        clear_model_context_window(&conn, "gpt-4o").unwrap();
+        assert_eq!(get_model_context_window(&conn, "gpt-4o").unwrap(), None);
+        assert_eq!(
+            resolve_context_tokens(&conn, "gpt-4o", &ProviderKind::OpenRouter),
+            128_000
+        );
+    }
+
+    #[test]
+    fn unknown_models_resolve_conservatively_per_provider() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE model_context_windows (model TEXT PRIMARY KEY, context_tokens INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'catalog', updated_at TEXT NOT NULL);")
+            .unwrap();
+        // A local server publishes no context metadata: assume the small end so
+        // the prompt is never rejected.
+        assert_eq!(
+            resolve_context_tokens(&conn, "some/new-model-2099", &ProviderKind::Local),
+            DEFAULT_LOCAL_CONTEXT_TOKENS
+        );
+        assert_eq!(
+            resolve_context_tokens(&conn, "some/new-model-2099", &ProviderKind::OpenRouter),
+            DEFAULT_CONTEXT_TOKENS
+        );
+        // An empty model id must not panic or resolve to something huge.
+        assert_eq!(
+            resolve_context_tokens(&conn, "  ", &ProviderKind::OpenRouter),
+            DEFAULT_CONTEXT_TOKENS
+        );
+    }
+
+    /// The regression behind raising the old 400k cap: a model advertising 500k,
+    /// 1M or 1.3M must resolve to *its own* window, not to a clamp above it.
+    #[test]
+    fn large_declared_windows_survive_intact() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE model_context_windows (model TEXT PRIMARY KEY, context_tokens INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'catalog', updated_at TEXT NOT NULL);")
+            .unwrap();
+        for window in [256_000usize, 500_000, 1_000_000, 1_300_000, 2_000_000] {
+            set_model_context_window(&conn, "big", window, "catalog").unwrap();
+            assert_eq!(
+                resolve_context_tokens(&conn, "big", &ProviderKind::OpenRouter),
+                window,
+                "a {window}-token window must be honoured, not clamped"
+            );
+        }
+    }
+
+    /// A real 4k model must be allowed to say so rather than being inflated to a
+    /// window it does not have.
+    #[test]
+    fn small_declared_windows_are_not_inflated() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE model_context_windows (model TEXT PRIMARY KEY, context_tokens INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'catalog', updated_at TEXT NOT NULL);")
+            .unwrap();
+        for window in [4_096usize, 8_192, 16_384] {
+            set_model_context_window(&conn, "small", window, "catalog").unwrap();
+            assert_eq!(
+                resolve_context_tokens(&conn, "small", &ProviderKind::OpenRouter),
+                window
+            );
+        }
+    }
+
+    #[test]
+    fn absurd_windows_are_clamped_to_something_usable() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE model_context_windows (model TEXT PRIMARY KEY, context_tokens INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'catalog', updated_at TEXT NOT NULL);")
+            .unwrap();
+        // A mis-reported 2-token window must not collapse the prompt.
+        set_model_context_window(&conn, "broken-small", 2, "catalog").unwrap();
+        assert_eq!(
+            resolve_context_tokens(&conn, "broken-small", &ProviderKind::OpenRouter),
+            MIN_CONTEXT_TOKENS
+        );
+        // A mis-reported 10M window is capped, but the cap must still sit far
+        // above every real model so it never costs a big-window user anything.
+        set_model_context_window(&conn, "broken-huge", 10_000_000, "catalog").unwrap();
+        assert_eq!(
+            resolve_context_tokens(&conn, "broken-huge", &ProviderKind::OpenRouter),
+            MAX_CONTEXT_TOKENS
+        );
+        assert!(MAX_CONTEXT_TOKENS >= 2_000_000);
+    }
     #[test]
     fn multimodal_body_uses_the_requested_model_not_the_provider_default() {
         // Regression: the vision paths (minutes with video frames, chat with
@@ -7010,15 +7608,8 @@ mod tests {
             enabled: true,
             reasoning_effort: "off".into(),
         };
-        let text_only = build_multimodal_body(
-            &provider,
-            "sys",
-            "usr",
-            &[],
-            100,
-            "off",
-            "requested-model",
-        );
+        let text_only =
+            build_multimodal_body(&provider, "sys", "usr", &[], 100, "off", "requested-model");
         assert_eq!(text_only["model"], "requested-model");
         let with_images = build_multimodal_body(
             &provider,
@@ -7074,7 +7665,10 @@ mod tests {
             max_output_tokens: 100,
             reasoning_effort: "off".into(),
         };
-        assert_eq!(codex_oauth::responses_payload(&request)["stream"], serde_json::json!(true));
+        assert_eq!(
+            codex_oauth::responses_payload(&request)["stream"],
+            serde_json::json!(true)
+        );
         assert_eq!(
             codex_oauth::responses_payload_multimodal(&request, &[])["stream"],
             serde_json::json!(true)
@@ -7278,7 +7872,10 @@ mod tests {
             reasoning_effort: "high".into(),
         };
         let body = build_provider_request(&base, &request).body;
-        assert_eq!(body["reasoning"], serde_json::json!({"enabled": true, "effort": "high"}));
+        assert_eq!(
+            body["reasoning"],
+            serde_json::json!({"enabled": true, "effort": "high"})
+        );
         let off = LlmRequest {
             reasoning_effort: "off".into(),
             ..request.clone()
@@ -7301,7 +7898,10 @@ mod tests {
         let body = build_provider_request(&compatible, &off).body;
         assert!(body.get("reasoning").is_none());
         let body = build_provider_request(&compatible, &request).body;
-        assert_eq!(body["reasoning"], serde_json::json!({"enabled": true, "effort": "high"}));
+        assert_eq!(
+            body["reasoning"],
+            serde_json::json!({"enabled": true, "effort": "high"})
+        );
         let local = ProviderConfig {
             kind: ProviderKind::Local,
             ..base.clone()
@@ -7543,7 +8143,9 @@ mod tests {
         assert!(message.contains("no usable minutes JSON"));
         assert!(message.contains("Sorry, I cannot output JSON"));
         // The empty-reply case names the empty content explicitly instead.
-        let error = BeaError::InvalidModelOutput("provider response contained no usable minutes JSON".into());
+        let error = BeaError::InvalidModelOutput(
+            "provider response contained no usable minutes JSON".into(),
+        );
         let message = failed_minutes_error(error, "  ").to_string();
         assert!(message.contains("contained no text"));
     }
@@ -7560,7 +8162,8 @@ mod tests {
         };
         let content = serde_json::json!({"choices":[{"message":{"content":"hello"}}]});
         assert_eq!(reply_text(&provider, &content), "hello");
-        let reasoning_only = serde_json::json!({"choices":[{"message":{"content":null,"reasoning":"thinking..."}}]});
+        let reasoning_only =
+            serde_json::json!({"choices":[{"message":{"content":null,"reasoning":"thinking..."}}]});
         assert_eq!(reply_text(&provider, &reasoning_only), "thinking...");
         provider.kind = ProviderKind::OpenAiOAuth;
         let oauth_payload = serde_json::json!({
@@ -8546,11 +9149,19 @@ mod tests {
         released.extend(mixer.push(0, &mono_constant(1000, 1000), 16_000, 1));
         released.extend(mixer.push(0, &mono_constant(1000, 500), 16_000, 1));
         for batch in 1..4usize {
-            released.extend(mixer.push((batch * 1000) as u64, &mono_constant(1000, 1000), 16_000, 1));
+            released.extend(mixer.push(
+                (batch * 1000) as u64,
+                &mono_constant(1000, 1000),
+                16_000,
+                1,
+            ));
         }
         // Buffer end 4000 minus horizon 3200 → exactly 800 samples settle.
         assert_eq!(released.len(), 800);
-        assert!(released.iter().all(|sample| *sample == 1500), "sources must sum sample-by-sample, including B's late batch");
+        assert!(
+            released.iter().all(|sample| *sample == 1500),
+            "sources must sum sample-by-sample, including B's late batch"
+        );
     }
 
     #[test]
@@ -8560,12 +9171,24 @@ mod tests {
         let mut mixer = AudioMixer::new(16_000, 1);
         let mut released: Vec<i16> = Vec::new();
         for batch in 0..3usize {
-            released.extend(mixer.push((batch * 1000) as u64, &mono_constant(1000, 2000), 8_000, 1));
+            released.extend(mixer.push(
+                (batch * 1000) as u64,
+                &mono_constant(1000, 2000),
+                8_000,
+                1,
+            ));
         }
         // 3 batches × 2000 = 6000 buffered; settle 6000 − 3200 = 2800.
         assert_eq!(released.len(), 2800);
-        assert_eq!(released.len() % 2, 0, "8 kHz → 16 kHz produces even sample counts");
-        assert!(released.iter().all(|sample| *sample == 2000), "resampled DC must keep its value");
+        assert_eq!(
+            released.len() % 2,
+            0,
+            "8 kHz → 16 kHz produces even sample counts"
+        );
+        assert!(
+            released.iter().all(|sample| *sample == 2000),
+            "resampled DC must keep its value"
+        );
     }
 
     #[test]
@@ -8645,7 +9268,10 @@ mod tests {
         mark_chunk_done(&conn, "m1", 0, 28).unwrap();
         mark_chunk_done(&conn, "m1", 28, 56).unwrap();
         assert_eq!(count_done_chunks(&conn, "m1").unwrap(), 2);
-        assert_eq!(list_done_chunks(&conn, "m1").unwrap(), vec![(0, 28), (28, 56)]);
+        assert_eq!(
+            list_done_chunks(&conn, "m1").unwrap(),
+            vec![(0, 28), (28, 56)]
+        );
         // Other meetings are untouched.
         assert_eq!(count_done_chunks(&conn, "other").unwrap(), 0);
         let chunks = vec![
@@ -8682,7 +9308,10 @@ mod tests {
         // absorbs the probe's ceil vs the WAV header's floor).
         assert!(cached_audio_covers_source(3600, 3600));
         assert!(cached_audio_covers_source(3600, 3601));
-        assert!(!cached_audio_covers_source(1800, 3600), "truncated cache must be rejected");
+        assert!(
+            !cached_audio_covers_source(1800, 3600),
+            "truncated cache must be rejected"
+        );
         assert!(cached_audio_covers_source(1, 0));
         // Chunk WAVs shorter than their slice are rebuilt; unreadable ones too.
         let dir = tempdir().unwrap();
@@ -8712,7 +9341,10 @@ mod tests {
             }
             writer.finalize().unwrap();
         }
-        assert!(!chunk_needs_reslice(&full, 28), "a full-length chunk is trusted");
+        assert!(
+            !chunk_needs_reslice(&full, 28),
+            "a full-length chunk is trusted"
+        );
     }
 
     /// Cheap in-memory engine for exercising the transcription loops without a
@@ -8801,7 +9433,10 @@ mod tests {
         // Completion counters are unique 1..=12 — no duplicated or skipped steps.
         let mut seen = std::collections::HashSet::new();
         for (completed, _) in marks.iter() {
-            assert!(seen.insert(*completed), "duplicate progress step {completed}");
+            assert!(
+                seen.insert(*completed),
+                "duplicate progress step {completed}"
+            );
         }
     }
 
@@ -8818,8 +9453,12 @@ mod tests {
             &chunks,
             &TranscriptLanguage::Auto,
             vec![
-                StubEngine { fail_on: Some(failing_chunk) },
-                StubEngine { fail_on: Some(failing_chunk) },
+                StubEngine {
+                    fail_on: Some(failing_chunk),
+                },
+                StubEngine {
+                    fail_on: Some(failing_chunk),
+                },
             ],
             |_, _, _| {},
         );
@@ -8854,11 +9493,15 @@ mod tests {
         let recovered = recover_interrupted_transcriptions(&path).unwrap();
         assert_eq!(recovered, 1);
         let status: String = conn
-            .query_row("SELECT status FROM meetings WHERE id='m1'", [], |row| row.get(0))
+            .query_row("SELECT status FROM meetings WHERE id='m1'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(status, "failed");
         let last_error: String = conn
-            .query_row("SELECT last_error FROM meetings WHERE id='m1'", [], |row| row.get(0))
+            .query_row("SELECT last_error FROM meetings WHERE id='m1'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(last_error, INTERRUPTED_TRANSCRIPTION_ERROR);
         let job_state: String = conn
@@ -8867,8 +9510,134 @@ mod tests {
         assert_eq!(job_state, "failed");
         // A ready meeting is untouched by the recovery pass.
         let ready_status: String = conn
-            .query_row("SELECT status FROM meetings WHERE id='m2'", [], |row| row.get(0))
+            .query_row("SELECT status FROM meetings WHERE id='m2'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(ready_status, "ready");
+    }
+
+    fn turn(question: &str, answer: &str) -> ChatTurn {
+        ChatTurn {
+            question: question.into(),
+            answer: answer.into(),
+            created_at: "2026-03-05T09:07:00+00:00".into(),
+        }
+    }
+
+    #[test]
+    fn chat_payload_splits_question_and_answer() {
+        let (question, answer) =
+            parse_chat_payload("Q: Who owns the CHED filing?\nA: Maria does.").unwrap();
+        assert_eq!(question, "Who owns the CHED filing?");
+        assert_eq!(answer, "Maria does.");
+        // A multi-line answer survives intact.
+        let (_, answer) = parse_chat_payload("Q: List them\nA: line one\nline two").unwrap();
+        assert_eq!(answer, "line one\nline two");
+        // Context notes are not chat exchanges.
+        assert!(parse_chat_payload("The Dean waived the policy.").is_none());
+        assert!(parse_chat_payload("Q: no answer half").is_none());
+    }
+
+    #[test]
+    fn chat_markdown_export_labels_both_halves_and_keeps_tables() {
+        let doc = export_chat_markdown(
+            "  Faculty Council  ",
+            &[turn(
+                "What was decided?",
+                "| Item | Owner |\n| --- | --- |\n| Grade | Maria |",
+            )],
+        );
+        assert!(doc.starts_with("# Faculty Council — chat\n\n"));
+        assert!(doc.contains("### You · 2026-03-05 09:07 UTC"));
+        assert!(doc.contains("### Bea · 2026-03-05 09:07 UTC"));
+        // GFM table pipes must reach the file untouched.
+        assert!(doc.contains("| Item | Owner |"));
+        assert!(!export_chat_markdown("Empty", &[]).contains("###"));
+        assert!(export_chat_markdown("Empty", &[]).contains("_No questions asked yet._"));
+    }
+
+    #[test]
+    fn chat_text_export_labels_both_halves() {
+        let doc = export_chat_text(
+            "Faculty Council",
+            &[turn("What was decided?", "The grade stays at 2.0.")],
+        );
+        assert!(doc.starts_with("Faculty Council — chat\n\n"));
+        assert!(doc.contains("2026-03-05 09:07 UTC You:\nWhat was decided?\n"));
+        assert!(doc.contains("2026-03-05 09:07 UTC Bea:\nThe grade stays at 2.0.\n"));
+        assert!(export_chat_text("Empty", &[]).contains("No questions asked yet."));
+    }
+
+    #[test]
+    fn chat_timestamp_falls_back_to_the_stored_value() {
+        assert_eq!(chat_timestamp_label("not-a-date"), "not-a-date");
+    }
+
+    #[test]
+    fn table_csv_uses_bom_crlf_and_pads_ragged_rows() {
+        let headers = vec!["Topic".to_string(), "Owner".to_string()];
+        let rows = vec![vec!["Grade".to_string()]];
+        let csv = export_table_csv(&headers, &rows);
+        assert!(csv.starts_with('\u{feff}'));
+        assert_eq!(csv, "\u{feff}Topic,Owner\r\nGrade,\r\n");
+    }
+
+    #[test]
+    fn table_csv_quotes_specials_and_guards_formula_injection() {
+        let headers = vec!["Note".to_string(), "Value".to_string()];
+        let rows = vec![
+            vec!["a,b".to_string(), "=1+1".to_string()],
+            vec!["say \"hi\"".to_string(), "@SUM(A1)".to_string()],
+            vec!["line\nbreak".to_string(), "-2".to_string()],
+        ];
+        let csv = export_table_csv(&headers, &rows);
+        let lines: Vec<&str> = csv.trim_start_matches('\u{feff}').split("\r\n").collect();
+        assert_eq!(lines[1], "\"a,b\",'=1+1");
+        assert_eq!(lines[2], "\"say \"\"hi\"\"\",'@SUM(A1)");
+        assert_eq!(lines[3], "\"line\nbreak\",'-2");
+    }
+
+    #[test]
+    fn table_csv_without_headers_writes_only_body_rows() {
+        let rows = vec![vec!["A".to_string(), "B".to_string()]];
+        assert_eq!(export_table_csv(&[], &rows), "\u{feff}A,B\r\n");
+    }
+
+    #[test]
+    fn table_xlsx_writes_a_zip_with_an_escaped_sheet() {
+        use std::io::Read;
+        use zip::ZipArchive;
+        let headers = vec!["Item".to_string(), "Owner".to_string()];
+        let rows = vec![vec!["Grade <2.0>".to_string(), "Maria & Co".to_string()]];
+        let bytes = export_table_xlsx(&headers, &rows).unwrap();
+        let mut archive = ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+        assert!(names.contains(&"[Content_Types].xml".to_string()));
+        assert!(names.contains(&"xl/workbook.xml".to_string()));
+        assert!(names.contains(&"xl/worksheets/sheet1.xml".to_string()));
+        let mut sheet = String::new();
+        archive
+            .by_name("xl/worksheets/sheet1.xml")
+            .unwrap()
+            .read_to_string(&mut sheet)
+            .unwrap();
+        // Cells carry spreadsheet-style references and escaped payloads.
+        assert!(sheet.contains(r#"<c r="A1" t="inlineStr">"#));
+        assert!(sheet.contains(r#"<c r="B2" t="inlineStr">"#));
+        assert!(sheet.contains("Grade &lt;2.0&gt;"));
+        assert!(sheet.contains("Maria &amp; Co"));
+    }
+
+    #[test]
+    fn xlsx_column_names_wrap_past_z() {
+        assert_eq!(xlsx_column_name(0), "A");
+        assert_eq!(xlsx_column_name(25), "Z");
+        assert_eq!(xlsx_column_name(26), "AA");
+        assert_eq!(xlsx_column_name(27), "AB");
+        assert_eq!(xlsx_column_name(51), "AZ");
+        assert_eq!(xlsx_column_name(52), "BA");
+        assert_eq!(xlsx_column_name(701), "ZZ");
+        assert_eq!(xlsx_column_name(702), "AAA");
     }
 }

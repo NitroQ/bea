@@ -13,8 +13,8 @@ describe("version consistency", () => {
 });
 
 describe("releaseTag", () => {
-  it("maps internal versions to two-digit release tags", () => {
-    expect(releaseTag("1.0.0")).toBe("v1.0");
-    expect(releaseTag("0.1.0")).toBe("v0.1");
+  it("maps internal versions to matching three-component release tags", () => {
+    expect(releaseTag("1.0.0")).toBe("v1.0.0");
+    expect(releaseTag("0.3.4")).toBe("v0.3.4");
   });
 });

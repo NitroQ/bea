@@ -6,9 +6,13 @@ import type { OpenRouterModelInfo } from './types';
 import { REASONING_EFFORTS, normalizeReasoningEffort } from './types';
 import Icon from './Icon';
 import BeaAvatar from './BeaAvatar';
+import Markdown from './chatMarkdown';
+import { copyText } from './chatFormat';
+import type { TableExportHandler } from './chatFormat';
 
-export type ChatMessage = { id: string; role: 'user' | 'bea' | 'system'; text: string; chip?: string };
+export type ChatMessage = { id: string; role: 'user' | 'bea' | 'system'; text: string; chip?: string; createdAt?: string };
 type Attachment = { id: string; name: string; dataUrl: string };
+export type ChatExportFormat = 'markdown' | 'text';
 type Props = {
   messages: ChatMessage[];
   busy: boolean;
@@ -21,10 +25,23 @@ type Props = {
   onReasoningChange: (reasoning: string) => void;
   /// Whether the selected model accepts images (null = unknown → no warning).
   visionCapable?: boolean | null;
-  onModelChange: (model: string) => void;
+  onModelChange: (model: string, contextTokens?: number | null) => void;
   onSend: (input: string, images: string[]) => void;
   onOpenCustomFormat: () => void;
+  /// Re-asks the last question; hidden while a reply is already in flight.
+  onRegenerate?: () => void;
+  onExportTable?: TableExportHandler;
+  onExportChat?: (format: ChatExportFormat) => void;
 };
+
+/// Chat clock label. `created_at` arrives from SQLite as an ISO string, so a
+/// bad value has to degrade to an empty label rather than "Invalid Date".
+export function chatTimeLabel(iso: string | undefined): string {
+  if (!iso) return '';
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return '';
+  return parsed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
 
 /// True when the model id looks vision-capable and the provider catalog has no
 /// entry for it (Codex / locally discovered lists). Mirrors the backend
@@ -37,14 +54,45 @@ export function modelLooksVisionCapable(modelId: string, catalog: OpenRouterMode
   return ['gpt-4o', 'gpt-4.1', 'gpt-5', 'o3', 'o4', 'claude-3', 'claude-4', 'gemini', 'pixtral', 'llava', 'vl', 'vision'].some((marker) => id.includes(marker));
 }
 
-export default function ChatPanel({ messages, busy, hasCustomFormat, meetingModel, modelOptions, openRouterModels = [], meetingReasoning, onReasoningChange, visionCapable = null, onModelChange, onSend, onOpenCustomFormat }: Props) {
+export default function ChatPanel({ messages, busy, hasCustomFormat, meetingModel, modelOptions, openRouterModels = [], meetingReasoning, onReasoningChange, visionCapable = null, onModelChange, onSend, onOpenCustomFormat, onRegenerate, onExportTable, onExportChat }: Props) {
   const [input, setInput] = useState('');
   const [menuOpen, setMenuOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  // Sticky when the reader has scrolled up, so an incoming answer no longer
+  // yanks them back to the bottom mid-paragraph.
+  const [stickToBottom, setStickToBottom] = useState(true);
   const logRef = useRef<HTMLDivElement | null>(null);
-  const inputRef = useRef<HTMLInputElement | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
-  useEffect(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, [messages, busy]);
+
+  const onLogScroll = () => {
+    const log = logRef.current;
+    if (!log) return;
+    setStickToBottom(log.scrollHeight - log.scrollTop - log.clientHeight < 48);
+  };
+  useEffect(() => {
+    if (stickToBottom && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [messages, busy, stickToBottom]);
+  useEffect(() => {
+    if (!copiedId) return;
+    const timer = setTimeout(() => setCopiedId(null), 1600);
+    return () => clearTimeout(timer);
+  }, [copiedId]);
+
+  // Grow with the content up to a ceiling, then scroll internally.
+  useEffect(() => {
+    const field = inputRef.current;
+    if (!field) return;
+    field.style.height = 'auto';
+    field.style.height = `${Math.min(field.scrollHeight, 180)}px`;
+  }, [input]);
+
+  const jumpToLatest = () => {
+    setStickToBottom(true);
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  };
 
   const addFiles = (files: Array<{ name: string; dataUrl: string }>) => {
     setAttachments((current) => [...current, ...files.map((file) => ({ id: crypto.randomUUID(), name: file.name, dataUrl: file.dataUrl }))].slice(0, 6));
@@ -91,15 +139,40 @@ export default function ChatPanel({ messages, busy, hasCustomFormat, meetingMode
     inputRef.current?.focus();
   };
   const showVisionWarning = attachments.length > 0 && visionCapable === false;
+  const lastBeaId = [...messages].reverse().find((message) => message.role === 'bea')?.id;
+  const hasConversation = messages.some((message) => message.role !== 'system');
   return <div className="chat-panel" onPaste={onPaste}>
-    <div className="chat-log" ref={logRef}>
+    <div className="chat-log" ref={logRef} onScroll={onLogScroll}>
       {messages.length === 0 && <div className="chat-empty"><div className="chat-empty-bea"><BeaAvatar variant="love" size={44} />
         <p>Ask about this meeting, or pick a command. You can also paste or attach a screenshot.</p></div>
         <ul>{SLASH_HELP.map((line) => <li key={line}><code>{line}</code></li>)}</ul>
       </div>}
-      {messages.map((message) => <div key={message.id} className={`chat-message ${message.role}`}>{message.text}{message.chip && <span className="chat-frame-chip">{message.chip}</span>}</div>)}
+      {messages.map((message) => {
+        const time = chatTimeLabel(message.createdAt);
+        const isLastBea = message.id === lastBeaId;
+        return <div key={message.id} className={`chat-message ${message.role}`}>
+          <div className="chat-message-body">
+            {message.role === 'system' ? <span className="chat-plain">{message.text}</span> : <Markdown text={message.text} onExportTable={onExportTable} />}
+            {message.chip && <span className="chat-frame-chip">{message.chip}</span>}
+          </div>
+          {(time || message.role !== 'system') && <div className="chat-message-foot">
+            {time && <time className="chat-message-time">{time}</time>}
+            {message.role !== 'system' && <div className="chat-message-actions">
+              <button type="button" onClick={() => { void copyText(message.text).then((ok) => { if (ok) setCopiedId(message.id); }); }} title="Copy message" aria-label="Copy message">
+                <Icon name={copiedId === message.id ? 'check' : 'copy'} size={12} />{copiedId === message.id ? 'Copied' : 'Copy'}
+              </button>
+              {onRegenerate && isLastBea && <button type="button" onClick={onRegenerate} disabled={busy} title="Ask again" aria-label="Regenerate answer">
+                <Icon name="refresh" size={12} />Retry
+              </button>}
+            </div>}
+          </div>}
+        </div>;
+      })}
       {busy && <div className="chat-message bea chat-busy">Thinking…</div>}
     </div>
+    {!stickToBottom && messages.length > 0 && <button type="button" className="chat-jump-latest" onClick={jumpToLatest} aria-label="Jump to latest message">
+      <Icon name="chevron-down" size={14} />Latest
+    </button>}
     {attachments.length > 0 && <div className="chat-attachments" aria-label="Attached images">
       {attachments.map((attachment) => <figure key={attachment.id} className="chat-attachment">
         <img src={attachment.dataUrl} alt={attachment.name} />
@@ -141,9 +214,37 @@ export default function ChatPanel({ messages, busy, hasCustomFormat, meetingMode
           <code>{command.name}</code><span>{command.description}</span>
         </button>)}
       </div>}
+      {onExportChat && <div className="chat-export-menu">
+        <button type="button" className="secondary small" onClick={() => setExportOpen((open) => !open)} title="Download this chat" aria-expanded={exportOpen} disabled={!hasConversation}>
+          <Icon name="download" size={14} />Export
+        </button>
+        {exportOpen && <div className="chat-export-menu-list" role="menu">
+          <button type="button" role="menuitem" onClick={() => { setExportOpen(false); onExportChat('markdown'); }}>
+            <Icon name="file" size={14} /><span><strong>Markdown <small>.md</small></strong><small>Headings, tables and code kept as written</small></span>
+          </button>
+          <button type="button" role="menuitem" onClick={() => { setExportOpen(false); onExportChat('text'); }}>
+            <Icon name="list" size={14} /><span><strong>Plain text <small>.txt</small></strong><small>Just the questions and answers</small></span>
+          </button>
+        </div>}
+      </div>}
     </div>
     <form className="chat-input-row" onSubmit={(event) => { event.preventDefault(); submit(); }}>
-      <input ref={inputRef} value={input} onChange={(event) => onInputChange(event.target.value)} placeholder="Ask about the meeting, paste a screenshot, or /minutes /clarify /context /correction /custom" disabled={busy} aria-label="Meeting chat input" />
+      <textarea
+        ref={inputRef}
+        rows={1}
+        value={input}
+        onChange={(event) => onInputChange(event.target.value)}
+        // Enter sends; Shift+Enter inserts a newline for multi-line questions.
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+            event.preventDefault();
+            submit();
+          }
+        }}
+        placeholder="Ask about the meeting, paste a screenshot, or /minutes /clarify /context /correction /custom"
+        disabled={busy}
+        aria-label="Meeting chat input"
+      />
       <button type="submit" className="primary" disabled={busy || !input.trim()}><Icon name="arrow-right" size={14} />Send</button>
     </form>
   </div>;

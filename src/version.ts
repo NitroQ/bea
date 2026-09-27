@@ -1,9 +1,8 @@
 /**
  * Single source of truth for the version → release-tag mapping.
- * Internal versions are X.Y.Z (Cargo/npm semver requirement); release tags
- * on github.com/NitroQ/bea are two digits only: v1.0, v1.1, ...
+ * Internal versions and release tags on github.com/NitroQ/bea are both X.Y.Z,
+ * so the tag is the version with a `v` prefix.
  */
 export function releaseTag(version: string): string {
-  const [major, minor] = version.split(".");
-  return `v${major}.${minor}`;
+  return `v${version}`;
 }

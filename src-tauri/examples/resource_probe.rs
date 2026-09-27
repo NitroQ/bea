@@ -62,7 +62,10 @@ fn make_long_fixture(ffmpeg: &Path, source: &Path, output: &Path) -> Result<(), 
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let models_root = PathBuf::from(args.get(1).expect("usage: resource_probe <models_root> [whisper|qwen]"));
+    let models_root = PathBuf::from(
+        args.get(1)
+            .expect("usage: resource_probe <models_root> [whisper|qwen]"),
+    );
     let which = args.get(2).map(String::as_str).unwrap_or("whisper");
     let (engine_id, engine_dir, fixture): (String, PathBuf, PathBuf) = match which {
         "qwen" => (
@@ -88,7 +91,9 @@ fn main() {
     println!("== machine ==");
     println!(
         "cores={} asr_thread_count={} turbo_supported={}",
-        std::thread::available_parallelism().map(|c| c.get()).unwrap_or(0),
+        std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(0),
         asr_thread_count(),
         turbo_supported()
     );
@@ -238,8 +243,13 @@ fn main() {
             start_seconds: 0,
             end_seconds: 60,
         };
-        let result = engine.transcribe(&chunk, &TranscriptLanguage::English).expect("qwen decode");
-        println!("== qwen KV=1024 smoke: text = {:?} ==", &result.text[..result.text.len().min(80)]);
+        let result = engine
+            .transcribe(&chunk, &TranscriptLanguage::English)
+            .expect("qwen decode");
+        println!(
+            "== qwen KV=1024 smoke: text = {:?} ==",
+            &result.text[..result.text.len().min(80)]
+        );
     }
     println!("smoke probe complete");
 }

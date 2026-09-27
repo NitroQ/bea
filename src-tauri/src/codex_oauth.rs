@@ -137,8 +137,7 @@ pub fn responses_payload_multimodal(
     images: &[(std::path::PathBuf, String)],
 ) -> serde_json::Value {
     use base64::Engine;
-    let mut parts =
-        vec![serde_json::json!({"type": "input_text", "text": request.user})];
+    let mut parts = vec![serde_json::json!({"type": "input_text", "text": request.user})];
     for (path, _ocr) in images {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
@@ -362,7 +361,10 @@ mod tests {
             max_output_tokens: 500,
             reasoning_effort: "off".into(),
         };
-        assert_eq!(responses_payload(&request)["store"], serde_json::json!(false));
+        assert_eq!(
+            responses_payload(&request)["store"],
+            serde_json::json!(false)
+        );
         assert_eq!(
             responses_payload_multimodal(&request, &[])["store"],
             serde_json::json!(false)

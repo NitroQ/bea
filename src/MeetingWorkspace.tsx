@@ -2,18 +2,21 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { save as saveDialog } from '@tauri-apps/plugin-dialog';
-import { isSilenceSegment, mediaKindIsVideo, speakerLabel, exportExtension, minutesHasExportableContent } from './types';
+import { isSilenceSegment, mediaKindIsVideo, speakerLabel, exportExtension, minutesHasExportableContent, chatExtension, tableExtension, safeFileStem } from './types';
 import type { ContextEventRow, Meeting, Minutes, OpenRouterModelInfo, ProviderConfig, SpeakerName, TranscriptSegment } from './types';
 import { applyBlockEdit, buildConversationBlocks } from './conversation';
 import type { ConversationBlock } from './conversation';
 import SpeakerEditor from './SpeakerEditor';
 import ChatPanel from './ChatPanel';
-import type { ChatMessage } from './ChatPanel';
+import type { ChatExportFormat, ChatMessage } from './ChatPanel';
+import { copyText, tableToCsv, tableToTsv } from './chatFormat';
+import type { ChatTableData, TableExportFormat } from './chatFormat';
 import ClarificationsWizard from './ClarificationsWizard';
 import BeaAvatar from './BeaAvatar';
 import type { ClarificationAnswer } from './ClarificationsWizard';
 import { parseSlashCommand } from './chatActions';
 import type { ClarificationQuestion } from './chatActions';
+import { rememberModelContext } from './modelContext';
 import { modelLooksVisionCapable } from './ChatPanel';
 import { CODEX_FALLBACK_MODELS, codexModelOptionsOrFallback } from './providerPresets';
 import Icon from './Icon';
@@ -26,6 +29,9 @@ const emptyMinutes = (title: string): Minutes => ({ title, summary: '', agenda: 
 const mmss = (seconds: number) => { const total = Math.max(0, Math.floor(seconds)); const hours = Math.floor(total / 3600); const minutes = Math.floor((total % 3600) / 60); const secs = total % 60; const two = (value: number) => value.toString().padStart(2, '0'); return hours > 0 ? `${hours}:${two(minutes)}:${two(secs)}` : `${two(minutes)}:${two(secs)}`; };
 
 const SPEEDS = [1, 1.25, 1.5, 2, 0.75];
+/// SQLite stores `created_at` as an ISO string, so locally-created messages get
+/// the same shape to keep the chat clock consistent across a reload.
+const nowIso = () => new Date().toISOString();
 
 export default function MeetingWorkspace({ meeting, onBack, onNotice, onImport, onImportVtt, onRecording, onMeetingStatus, onRetryTranscription, onResumeTranscription, onRepairTools, repairing = [], busy, transcriptionStartedAt = null, transcribeProgress, liveSegments = [], generating, onGenerateMinutes, onCancelMinutesGeneration }: Props) {
   const [tab, setTab] = useState<Tab>('transcript');
@@ -246,12 +252,14 @@ export default function MeetingWorkspace({ meeting, onBack, onNotice, onImport, 
       // event holds "Q: …\nA: …"; split it so the user's question shows as
       // their own bubble again instead of vanishing inside the answer.
       .then((events) => setChatMessages(events.filter((event) => event.kind !== 'clarify').flatMap((event) => {
-        if (event.kind !== 'chat') return [{ id: event.id, role: 'user' as const, text: event.payload }];
+        // `created_at` is already on the row; the pair shares the answer's
+        // timestamp since the Q/A is stored as a single record.
+        if (event.kind !== 'chat') return [{ id: event.id, role: 'user' as const, text: event.payload, createdAt: event.created_at }];
         const pair = event.payload.match(/^Q: ([\s\S]*?)\nA: ([\s\S]*)$/);
-        if (!pair) return [{ id: event.id, role: 'bea' as const, text: event.payload }];
+        if (!pair) return [{ id: event.id, role: 'bea' as const, text: event.payload, createdAt: event.created_at }];
         return [
-          { id: `${event.id}-q`, role: 'user' as const, text: pair[1] },
-          { id: `${event.id}-a`, role: 'bea' as const, text: pair[2] },
+          { id: `${event.id}-q`, role: 'user' as const, text: pair[1], createdAt: event.created_at },
+          { id: `${event.id}-a`, role: 'bea' as const, text: pair[2], createdAt: event.created_at },
         ];
       })))
       .catch(() => undefined);
@@ -280,8 +288,14 @@ export default function MeetingWorkspace({ meeting, onBack, onNotice, onImport, 
     onNotice(message);
   }
 
-  async function changeMeetingModel(model: string) {
+  async function changeMeetingModel(model: string, contextTokens?: number | null) {
     setMeetingModel(model);
+    // The catalog window is recorded *before* the switch is confirmed: chat sizes
+    // its next prompt from the per-meeting model, not the provider default, so
+    // this is the value that makes the transition visible on the next question.
+    // Awaited so a question sent right after the switch cannot race the write
+    // and land on the previous model's budget.
+    await rememberModelContext(model, contextTokens);
     try { await invoke('set_meeting_model_command', { meetingId: meeting.id, model }); notify(model.trim() ? `This meeting now uses ${model.trim()}.` : 'Using the default model from Settings.'); } catch (error) { notify(`Could not save the model: ${String(error)}`); }
   }
 
@@ -294,10 +308,10 @@ export default function MeetingWorkspace({ meeting, onBack, onNotice, onImport, 
     const parsed = parseSlashCommand(input);
     const localId = crypto.randomUUID();
     if (parsed.action?.startsWith('unknown:')) {
-      setChatMessages((current) => [...current, { id: localId, role: 'system', text: `Unknown action "${parsed.action!.split(':')[1]}". Try /clarify /context /correction /custom.` }]);
+      setChatMessages((current) => [...current, { id: localId, role: 'system', text: `Unknown action "${parsed.action!.split(':')[1]}". Try /clarify /context /correction /custom.`, createdAt: nowIso() }]);
       return;
     }
-    setChatMessages((current) => [...current, { id: localId, role: 'user', text: input.trim() }]);
+    setChatMessages((current) => [...current, { id: localId, role: 'user', text: input.trim(), createdAt: nowIso() }]);
     if (parsed.action === 'correction') {
       // The instruction is natural language (e.g. "replace all "enyu" with
       // "NU""). The AI resolves it into concrete find/replace pairs against
@@ -312,44 +326,61 @@ export default function MeetingWorkspace({ meeting, onBack, onNotice, onImport, 
         const stored = await invoke<TranscriptSegment[]>('list_transcript_command', { meetingId: meeting.id });
         setTranscript(stored);
         const summary = result.replacements.map((pair) => `“${pair.find}” → “${pair.replace}”`).join(', ');
-        setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'bea', text: total > 0 ? `Applied ${total} replacement(s): ${summary}` : `No matches found in the transcript. ${result.note}`.trim() }]);
-      } catch (error) { setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'system', text: `Correction failed: ${String(error)}` }]); }
+        setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'bea', text: total > 0 ? `Applied ${total} replacement(s): ${summary}` : `No matches found in the transcript. ${result.note}`.trim(), createdAt: nowIso() }]);
+      } catch (error) { setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'system', text: `Correction failed: ${String(error)}`, createdAt: nowIso() }]); }
       finally { setChatBusy(false); }
       return;
     }
     if (parsed.action === 'custom') { setShowCustomFormat(true); return; }
     if (parsed.action === 'minutes') {
-      if (!parsed.arg.trim()) { setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'system', text: 'Describe the change after /minutes, e.g. “/minutes add an agenda item about the budget review”.' }]); return; }
+      if (!parsed.arg.trim()) { setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'system', text: 'Describe the change after /minutes, e.g. “/minutes add an agenda item about the budget review”.', createdAt: nowIso() }]); return; }
       setChatBusy(true);
       try {
         const updated = await invoke<Minutes>('modify_minutes_command', { meetingId: meeting.id, instruction: parsed.arg });
         setMinutes(updated);
-        setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'bea', text: 'Minutes updated. Check the Minutes tab for the changes.' }]);
-      } catch (error) { setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'system', text: `Could not modify minutes: ${String(error)}` }]); }
+        setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'bea', text: 'Minutes updated. Check the Minutes tab for the changes.', createdAt: nowIso() }]);
+      } catch (error) { setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'system', text: `Could not modify minutes: ${String(error)}`, createdAt: nowIso() }]); }
       finally { setChatBusy(false); }
       return;
     }
     if (parsed.action === 'clarify' || parsed.action === 'context') {
-      if (!parsed.arg.trim()) { setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'system', text: `Add a note after ${parsed.action}, e.g. “/${parsed.action} the vote passed 5-2”.` }]); return; }
+      if (!parsed.arg.trim()) { setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'system', text: `Add a note after ${parsed.action}, e.g. “/${parsed.action} the vote passed 5-2”.`, createdAt: nowIso() }]); return; }
       try {
         const event = await invoke<{ id: string }>('add_context_event_command', { meetingId: meeting.id, kind: parsed.action, payload: parsed.arg });
-        setChatMessages((current) => [...current, { id: event.id, role: 'user', text: parsed.arg }]);
-      } catch (error) { setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'system', text: `Could not save: ${String(error)}` }]); }
+        setChatMessages((current) => [...current, { id: event.id, role: 'user', text: parsed.arg, createdAt: nowIso() }]);
+      } catch (error) { setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'system', text: `Could not save: ${String(error)}`, createdAt: nowIso() }]); }
       return;
     }
     // plain question → chat_command. The AI pulls video frames itself when the
     // meeting has a video; pasted/uploaded images ride along as attachments.
+    await askBea(input.trim(), images);
+  }
+
+  /// Shared by the first send and by "Retry": asks the model and appends the
+  /// answer bubble. The question bubble is added by the caller so a retry does
+  /// not duplicate it.
+  async function askBea(question: string, images: string[] = []) {
     setChatBusy(true);
-    const question = input.trim();
     try {
       const reply = await invoke<{ answer: string; frames_used: number; mode: string }>('chat_command', { meetingId: meeting.id, question, images });
       const chip = reply.mode && reply.frames_used > 0
         ? `${reply.mode === 'vision' ? '📷' : '🔍'} ${reply.frames_used} image${reply.frames_used === 1 ? '' : 's'} (${reply.mode === 'vision' ? 'vision' : 'OCR fallback'})`
         : undefined;
-      setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'bea', text: reply.answer, chip }]);
+      setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'bea', text: reply.answer, chip, createdAt: nowIso() }]);
     } catch (error) {
-      setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'system', text: `Chat failed: ${String(error)}` }]);
+      setChatMessages((current) => [...current, { id: crypto.randomUUID(), role: 'system', text: `Chat failed: ${String(error)}`, createdAt: nowIso() }]);
     } finally { setChatBusy(false); }
+  }
+
+  /// Re-asks the newest question. The stale answer stays until the retry lands
+  /// so the previous result is not lost if the request fails.
+  const lastQuestion = useMemo(
+    () => [...chatMessages].reverse().find((message) => message.role === 'user')?.text ?? '',
+    [chatMessages],
+  );
+  async function regenerateChat() {
+    if (chatBusy || !lastQuestion) return;
+    await askBea(lastQuestion);
   }
 
   const generationRef = useRef<Promise<void> | null>(null);
@@ -464,6 +495,75 @@ export default function MeetingWorkspace({ meeting, onBack, onNotice, onImport, 
     } catch (error) { notify(`Unable to export: ${String(error)}`); }
   }
   function downloadMarkdown() { const agenda = minutes.agenda.length ? `\n\n## Agenda\n${minutes.agenda.map((item) => { const span = item.start_seconds != null && item.end_seconds != null ? ` (${mmss(item.start_seconds)}\u2013${mmss(item.end_seconds)})` : ''; return `- ${item.heading}${span}`; }).join('\n')}` : ''; const text = `# ${minutes.title}\n\n${minutes.summary}${agenda}\n\n## Decisions\n${minutes.decisions.map((item) => `- ${item.summary}`).join('\n')}\n\n## Action items\n${minutes.action_items.map((item) => `- ${item.summary}`).join('\n')}\n\n## Unresolved\n${minutes.unresolved.map((item) => `- ${item.summary}`).join('\n')}`; const anchor = document.createElement('a'); anchor.href = URL.createObjectURL(new Blob([text], { type: 'text/markdown' })); anchor.download = `${minutes.title.replace(/[^a-z0-9]+/gi, '-').toLowerCase() || 'minutes'}.md`; anchor.click(); URL.revokeObjectURL(anchor.href); notify('Markdown export downloaded.'); }
+  /// Per-table download. Desktop hands the rows to the Rust exporter so a real
+  /// .csv/.xlsx lands on disk; the browser preview can only manage CSV and
+  /// plain-text table copies.
+  async function downloadTable(table: ChatTableData, format: TableExportFormat) {
+    const stem = `${safeFileStem(meeting.title, 'meeting')}-table`;
+    const ext = tableExtension(format);
+    try {
+      if (inDesktop) {
+        const destination = await saveDialog({ defaultPath: `${stem}.${ext}`, filters: [{ name: ext.toUpperCase(), extensions: [ext] }] });
+        if (!destination) return;
+        await invoke('export_table_command', { headers: table.headers, rows: table.rows, format, destination });
+        notify(`${ext.toUpperCase()} table saved.`);
+        return;
+      }
+      if (format === 'xlsx') {
+        await copyText(tableToTsv(table));
+        notify('XLSX export needs the desktop app — the table was copied as tab-separated text instead.');
+        return;
+      }
+      const anchor = document.createElement('a');
+      anchor.href = URL.createObjectURL(new Blob(['\uFEFF', tableToCsv(table)], { type: 'text/csv;charset=utf-8' }));
+      anchor.download = `${stem}.${ext}`;
+      anchor.click();
+      URL.revokeObjectURL(anchor.href);
+      notify('CSV table downloaded.');
+    } catch (error) { notify(`Unable to export table: ${String(error)}`); }
+  }
+
+  /// Full chat export. Markdown keeps the model's own formatting (headings,
+  /// tables, fenced code); plain text drops it for pasting into an email.
+  async function exportChat(format: ChatExportFormat) {
+    if (!chatMessages.some((message) => message.role !== 'system')) { notify('There is no chat to export yet.'); return; }
+    const ext = chatExtension(format);
+    const defaultName = `${safeFileStem(meeting.title, 'meeting')}-chat.${ext}`;
+    try {
+      if (inDesktop) {
+        const destination = await saveDialog({ defaultPath: defaultName, filters: [{ name: ext.toUpperCase(), extensions: [ext] }] });
+        if (!destination) return;
+        await invoke('export_chat_command', { meetingId: meeting.id, format, destination });
+        notify(`${ext.toUpperCase()} chat export saved.`);
+        return;
+      }
+      const anchor = document.createElement('a');
+      anchor.href = URL.createObjectURL(new Blob([buildChatDocument(format)], { type: format === 'markdown' ? 'text/markdown' : 'text/plain' }));
+      anchor.download = defaultName;
+      anchor.click();
+      URL.revokeObjectURL(anchor.href);
+      notify(`${ext.toUpperCase()} chat downloaded.`);
+    } catch (error) { notify(`Unable to export chat: ${String(error)}`); }
+  }
+
+  /// Browser-preview equivalent of the Rust `export_chat_*` serializers. Kept
+  /// in step with the Q/A layout the backend writes so both exports match.
+  function buildChatDocument(format: ChatExportFormat): string {
+    const header = `# ${meeting.title} — chat`;
+    const pairs = chatMessages
+      .filter((message) => message.role !== 'system')
+      .map((message) => ({
+        who: message.role === 'user' ? 'You' : 'Bea',
+        at: message.createdAt ? new Date(message.createdAt).toLocaleString() : '',
+        text: message.text,
+      }));
+    if (format === 'text') {
+      return [`${meeting.title} — chat`, '', ...pairs.flatMap((pair) => [`${pair.at ? `${pair.at} ` : ''}${pair.who}:`, pair.text, ''])].join('\n');
+    }
+    const body = pairs.flatMap((pair) => [`### ${pair.who}${pair.at ? ` · ${pair.at}` : ''}`, '', pair.text, '']);
+    return [header, '', ...body].join('\n');
+  }
+
   /// Transcript export: build a formatted string from the conversation blocks
   /// and offer a client-side download. Three formats cover the common use
   /// cases — plain text for quick sharing, markdown for notes apps, and VTT
@@ -568,7 +668,7 @@ export default function MeetingWorkspace({ meeting, onBack, onNotice, onImport, 
   const chatVisionCapable = effectiveChatModel ? modelLooksVisionCapable(effectiveChatModel, openRouterModels) : null;
   const toolsHint = /media processing|ffmpeg|ffprobe|cannot find the path|os error|no completed recording chunks/i.test(meeting.last_error ?? '');
 
-  return <main className="workspace-shell"><aside className="workspace-rail"><button type="button" className="rail-back" onClick={onBack} aria-label="Back to the meeting list" title="Back to meetings"><Icon name="arrow-left" size={15} />All meetings</button><nav className="workspace-nav">{(['transcript', 'minutes', 'evidence', 'chat'] as Tab[]).map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}><Icon name={item === 'transcript' ? 'waveform' : item === 'minutes' ? 'file' : item === 'evidence' ? 'image' : 'spark'} size={15} />{item[0].toUpperCase() + item.slice(1)}{item === 'transcript' && mergedTranscript.length > 0 && <span className="nav-count">{mergedTranscript.length}</span>}</button>)}</nav><div className="workspace-rail-footer"><span className="local-dot" />Local project<small>{meeting.language === 'auto' ? 'Language auto-detect' : meeting.language}</small></div></aside><section className="workspace-main"><header className="workspace-header"><div className="workspace-title-lockup"><BeaAvatar variant="presenting" size={46} /><div><span className="workspace-breadcrumb">{tab[0].toUpperCase() + tab.slice(1)}</span><h1>{meeting.title}</h1></div></div><div className="workspace-header-actions"><span className={`status-label ${status} ${busy ? 'working' : ''}`}>{busy ? transcribeProgress ? `Transcribing… ${transcribeProgress.completed}/${transcribeProgress.total} · ${mmss(elapsedSeconds)} elapsed` : `Transcribing… ${mmss(elapsedSeconds)} elapsed` : status === 'recording' ? 'Recording' : status === 'processing' ? (resumeAvailable ? 'Interrupted — resume to continue' : 'Processing') : status === 'ready' ? 'Ready' : statusLabel(status)}</span>{busy && <div className="workspace-progress" role="progressbar" aria-label="Transcription progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={transcribeProgress?.total ? Math.round((transcribeProgress.completed / transcribeProgress.total) * 100) : undefined}><span style={{ width: transcribeProgress?.total ? `${Math.round((transcribeProgress.completed / transcribeProgress.total) * 100)}%` : '100%' }} className={!transcribeProgress ? 'indeterminate' : undefined} /></div>}{status === 'failed' && <span className="status-reason" title={meeting.last_error ?? ''}>{meeting.last_error ? 'Transcription failed — see the overview for details' : 'The last transcription attempt failed'}</span>}{((status === 'failed' || status === 'processing' || status === 'draft') && resumeAvailable && !busy) && <button className="primary" onClick={() => onResumeTranscription(meeting)}><Icon name="play" size={15} />Resume transcription</button>}{(status === 'processing' || status === 'failed') && !busy && <button className="secondary" onClick={() => onRetryTranscription(meeting)}><Icon name="refresh" size={15} />Retry transcription</button>}{mediaCount === 0 && <button className="secondary" onClick={() => onImport(meeting)}><Icon name="upload" size={15} />Import</button>}{(status === 'recording' || status === 'paused') ? <RecordingBar recording={status === 'recording'} seconds={recordingSeconds} level={recordingLevel} onPauseResume={() => onRecording(meeting, status === 'recording' ? 'pause' : 'resume')} onStop={() => onRecording(meeting, 'stop')} /> : mediaCount === 0 && <RecordLauncher devices={audioDevices} selected={selectedDevices} onToggle={(id) => setSelectedDevices((current) => current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id])} onStart={() => onRecording(meeting, 'start', selectedDevices)} disabled={generating || busy} />}</div></header>{tab === 'transcript' && <>{meeting.status === 'failed' && <div className="attention-panel" role="alert"><div className="attention-copy"><strong>Transcription needs attention</strong><span>{meeting.last_error ?? 'The last transcription attempt failed without a reported reason.'}</span></div><div className="attention-actions">{toolsHint && <button className="secondary" onClick={() => void onRepairTools?.(['ffmpeg'])} disabled={repairing.includes('ffmpeg')}><Icon name={repairing.includes('ffmpeg') ? 'refresh' : 'download'} size={14} />{repairing.includes('ffmpeg') ? 'Installing…' : 'Install FFmpeg & FFprobe'}</button>}{resumeAvailable && <button className="primary" onClick={() => onResumeTranscription(meeting)}><Icon name="play" size={14} />Resume transcription</button>}<button className={resumeAvailable ? 'secondary' : 'primary'} onClick={() => onRetryTranscription(meeting)} disabled={repairing.includes('ffmpeg')}><Icon name="refresh" size={14} />{resumeAvailable ? 'Start over' : repairing.includes('ffmpeg') ? 'Waiting for tools…' : 'Retry transcription'}</button></div></div>}<div className="workspace-grid"><section className="editor-column"><div className="player"><div className="player-heading"><div><span className="player-label">Media</span><strong>{meeting.title}</strong></div><span>{mmss(Math.round(playbackSeconds))} / {mmss(mediaDuration || meeting.duration_seconds)}</span></div><div className="player-timeline"><input aria-label="Playback position" type="range" min="0" max="1" step="0.01" value={mediaDuration ? playbackSeconds / mediaDuration : 0} onChange={(event) => { const media = mediaRef.current; if (media && mediaDuration) { media.currentTime = Number(event.target.value) * mediaDuration; setPlaybackSeconds(media.currentTime); } }} /></div><div className="player-controls"><div className="player-volume"><button className="player-pill" aria-label={muted || volume === 0 ? 'Unmute' : 'Mute'} onClick={() => { if (muted || volume === 0) { setMuted(false); if (volume === 0) setVolume(0.6); } else setMuted(true); }}><Icon name={muted || volume === 0 ? 'volume-mute' : 'volume'} size={15} /></button><input aria-label="Volume" type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume} onChange={(event) => { const next = Number(event.target.value); setVolume(next); setMuted(next === 0); }} /></div><div className="player-center"><button className="player-skip" aria-label="Back 10 seconds" onClick={() => skip(-10)}><Icon name="rewind-10" size={20} /></button><button className="play-button" aria-label={playing ? 'Pause' : 'Play'} onClick={() => { const media = mediaRef.current; if (!media) return; if (playing) { media.pause(); } else { void media.play(); } }}><Icon name={playing ? 'pause' : 'play'} size={16} /></button><button className="player-skip" aria-label="Forward 10 seconds" onClick={() => skip(10)}><Icon name="forward-10" size={20} /></button></div><div className="player-speed"><button className="player-pill" aria-label="Playback speed" onClick={() => setPlaybackRate((rate) => SPEEDS[(SPEEDS.indexOf(rate) + 1) % SPEEDS.length] ?? 1)}>{speedLabel}</button></div></div>{proxyNotice && <small className="proxy-notice">{proxyNotice}</small>}{mediaUrl && isVideo ? <video ref={videoRef} src={mediaUrl} preload="metadata" playsInline onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => { setPlaying(false); setPlaybackSeconds(0); }} onTimeUpdate={(event) => setPlaybackSeconds(event.currentTarget.currentTime)} onLoadedMetadata={(event) => setMediaDuration(event.currentTarget.duration || 0)} onError={() => { if (proxyTriedRef.current) return; proxyTriedRef.current = true; setProxyNotice('Preparing playback…'); invoke<{ path: string }>('ensure_playable_proxy_command', { meetingId: meeting.id, mediaPath: decodeURIComponent(new URL(mediaUrl).pathname.replace(/^\/[A-Za-z]:/, '')) }).then((proxy) => { setMediaUrl(convertFileSrc(proxy.path)); setProxyNotice(null); }).catch((error) => { setProxyNotice(null); notify(`Playback failed: ${String(error)}`); }); }} style={{ width: '100%', borderRadius: 8, background: '#000' }} /> : null}{mediaUrl && !isVideo ? <audio ref={audioRef} src={mediaUrl} preload="metadata" onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => { setPlaying(false); setPlaybackSeconds(0); }} onTimeUpdate={(event) => setPlaybackSeconds(event.currentTarget.currentTime)} onLoadedMetadata={(event) => setMediaDuration(event.currentTarget.duration || 0)} /> : null}</div><div className="transcript-toolbar"><div><h2>Transcript</h2><span>{filteredTranscript.length} conversation turns{speakerCount > 0 ? ` · ${speakerCount} speaker${speakerCount === 1 ? '' : 's'} detected` : ''}{silenceSeconds >= 1 ? ` · ${mmss(silenceSeconds)} silence` : ''}{busy ? ' · transcribing' : ''}</span></div><label className="search-field"><Icon name="search" size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Find in transcript" /></label><TranscriptExportMenu onExport={(format) => void downloadTranscript(format)} /><button className="secondary small" onClick={() => onImportVtt(meeting)}><Icon name="file" size={14} />Import VTT</button><button className="secondary small" onClick={() => setShowSpeakerEditor(true)}><Icon name="grid" size={14} />Speakers</button></div><div className="transcript-editor">{filteredTranscript.length === 0 ? <div className="empty-editor"><Icon name="waveform" size={24} /><p>{query ? 'No transcript segment matches that search.' : 'No transcript yet. Record or import a file to begin.'}</p></div> : filteredTranscript.map((block) => { const extra = segmentSpeakers[block.key] ?? []; return <article className="conversation-block" key={block.key}><header className="conversation-header"><span className={`conversation-speaker${block.speaker !== null ? ' assigned' : ''}`}>{speakerLabel(block.speaker, speakerNames, extra)}</span><button className="segment-time" onClick={() => { const media = mediaRef.current; if (media) { media.currentTime = block.startSeconds; setPlaybackSeconds(block.startSeconds); } }}>{mmss(block.startSeconds)}{block.endSeconds - block.startSeconds >= 60 ? `–${mmss(block.endSeconds)}` : ''}</button><span className="conversation-tools"><SpeakerPicker primary={block.speaker} extras={extra} names={speakerNames} onApply={(selection) => void applySpeakerSelection(block, selection)} /></span></header><textarea className="conversation-text" value={block.text} onChange={(event) => { void updateSegment(block, event.target.value); }} rows={Math.max(2, Math.ceil(block.text.length / 110))} aria-label={`Transcript from ${mmss(block.startSeconds)}`} /></article>; })}</div></section><Inspector minutes={minutes} onGenerate={() => void generate()} generating={generating} hasTranscript={transcript.length > 0} /></div></>}{tab === 'minutes' && <MinutesPanel minutes={minutes} onGenerate={() => void generate()} onExport={(format) => void exportMinutes(format)} generating={generating} hasTranscript={transcript.length > 0} />}{tab === 'evidence' && <EvidencePanel evidence={evidence} onSeek={seekFromEvidence} />}{tab === 'chat' && <ChatPanel messages={chatMessages} busy={chatBusy} hasCustomFormat={customFormat.trim().length > 0} meetingModel={meetingModel} modelOptions={chatModelOptions.length ? chatModelOptions : openRouterModels.map((model) => model.id)} openRouterModels={openRouterModels} meetingReasoning={meetingReasoning} onReasoningChange={(reasoning) => void changeMeetingReasoning(reasoning)} visionCapable={chatVisionCapable} onModelChange={(model) => void changeMeetingModel(model)} onSend={(input, images) => void sendChat(input, images)} onOpenCustomFormat={() => setShowCustomFormat(true)} />}</section>{showSpeakerEditor && <SpeakerEditor meetingId={meeting.id} names={speakerNames} detectedIndices={detectedSpeakerIndices} onNamesChanged={setSpeakerNames} onNotice={onNotice} onClose={() => setShowSpeakerEditor(false)} />}{showCustomFormat && <div className="custom-format-overlay" role="dialog" aria-label="Custom minutes format"><div className="custom-format-modal"><div className="minutes-heading"><div><span className="page-kicker">Minutes format</span><h2>Custom minutes format</h2><p>Markdown the minutes must follow. Leave empty to use the default format.</p></div><button className="secondary small" onClick={() => setShowCustomFormat(false)}><Icon name="x" size={14} />Close</button></div><textarea className="custom-format-editor" value={customFormat} onChange={(event) => setCustomFormat(event.target.value)} rows={14} placeholder={'## Summary\n## Decisions\n## Actions — owner + due date\n## Open questions'} aria-label="Custom minutes format editor" /><div className="minutes-actions"><button className="primary" onClick={() => { void invoke('save_custom_minutes_format_command', { meetingId: meeting.id, format: customFormat }).then(() => notify('Custom minutes format saved.')).catch((error) => notify(`Could not save the format: ${String(error)}`)); setShowCustomFormat(false); }}><Icon name="check" size={14} />Save format</button><button className="secondary" onClick={() => { setCustomFormat(''); void invoke('save_custom_minutes_format_command', { meetingId: meeting.id, format: '' }).catch(() => undefined); }}>Reset to default</button></div></div></div>}{clarifyQuestions && <ClarificationsWizard questions={clarifyQuestions} busy={generating} onAnswered={(answers) => void confirmClarifications(answers)} onClose={closeClarifications} />}{toast && <div className={`workspace-toast ${toast.error ? 'error' : ''}`} role="status"><Icon name={toast.error ? 'x' : 'check'} size={14} /><span>{toast.message}</span><button type="button" className="workspace-toast-close" onClick={() => setToast(null)} aria-label="Dismiss notification"><Icon name="x" size={12} /></button></div>}</main>;
+  return <main className="workspace-shell"><aside className="workspace-rail"><button type="button" className="rail-back" onClick={onBack} aria-label="Back to the meeting list" title="Back to meetings"><Icon name="arrow-left" size={15} />All meetings</button><nav className="workspace-nav">{(['transcript', 'minutes', 'evidence', 'chat'] as Tab[]).map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}><Icon name={item === 'transcript' ? 'waveform' : item === 'minutes' ? 'file' : item === 'evidence' ? 'image' : 'spark'} size={15} />{item[0].toUpperCase() + item.slice(1)}{item === 'transcript' && mergedTranscript.length > 0 && <span className="nav-count">{mergedTranscript.length}</span>}</button>)}</nav><div className="workspace-rail-footer"><span className="local-dot" />Local project<small>{meeting.language === 'auto' ? 'Language auto-detect' : meeting.language}</small></div></aside><section className="workspace-main"><header className="workspace-header"><div className="workspace-title-lockup"><BeaAvatar variant="presenting" size={46} /><div><span className="workspace-breadcrumb">{tab[0].toUpperCase() + tab.slice(1)}</span><h1>{meeting.title}</h1></div></div><div className="workspace-header-actions"><span className={`status-label ${status} ${busy ? 'working' : ''}`}>{busy ? transcribeProgress ? `Transcribing… ${transcribeProgress.completed}/${transcribeProgress.total} · ${mmss(elapsedSeconds)} elapsed` : `Transcribing… ${mmss(elapsedSeconds)} elapsed` : status === 'recording' ? 'Recording' : status === 'processing' ? (resumeAvailable ? 'Interrupted — resume to continue' : 'Processing') : status === 'ready' ? 'Ready' : statusLabel(status)}</span>{busy && <div className="workspace-progress" role="progressbar" aria-label="Transcription progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={transcribeProgress?.total ? Math.round((transcribeProgress.completed / transcribeProgress.total) * 100) : undefined}><span style={{ width: transcribeProgress?.total ? `${Math.round((transcribeProgress.completed / transcribeProgress.total) * 100)}%` : '100%' }} className={!transcribeProgress ? 'indeterminate' : undefined} /></div>}{status === 'failed' && <span className="status-reason" title={meeting.last_error ?? ''}>{meeting.last_error ? 'Transcription failed — see the overview for details' : 'The last transcription attempt failed'}</span>}{((status === 'failed' || status === 'processing' || status === 'draft') && resumeAvailable && !busy) && <button className="primary" onClick={() => onResumeTranscription(meeting)}><Icon name="play" size={15} />Resume transcription</button>}{(status === 'processing' || status === 'failed') && !busy && <button className="secondary" onClick={() => onRetryTranscription(meeting)}><Icon name="refresh" size={15} />Retry transcription</button>}{mediaCount === 0 && <button className="secondary" onClick={() => onImport(meeting)}><Icon name="upload" size={15} />Import</button>}{(status === 'recording' || status === 'paused') ? <RecordingBar recording={status === 'recording'} seconds={recordingSeconds} level={recordingLevel} onPauseResume={() => onRecording(meeting, status === 'recording' ? 'pause' : 'resume')} onStop={() => onRecording(meeting, 'stop')} /> : mediaCount === 0 && <RecordLauncher devices={audioDevices} selected={selectedDevices} onToggle={(id) => setSelectedDevices((current) => current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id])} onStart={() => onRecording(meeting, 'start', selectedDevices)} disabled={generating || busy} />}</div></header>{tab === 'transcript' && <>{meeting.status === 'failed' && <div className="attention-panel" role="alert"><div className="attention-copy"><strong>Transcription needs attention</strong><span>{meeting.last_error ?? 'The last transcription attempt failed without a reported reason.'}</span></div><div className="attention-actions">{toolsHint && <button className="secondary" onClick={() => void onRepairTools?.(['ffmpeg'])} disabled={repairing.includes('ffmpeg')}><Icon name={repairing.includes('ffmpeg') ? 'refresh' : 'download'} size={14} />{repairing.includes('ffmpeg') ? 'Installing…' : 'Install FFmpeg & FFprobe'}</button>}{resumeAvailable && <button className="primary" onClick={() => onResumeTranscription(meeting)}><Icon name="play" size={14} />Resume transcription</button>}<button className={resumeAvailable ? 'secondary' : 'primary'} onClick={() => onRetryTranscription(meeting)} disabled={repairing.includes('ffmpeg')}><Icon name="refresh" size={14} />{resumeAvailable ? 'Start over' : repairing.includes('ffmpeg') ? 'Waiting for tools…' : 'Retry transcription'}</button></div></div>}<div className="workspace-grid"><section className="editor-column"><div className="player"><div className="player-heading"><div><span className="player-label">Media</span><strong>{meeting.title}</strong></div><span>{mmss(Math.round(playbackSeconds))} / {mmss(mediaDuration || meeting.duration_seconds)}</span></div><div className="player-timeline"><input aria-label="Playback position" type="range" min="0" max="1" step="0.01" value={mediaDuration ? playbackSeconds / mediaDuration : 0} onChange={(event) => { const media = mediaRef.current; if (media && mediaDuration) { media.currentTime = Number(event.target.value) * mediaDuration; setPlaybackSeconds(media.currentTime); } }} /></div><div className="player-controls"><div className="player-volume"><button className="player-pill" aria-label={muted || volume === 0 ? 'Unmute' : 'Mute'} onClick={() => { if (muted || volume === 0) { setMuted(false); if (volume === 0) setVolume(0.6); } else setMuted(true); }}><Icon name={muted || volume === 0 ? 'volume-mute' : 'volume'} size={15} /></button><input aria-label="Volume" type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume} onChange={(event) => { const next = Number(event.target.value); setVolume(next); setMuted(next === 0); }} /></div><div className="player-center"><button className="player-skip" aria-label="Back 10 seconds" onClick={() => skip(-10)}><Icon name="rewind-10" size={20} /></button><button className="play-button" aria-label={playing ? 'Pause' : 'Play'} onClick={() => { const media = mediaRef.current; if (!media) return; if (playing) { media.pause(); } else { void media.play(); } }}><Icon name={playing ? 'pause' : 'play'} size={16} /></button><button className="player-skip" aria-label="Forward 10 seconds" onClick={() => skip(10)}><Icon name="forward-10" size={20} /></button></div><div className="player-speed"><button className="player-pill" aria-label="Playback speed" onClick={() => setPlaybackRate((rate) => SPEEDS[(SPEEDS.indexOf(rate) + 1) % SPEEDS.length] ?? 1)}>{speedLabel}</button></div></div>{proxyNotice && <small className="proxy-notice">{proxyNotice}</small>}{mediaUrl && isVideo ? <video ref={videoRef} src={mediaUrl} preload="metadata" playsInline onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => { setPlaying(false); setPlaybackSeconds(0); }} onTimeUpdate={(event) => setPlaybackSeconds(event.currentTarget.currentTime)} onLoadedMetadata={(event) => setMediaDuration(event.currentTarget.duration || 0)} onError={() => { if (proxyTriedRef.current) return; proxyTriedRef.current = true; setProxyNotice('Preparing playback…'); invoke<{ path: string }>('ensure_playable_proxy_command', { meetingId: meeting.id, mediaPath: decodeURIComponent(new URL(mediaUrl).pathname.replace(/^\/[A-Za-z]:/, '')) }).then((proxy) => { setMediaUrl(convertFileSrc(proxy.path)); setProxyNotice(null); }).catch((error) => { setProxyNotice(null); notify(`Playback failed: ${String(error)}`); }); }} style={{ width: '100%', borderRadius: 8, background: '#000' }} /> : null}{mediaUrl && !isVideo ? <audio ref={audioRef} src={mediaUrl} preload="metadata" onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => { setPlaying(false); setPlaybackSeconds(0); }} onTimeUpdate={(event) => setPlaybackSeconds(event.currentTarget.currentTime)} onLoadedMetadata={(event) => setMediaDuration(event.currentTarget.duration || 0)} /> : null}</div><div className="transcript-toolbar"><div><h2>Transcript</h2><span>{filteredTranscript.length} conversation turns{speakerCount > 0 ? ` · ${speakerCount} speaker${speakerCount === 1 ? '' : 's'} detected` : ''}{silenceSeconds >= 1 ? ` · ${mmss(silenceSeconds)} silence` : ''}{busy ? ' · transcribing' : ''}</span></div><label className="search-field"><Icon name="search" size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Find in transcript" /></label><TranscriptExportMenu onExport={(format) => void downloadTranscript(format)} /><button className="secondary small" onClick={() => onImportVtt(meeting)}><Icon name="file" size={14} />Import VTT</button><button className="secondary small" onClick={() => setShowSpeakerEditor(true)}><Icon name="grid" size={14} />Speakers</button></div><div className="transcript-editor">{filteredTranscript.length === 0 ? <div className="empty-editor"><Icon name="waveform" size={24} /><p>{query ? 'No transcript segment matches that search.' : 'No transcript yet. Record or import a file to begin.'}</p></div> : filteredTranscript.map((block) => { const extra = segmentSpeakers[block.key] ?? []; return <article className="conversation-block" key={block.key}><header className="conversation-header"><span className={`conversation-speaker${block.speaker !== null ? ' assigned' : ''}`}>{speakerLabel(block.speaker, speakerNames, extra)}</span><button className="segment-time" onClick={() => { const media = mediaRef.current; if (media) { media.currentTime = block.startSeconds; setPlaybackSeconds(block.startSeconds); } }}>{mmss(block.startSeconds)}{block.endSeconds - block.startSeconds >= 60 ? `–${mmss(block.endSeconds)}` : ''}</button><span className="conversation-tools"><SpeakerPicker primary={block.speaker} extras={extra} names={speakerNames} onApply={(selection) => void applySpeakerSelection(block, selection)} /></span></header><textarea className="conversation-text" value={block.text} onChange={(event) => { void updateSegment(block, event.target.value); }} rows={Math.max(2, Math.ceil(block.text.length / 110))} aria-label={`Transcript from ${mmss(block.startSeconds)}`} /></article>; })}</div></section><Inspector minutes={minutes} onGenerate={() => void generate()} generating={generating} hasTranscript={transcript.length > 0} /></div></>}{tab === 'minutes' && <MinutesPanel minutes={minutes} onGenerate={() => void generate()} onExport={(format) => void exportMinutes(format)} generating={generating} hasTranscript={transcript.length > 0} />}{tab === 'evidence' && <EvidencePanel evidence={evidence} onSeek={seekFromEvidence} />}{tab === 'chat' && <ChatPanel messages={chatMessages} busy={chatBusy} hasCustomFormat={customFormat.trim().length > 0} meetingModel={meetingModel} modelOptions={chatModelOptions.length ? chatModelOptions : openRouterModels.map((model) => model.id)} openRouterModels={openRouterModels} meetingReasoning={meetingReasoning} onReasoningChange={(reasoning) => void changeMeetingReasoning(reasoning)} visionCapable={chatVisionCapable} onModelChange={(model, contextTokens) => void changeMeetingModel(model, contextTokens)} onSend={(input, images) => void sendChat(input, images)} onOpenCustomFormat={() => setShowCustomFormat(true)} onRegenerate={() => void regenerateChat()} onExportTable={(table, format) => void downloadTable(table, format)} onExportChat={(format) => void exportChat(format)} />}</section>{showSpeakerEditor && <SpeakerEditor meetingId={meeting.id} names={speakerNames} detectedIndices={detectedSpeakerIndices} onNamesChanged={setSpeakerNames} onNotice={onNotice} onClose={() => setShowSpeakerEditor(false)} />}{showCustomFormat && <div className="custom-format-overlay" role="dialog" aria-label="Custom minutes format"><div className="custom-format-modal"><div className="minutes-heading"><div><span className="page-kicker">Minutes format</span><h2>Custom minutes format</h2><p>Markdown the minutes must follow. Leave empty to use the default format.</p></div><button className="secondary small" onClick={() => setShowCustomFormat(false)}><Icon name="x" size={14} />Close</button></div><textarea className="custom-format-editor" value={customFormat} onChange={(event) => setCustomFormat(event.target.value)} rows={14} placeholder={'## Summary\n## Decisions\n## Actions — owner + due date\n## Open questions'} aria-label="Custom minutes format editor" /><div className="minutes-actions"><button className="primary" onClick={() => { void invoke('save_custom_minutes_format_command', { meetingId: meeting.id, format: customFormat }).then(() => notify('Custom minutes format saved.')).catch((error) => notify(`Could not save the format: ${String(error)}`)); setShowCustomFormat(false); }}><Icon name="check" size={14} />Save format</button><button className="secondary" onClick={() => { setCustomFormat(''); void invoke('save_custom_minutes_format_command', { meetingId: meeting.id, format: '' }).catch(() => undefined); }}>Reset to default</button></div></div></div>}{clarifyQuestions && <ClarificationsWizard questions={clarifyQuestions} busy={generating} onAnswered={(answers) => void confirmClarifications(answers)} onClose={closeClarifications} />}{toast && <div className={`workspace-toast ${toast.error ? 'error' : ''}`} role="status"><Icon name={toast.error ? 'x' : 'check'} size={14} /><span>{toast.message}</span><button type="button" className="workspace-toast-close" onClick={() => setToast(null)} aria-label="Dismiss notification"><Icon name="x" size={12} /></button></div>}</main>;
 }
 
 function statusLabel(status: Meeting['status']) { return status === 'draft' ? 'Draft' : status === 'processing' ? 'Processing' : status === 'paused' ? 'Paused' : status === 'failed' ? 'Needs attention' : status[0].toUpperCase() + status.slice(1); }

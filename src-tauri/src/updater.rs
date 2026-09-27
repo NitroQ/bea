@@ -107,8 +107,11 @@ pub async fn download_and_install(app: &AppHandle) -> Result<(), String> {
 /// Shared scheduler loop, injected with the check future so tests can run it
 /// without an app handle. Sleeps out the startup delay first — tokio
 /// `interval` fires its first tick immediately, so the delay must be a sleep.
-pub async fn run_scheduled_checks<F, Fut>(mut check: F, startup_delay: Duration, check_interval: Duration)
-where
+pub async fn run_scheduled_checks<F, Fut>(
+    mut check: F,
+    startup_delay: Duration,
+    check_interval: Duration,
+) where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
@@ -161,7 +164,11 @@ mod tests {
         use std::sync::Arc;
         use std::time::Duration;
 
-        fn counting(checks: Arc<AtomicUsize>) -> impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
+        fn counting(
+            checks: Arc<AtomicUsize>,
+        ) -> impl FnMut() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
+        > {
             move || {
                 checks.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async { Ok(()) })

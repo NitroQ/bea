@@ -4,7 +4,7 @@ export type IconName =
   | 'arrow-left' | 'arrow-right' | 'check' | 'chevron-down' | 'chevron-right'
   | 'clock' | 'list' | 'download' | 'file' | 'folder' | 'forward-10' | 'grid' | 'headphones' | 'image'
   | 'mic' | 'more' | 'pause' | 'play' | 'plus' | 'refresh' | 'rewind-10' | 'search' | 'settings'
-  | 'spark' | 'trash' | 'upload' | 'video' | 'volume' | 'volume-mute' | 'waveform' | 'x';
+  | 'spark' | 'table' | 'copy' | 'trash' | 'upload' | 'video' | 'volume' | 'volume-mute' | 'waveform' | 'x';
 
 const paths: Record<IconName, ReactElement> = {
   'arrow-left': <><path d="m15 18-6-6 6-6" /><path d="M9 12h10" /></>,
@@ -31,6 +31,8 @@ const paths: Record<IconName, ReactElement> = {
   search: <><circle cx="10.5" cy="10.5" r="6" /><path d="m16 16 4 4" /></>,
   settings: <><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.4 1.4-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-2v-.2a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L9 17l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H7v-2h.2a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L8.4 9 9.8 7.6l.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6v-.2h2v.2a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 9l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v2H21a1.7 1.7 0 0 0-1.6 1z" /></>,
   spark: <><path d="m12 3 1.4 5.6L19 10l-5.6 1.4L12 17l-1.4-5.6L5 10l5.6-1.4z" /><path d="m19 16 .6 2.4L22 19l-2.4.6L19 22l-.6-2.4L16 19l2.4-.6z" /></>,
+  table: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 10h18M9 10v10" /></>,
+  copy: <><rect x="9" y="9" width="12" height="12" rx="2" /><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1" /></>,
   trash: <><path d="M5 7h14M10 11v6M14 11v6" /><path d="M8 7l1-3h6l1 3M7 7l1 14h8l1-14" /></>,
   upload: <><path d="M12 16V5" /><path d="m8 9 4-4 4 4" /><path d="M5 19h14" /></>,
   video: <><rect x="3" y="6" width="13" height="12" rx="2" /><path d="m16 10 5-3v10l-5-3z" /></>,

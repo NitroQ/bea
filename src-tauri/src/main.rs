@@ -4,18 +4,19 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use bea_core::{
-    create_job, create_meeting_with_engine, delete_meeting, estimate_tokens,
-    export_minutes, extract_ledger_events, generate_minutes, get_app_setting,
-    import_media, inspect_asr_model_package, inspect_runtime, install_qwen_model_package,
-    install_sherpa_model_package, list_audio_input_devices, list_completed_recording_chunks,
-    list_done_chunks, list_meetings, list_transcript, load_asr_engine, load_minutes, load_provider,
-    open_database, partition_chunks, persist_completed_audio_chunk, prepare_imported_media_chunks,
-    record_usage, register_model, save_ledger_events,
-    save_minutes, save_provider, search_transcript, set_app_setting, transcribe_chunks_with_progress,
-    update_meeting_title, waveform_peaks, AsrDevice, AudioChunkInput, CompletedAudioChunk,
-    ContextMode, ExportFormat, FfmpegPipeline, LlmRequest, MediaKind, OcrEngine, MediaSource,
-    Meeting, Minutes, ModelInstallProgress, ModelManifest, ProviderConfig, RecorderConfig,
-    RuntimeAvailability, SegmentedWavRecorder, TranscriptLanguage, TranscriptSegment, UsageRecord,
+    create_job, create_meeting_with_engine, delete_meeting, estimate_tokens, export_chat_markdown,
+    export_chat_text, export_minutes, export_table_csv, export_table_xlsx, extract_ledger_events,
+    generate_minutes, get_app_setting, import_media, inspect_asr_model_package, inspect_runtime,
+    install_qwen_model_package, install_sherpa_model_package, list_audio_input_devices,
+    list_completed_recording_chunks, list_done_chunks, list_meetings, list_transcript,
+    load_asr_engine, load_minutes, load_provider, open_database, parse_chat_payload,
+    partition_chunks, persist_completed_audio_chunk, prepare_imported_media_chunks, record_usage,
+    register_model, save_ledger_events, save_minutes, save_provider, search_transcript,
+    set_app_setting, transcribe_chunks_with_progress, update_meeting_title, waveform_peaks,
+    AsrDevice, AudioChunkInput, ChatTurn, CompletedAudioChunk, ContextMode, ExportFormat,
+    FfmpegPipeline, LlmRequest, MediaKind, MediaSource, Meeting, Minutes, ModelInstallProgress,
+    ModelManifest, OcrEngine, ProviderConfig, RecorderConfig, RuntimeAvailability,
+    SegmentedWavRecorder, TranscriptLanguage, TranscriptSegment, UsageRecord,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use keyring::Entry;
@@ -220,14 +221,16 @@ fn minutes_failure_message(provider_error: &str) -> String {
 
 /// Resolves the playback source path against the meeting's registered media
 /// sources so only imported/recorded media can be transcoded.
-fn verify_media_source(database: &rusqlite::Connection, meeting_id: &str, source: &std::path::Path) -> Result<(), String> {
+fn verify_media_source(
+    database: &rusqlite::Connection,
+    meeting_id: &str,
+    source: &std::path::Path,
+) -> Result<(), String> {
     let mut statement = database
         .prepare("SELECT path FROM media_sources WHERE meeting_id=?1")
         .map_err(command_error)?;
     let rows = statement
-        .query_map(rusqlite::params![meeting_id], |row| {
-            row.get::<_, String>(0)
-        })
+        .query_map(rusqlite::params![meeting_id], |row| row.get::<_, String>(0))
         .map_err(command_error)?;
     let source_text = source.to_string_lossy();
     let source_lower = source_text.to_ascii_lowercase();
@@ -255,6 +258,100 @@ fn verify_media_source(database: &rusqlite::Connection, meeting_id: &str, source
     Err("media path is not registered for this meeting".into())
 }
 
+/// How many of the most recent chat Q&A pairs ride into a prompt verbatim.
+/// Older turns are compacted to their question alone: the answer is
+/// re-derivable from the transcript, while the question still records what the
+/// user already asked, so the model neither repeats itself nor loses the thread.
+///
+/// A cap is required, not an optimization: every turn appends a full answer —
+/// up to ~2.5k tokens now that answers are Markdown with tables — to a block
+/// that is re-sent on every later question and again on minutes regeneration.
+const CHAT_HISTORY_TURNS: usize = 6;
+
+/// Longest excerpt kept from a chat row that cannot be read back as a Q/A pair,
+/// so a corrupt or legacy payload cannot grow the prompt without limit.
+const CHAT_COMPACT_CHARS: usize = 400;
+
+/// How many compacted question-only lines survive before the rest are dropped
+/// entirely. Without this the compacted tail is still O(turns): a user who asks
+/// 300 questions over a meeting would replay 300 question lines on every later
+/// question, which grows the prompt exactly as the verbatim answers used to.
+const CHAT_COMPACT_QUESTION_TURNS: usize = 20;
+
+/// Fraction of the model's context window that the transcript block may take.
+///
+/// The window has to be shared with the ledger, the notes, the chat history,
+/// cross-meeting memory, OCR text, vision frames, the system prompt and the
+/// answer itself, so the transcript cannot claim all of it. Two thirds leaves
+/// generous room for everything else while still letting a 1M-context model
+/// carry a long meeting in full — the point of tracking the window dynamically.
+const CHAT_TRANSCRIPT_WINDOW_SHARE: f64 = 0.66;
+
+/// Ledger share of the window. The ledger is a summary of the whole meeting, so
+/// it stays useful when the transcript is elided — but it must not crowd out the
+/// transcript it summarizes.
+const CHAT_LEDGER_WINDOW_SHARE: f64 = 0.12;
+
+/// Everything that is not the transcript or the ledger: system prompt, speaker
+/// legend, user notes, chat history, cross-meeting memory, OCR text, the
+/// question itself and the per-image overhead of any attached frames.
+const CHAT_OVERHEAD_WINDOW_SHARE: f64 = 0.12;
+
+/// Room held back for the answer. Without it a 4k local server is handed a
+/// prompt that leaves no room to reply.
+const CHAT_OUTPUT_WINDOW_SHARE: f64 = 0.10;
+
+/// Ceiling for the answer reserve. Markdown tables are token-hungry, so 2.5k is
+/// the target — but on a small window the share below it wins.
+const CHAT_MAX_OUTPUT_TOKENS: usize = 2_500;
+
+/// Tokens one video frame costs in a vision request. Used to keep the frame
+/// count inside the window instead of always sending the full set.
+const CHAT_VISION_FRAME_TOKENS: usize = 1_600;
+
+/// Token budgets for one chat prompt, derived from the answering model's
+/// context window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ChatContextBudget {
+    transcript_tokens: usize,
+    ledger_tokens: usize,
+    /// Budget for the blocks that are not transcript or ledger.
+    overhead_tokens: usize,
+    /// How many video frames may be attached, and how long the answer may be.
+    vision_frames: usize,
+    output_tokens: usize,
+}
+
+/// Splits a model's context window into prompt budgets.
+///
+/// The four shares add up to the whole window, so the prompt can never exceed
+/// what the model accepts no matter how large the declared window is. Deriving
+/// them from the window is what makes the compaction dynamic: a 4k local model
+/// gets a small prompt with no room for frames, a 1.3M-context model gets room
+/// for a long meeting plus frames, and switching models re-derives all of it on
+/// the very next question with no stored state to migrate.
+fn chat_context_budget(context_tokens: usize) -> ChatContextBudget {
+    // The same floor the resolver clamps to, so a declared 2k window is budgeted
+    // as the 2k model it is instead of being silently inflated.
+    let window = context_tokens.max(bea_core::MIN_CONTEXT_TOKENS);
+    // Floor, not round: the shares must sum to *at most* the window, and four
+    // rounded-up shares would overshoot it on small windows.
+    let share = |fraction: f64| -> usize { ((window as f64) * fraction).floor() as usize };
+    let overhead_tokens = share(CHAT_OVERHEAD_WINDOW_SHARE);
+    ChatContextBudget {
+        transcript_tokens: share(CHAT_TRANSCRIPT_WINDOW_SHARE),
+        ledger_tokens: share(CHAT_LEDGER_WINDOW_SHARE),
+        overhead_tokens,
+        // Frames are a count rather than a share, and each one is billed as
+        // CHAT_VISION_FRAME_TOKENS against the overhead allowance.
+        vision_frames: (overhead_tokens / CHAT_VISION_FRAME_TOKENS).clamp(0, 8),
+        // The share is the floor: a window too small to reserve 256 tokens for
+        // the answer gets its proportional share instead, so the reserves never
+        // add up to more than the model accepts.
+        output_tokens: share(CHAT_OUTPUT_WINDOW_SHARE).clamp(1, CHAT_MAX_OUTPUT_TOKENS),
+    }
+}
+
 fn list_context_events_payload(
     database: &rusqlite::Connection,
     meeting_id: &str,
@@ -272,16 +369,205 @@ fn list_context_events_payload(
     if collected.is_empty() {
         return Ok("(none)".into());
     }
-    Ok(collected
+    // Only the tail of the chat is replayed in full; see CHAT_HISTORY_TURNS.
+    let chat_total = collected.iter().filter(|(kind, _)| kind == "chat").count();
+    let verbatim_from = chat_total.saturating_sub(CHAT_HISTORY_TURNS);
+    // Turns older than the verbatim window keep only their question, and only
+    // the most recent CHAT_COMPACT_QUESTION_TURNS of those — beyond that the
+    // questions are too old to steer the answer and would just bloat the prompt.
+    let compacted_from = verbatim_from.saturating_sub(CHAT_COMPACT_QUESTION_TURNS);
+    let mut chat_seen = 0usize;
+    let mut lines = Vec::with_capacity(collected.len());
+    if compacted_from > 0 {
+        lines.push(format!(
+            "- [chat] ({compacted_from} much older question(s) omitted)"
+        ));
+    }
+    for (kind, payload) in &collected {
+        if kind != "chat" {
+            // 'clarify' and 'context' are written by hand and marked
+            // authoritative, so they always ride in whole — they are also few
+            // and short, which is what makes them safe to keep.
+            lines.push(format!("- [{kind}] {payload}"));
+            continue;
+        }
+        let index = chat_seen;
+        chat_seen += 1;
+        if index >= verbatim_from {
+            lines.push(format!("- [chat] {payload}"));
+            continue;
+        }
+        if index < compacted_from {
+            continue;
+        }
+        lines.push(match bea_core::parse_chat_payload(payload) {
+            Some((question, _)) => format!(
+                "- [chat] Q: {} (earlier turn — answer omitted, it is in the transcript above)",
+                question
+                    .chars()
+                    .take(CHAT_COMPACT_CHARS)
+                    .collect::<String>()
+            ),
+            // A row that is not in Q/A shape cannot be compacted by dropping the
+            // answer, so bound the excerpt instead of replaying it whole.
+            None => format!(
+                "- [chat] {}",
+                payload.chars().take(CHAT_COMPACT_CHARS).collect::<String>()
+            ),
+        });
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Tokens charged to the omission marker `compact_transcript_block` inserts.
+/// Reserving them up front is what makes the block it returns a hard ceiling
+/// rather than a budget plus ~40 tokens: without the reservation, every elision
+/// quietly overran the share it was given, and on a 2k model that was the
+/// difference between fitting and being rejected.
+const TRANSCRIPT_ELISION_MARKER_TOKENS: usize = 48;
+
+/// Bounds the transcript block for a chat prompt. A meeting that fits the
+/// budget is sent verbatim. A longer one keeps its opening (who is present and
+/// what the meeting set out to do) and its most recent stretch (what was just
+/// decided), eliding the middle with an explicit marker — the MEETING LEDGER
+/// block covers the decisions and evidence quotes from the elided span, so the
+/// model still grounds its answer in real quotes instead of losing them
+/// silently. The marker is paid for out of the same budget, so the result is
+/// never larger than `budget_tokens`.
+fn compact_transcript_block(lines: &[String], budget_tokens: usize) -> String {
+    let total = lines
         .iter()
-        .map(|(kind, payload)| format!("- [{kind}] {payload}"))
+        .map(|line| bea_core::estimate_tokens(line))
+        .sum::<usize>();
+    if total <= budget_tokens {
+        return lines.join("\n");
+    }
+    let room = budget_tokens.saturating_sub(TRANSCRIPT_ELISION_MARKER_TOKENS);
+    if room == 0 {
+        // Too small even for the marker. An empty transcript is still a usable
+        // prompt — the ledger carries the decisions — so say less rather than
+        // blow the ceiling the caller is holding us to.
+        return if budget_tokens >= TRANSCRIPT_ELISION_MARKER_TOKENS {
+            format!(
+                "[... {} transcript lines omitted to fit the context window ...]",
+                lines.len()
+            )
+        } else {
+            String::new()
+        };
+    }
+    let half = room / 2;
+    let mut head: Vec<&String> = Vec::new();
+    let mut head_tokens = 0usize;
+    for line in lines {
+        let cost = bea_core::estimate_tokens(line);
+        if head_tokens + cost > half {
+            break;
+        }
+        head_tokens += cost;
+        head.push(line);
+    }
+    let mut tail: Vec<&String> = Vec::new();
+    let mut tail_tokens = 0usize;
+    for line in lines.iter().rev() {
+        let cost = bea_core::estimate_tokens(line);
+        if tail_tokens + cost > half {
+            break;
+        }
+        tail_tokens += cost;
+        tail.push(line);
+    }
+    tail.reverse();
+    let elided = lines.len().saturating_sub(head.len() + tail.len());
+    let mut out = head
+        .iter()
+        .map(|line| line.as_str())
         .collect::<Vec<_>>()
-        .join("\n"))
+        .join("\n");
+    out.push_str(&format!(
+        "\n[... {elided} transcript lines omitted to fit the context window — \
+         the decisions and evidence from this span are in the MEETING LEDGER above ...]\n"
+    ));
+    out.push_str(
+        &tail
+            .iter()
+            .map(|line| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    out
+}
+
+/// Bounds a variable-length prompt block (OCR text, cross-meeting memory) to
+/// its share of the window by dropping whole lines from the end and saying so.
+/// Truncating mid-line would leave the model half a sentence to reason about;
+/// dropping from the end keeps every retained line intact.
+fn bound_block(block: &str, max_tokens: usize, label: &str) -> String {
+    if block.trim().is_empty() || bea_core::estimate_tokens(block) <= max_tokens {
+        return block.to_string();
+    }
+    let mut kept: Vec<&str> = block.lines().collect();
+    let mut tokens = bea_core::estimate_tokens(block);
+    while tokens > max_tokens {
+        match kept.pop() {
+            Some(line) => tokens = tokens.saturating_sub(bea_core::estimate_tokens(line)),
+            None => break,
+        }
+    }
+    let marker = format!("[... {label} truncated to fit the context window ...]");
+    kept.push(&marker);
+    kept.join("\n")
+}
+
+/// Bounds the notes replay to its share of the window.
+///
+/// `clarify` and `context` rows are hand-written and marked authoritative, so
+/// they are always kept whole; only the replayed `chat` rows are dropped, and
+/// only from the front. Truncating the whole block from the end — as
+/// `bound_block` does for OCR and memory — would silently discard the very
+/// corrections the user typed for this meeting, which is the one thing in the
+/// prompt they cannot reconstruct from the recording.
+fn bound_notes_block(block: &str, max_tokens: usize) -> String {
+    if block.trim().is_empty() || bea_core::estimate_tokens(block) <= max_tokens {
+        return block.to_string();
+    }
+    let is_authoritative =
+        |line: &str| line.starts_with("- [clarify]") || line.starts_with("- [context]");
+    let fixed: usize = block
+        .lines()
+        .filter(|line| is_authoritative(line))
+        .map(|line| bea_core::estimate_tokens(line))
+        .sum();
+    // Authoritative rows on their own fill the share: there is nothing to
+    // choose between, so truncate the block as a whole and admit it.
+    if fixed >= max_tokens {
+        return bound_block(block, max_tokens, "notes");
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut tokens = 0usize;
+    let mut dropped = 0usize;
+    for line in block.lines() {
+        let cost = bea_core::estimate_tokens(line);
+        if is_authoritative(line) || tokens + cost <= max_tokens {
+            kept.push(line);
+            tokens += cost;
+        } else {
+            dropped += 1;
+        }
+    }
+    if dropped == 0 {
+        return block.to_string();
+    }
+    let mut out = vec![format!(
+        "- [chat] ({dropped} older note line(s) omitted to fit the context window)"
+    )];
+    out.extend(kept.into_iter().map(str::to_string));
+    out.join("\n")
 }
 
 #[cfg(test)]
 mod context_payload_tests {
-    use super::list_context_events_payload;
+    use super::{list_context_events_payload, CHAT_COMPACT_CHARS};
 
     /// Chat Q&A (kind 'chat') must reach the minutes prompt alongside
     /// 'clarify' and 'context' events.
@@ -311,6 +597,561 @@ mod context_payload_tests {
         assert!(payload.contains("[context] Budget frozen"));
         assert!(payload.contains("[chat] Q: Who approved?"));
         assert!(!payload.contains("noise"));
+    }
+
+    fn chat_db() -> rusqlite::Connection {
+        let database = rusqlite::Connection::open_in_memory().unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE context_events (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, confidence REAL NOT NULL, created_at TEXT NOT NULL);",
+            )
+            .unwrap();
+        database
+    }
+
+    fn push_chat(database: &rusqlite::Connection, payload: &str) {
+        database
+            .execute(
+                "INSERT INTO context_events(id,meeting_id,kind,payload,confidence,created_at) VALUES (?1,'m1','chat',?2,1.0,'2026-01-01')",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), payload],
+            )
+            .unwrap();
+    }
+
+    /// The prompt is rebuilt from the database on every question, so history has
+    /// to be bounded: the most recent turns ride verbatim, older answers are
+    /// dropped and only their question is kept.
+    #[test]
+    fn only_the_most_recent_chat_turns_are_replayed_verbatim() {
+        let database = chat_db();
+        for index in 0..10 {
+            push_chat(
+                &database,
+                &format!("Q: question {index}\nA: answer {index}"),
+            );
+        }
+        let payload = list_context_events_payload(&database, "m1").unwrap();
+        // Oldest turns lose their answer.
+        assert!(payload.contains("Q: question 0 (earlier turn"));
+        assert!(!payload.contains("answer 0"));
+        assert!(!payload.contains("answer 3"));
+        // Newest CHAT_HISTORY_TURNS turns stay whole.
+        for index in 4..10 {
+            assert!(
+                payload.contains(&format!("A: answer {index}")),
+                "recent turn {index} should ride verbatim"
+            );
+        }
+        assert!(!payload.contains("Q: question 4 (earlier turn"));
+    }
+
+    /// A legacy or corrupt row that is not in Q/A shape cannot be compacted by
+    /// dropping an answer, so its excerpt has to be bounded instead.
+    #[test]
+    fn unparseable_chat_rows_are_bounded_to_an_excerpt() {
+        let database = chat_db();
+        let noise = "x".repeat(5_000);
+        for _ in 0..8 {
+            push_chat(&database, &noise);
+        }
+        let payload = list_context_events_payload(&database, "m1").unwrap();
+        assert!(payload.contains("[chat] xxx"));
+        // The 6 most recent rows ride whole; the 2 older ones are excerpted, so
+        // the block stays well under the 8 * 5000 characters that are stored.
+        let replayed = payload.chars().filter(|c| *c == 'x').count();
+        assert_eq!(replayed, 6 * 5_000 + 2 * CHAT_COMPACT_CHARS);
+    }
+
+    /// Compaction must never touch user-authored notes, which are few, short,
+    /// and authoritative.
+    #[test]
+    fn clarify_and_context_rows_are_never_compacted() {
+        let database = chat_db();
+        let long_note = "n".repeat(3000);
+        database
+            .execute(
+                "INSERT INTO context_events(id,meeting_id,kind,payload,confidence,created_at) VALUES (?1,'m1','clarify',?2,1.0,'2026-01-01')",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), long_note],
+            )
+            .unwrap();
+        for _ in 0..8 {
+            push_chat(&database, "Q: q\nA: a");
+        }
+        let payload = list_context_events_payload(&database, "m1").unwrap();
+        assert!(payload.contains(&long_note));
+    }
+
+    /// Compacting answers is not enough on its own — the question lines are
+    /// still O(turns). A long Q&A session must converge on a fixed size.
+    #[test]
+    fn a_long_chat_session_converges_on_a_fixed_prompt_size() {
+        let database = chat_db();
+        for index in 0..400 {
+            push_chat(
+                &database,
+                &format!("Q: question {index}\nA: {}", "detail ".repeat(500)),
+            );
+        }
+        let payload = list_context_events_payload(&database, "m1").unwrap();
+        // The 6 newest answers ride whole; the rest of the session is gone.
+        assert!(payload.contains("A: detail detail"));
+        assert!(!payload.contains("Q: question 0 "));
+        assert!(payload.contains("374 much older question(s) omitted"));
+        // Bounded by construction, not by how much the user happened to ask.
+        assert!(
+            bea_core::estimate_tokens(&payload) < 20_000,
+            "history block should stay small, got {} tokens",
+            bea_core::estimate_tokens(&payload)
+        );
+    }
+}
+
+#[cfg(test)]
+mod transcript_compaction_tests {
+    use super::{chat_context_budget, compact_transcript_block, ChatContextBudget};
+
+    /// A 128k-class window: the budget must land where a hosted model is
+    /// comfortable, not at a hardcoded constant.
+    const HOSTED: usize = 128_000;
+
+    fn budget(window: usize) -> ChatContextBudget {
+        chat_context_budget(window)
+    }
+
+    #[test]
+    fn a_transcript_within_budget_is_untouched() {
+        let lines: Vec<String> = (0..200).map(|i| format!("[00:0{i}] line {i}")).collect();
+        let joined = lines.join("\n");
+        assert_eq!(
+            compact_transcript_block(&lines, budget(HOSTED).transcript_tokens),
+            joined
+        );
+    }
+
+    #[test]
+    fn an_oversized_transcript_keeps_its_opening_and_its_most_recent_lines() {
+        let ceiling = budget(HOSTED).transcript_tokens;
+        // Each line ~10k tokens, so 100 lines blow well past the budget.
+        let blob = "word ".repeat(8_000);
+        let lines: Vec<String> = (0..100).map(|i| format!("LINE{i} {blob}")).collect();
+        let compacted = compact_transcript_block(&lines, ceiling);
+        assert!(compacted.starts_with("LINE0 "), "opening must survive");
+        assert!(
+            compacted.contains(&format!("LINE99 {}", blob.trim_end())),
+            "most recent line must survive"
+        );
+        assert!(!compacted.contains("LINE50 word"));
+        assert!(compacted.contains("transcript lines omitted to fit the context window"));
+        // Middle lines are gone, and what remains is inside the budget — the
+        // elision marker is paid for out of it, not added on top.
+        assert!(
+            bea_core::estimate_tokens(&compacted) <= ceiling,
+            "compacted block must not exceed the budget it was given"
+        );
+    }
+
+    /// A single line bigger than half the budget must not consume the whole
+    /// window on its own.
+    #[test]
+    fn a_giant_single_line_still_yields_to_the_tail() {
+        let blob = "word ".repeat(200_000);
+        let lines = vec![
+            format!("GIANT {blob}"),
+            "TAIL one".into(),
+            "TAIL two".into(),
+        ];
+        let compacted = compact_transcript_block(&lines, budget(HOSTED).transcript_tokens);
+        assert!(compacted.contains("TAIL one"));
+        assert!(compacted.contains("TAIL two"));
+        assert!(compacted.contains("transcript lines omitted"));
+    }
+
+    /// The budget must track the window instead of a constant. This is the
+    /// regression that a hardcoded 48k would fail: a 256k model must get more
+    /// room than a 32k one, and a 1.3M model more again.
+    #[test]
+    fn the_budget_scales_with_the_context_window() {
+        let small = budget(8_000);
+        let mid = budget(128_000);
+        let large = budget(256_000);
+        let huge = budget(1_300_000);
+        assert!(small.transcript_tokens < mid.transcript_tokens);
+        assert!(mid.transcript_tokens < large.transcript_tokens);
+        assert!(large.transcript_tokens < huge.transcript_tokens);
+        assert!(small.ledger_tokens < huge.ledger_tokens);
+        // Every share — transcript, ledger, overhead and the answer reserve —
+        // must fit inside the window together, or the prompt would be rejected.
+        for window in [
+            4_096usize, 8_000, 32_000, 128_000, 256_000, 500_000, 1_000_000, 1_300_000,
+        ] {
+            let b = budget(window);
+            let used = b.transcript_tokens + b.ledger_tokens + b.overhead_tokens + b.output_tokens;
+            assert!(
+                used <= window,
+                "budgets ({used}) must fit inside a {window}-token window"
+            );
+        }
+    }
+
+    /// A 1.3M model must be able to hold a meeting that a 256k model has to
+    /// trim — that is the whole point of tracking the window.
+    #[test]
+    fn a_huge_window_is_never_capped_below_the_declared_size() {
+        for window in [256_000usize, 500_000, 1_000_000, 1_300_000] {
+            assert!(budget(window).transcript_tokens > window / 2);
+        }
+    }
+
+    /// The answer shares the window with the prompt, so the output reserve has
+    /// to scale too — a fixed 2.5k on a 4k model leaves no room to reply.
+    #[test]
+    fn the_output_reserve_scales_with_the_window() {
+        assert!(budget(4_096).output_tokens < budget(128_000).output_tokens);
+        assert!(budget(128_000).output_tokens <= 2_500);
+        for window in [4_096usize, 8_000, 32_000, 128_000, 1_300_000] {
+            let b = budget(window);
+            assert!(b.output_tokens >= 256);
+            assert!(b.output_tokens <= window / 2);
+        }
+    }
+
+    /// Vision frames are the most expensive attachment, so their count follows
+    /// the window instead of always being 3-8.
+    #[test]
+    fn the_frame_allowance_follows_the_window() {
+        assert_eq!(budget(4_096).vision_frames, 0);
+        assert!(budget(32_000).vision_frames < 8);
+        assert_eq!(budget(128_000).vision_frames, 8);
+        assert_eq!(budget(1_300_000).vision_frames, 8);
+    }
+
+    /// A window too small to hold a meeting must not collapse the prompt.
+    #[test]
+    fn a_degenerate_window_still_yields_a_usable_prompt() {
+        for window in [0usize, 1, 100, 2_047] {
+            let b = budget(window);
+            // Lifted to the smallest window Bea supports, so the prompt keeps a
+            // real transcript allowance instead of being divided into zeros.
+            assert_eq!(
+                b.transcript_tokens,
+                budget(bea_core::MIN_CONTEXT_TOKENS).transcript_tokens
+            );
+            assert!(b.ledger_tokens > 0);
+            assert!(b.overhead_tokens > 0);
+            assert!(b.output_tokens > 0);
+        }
+    }
+
+    /// A declared 2k window must be budgeted as 2k, not rounded up to 4k: the
+    /// resolver's minimum and the budget floor are the same number precisely so
+    /// a genuinely small model is not handed a prompt it cannot accept.
+    #[test]
+    fn a_two_thousand_token_window_is_not_inflated() {
+        let b = budget(2_048);
+        let used = b.transcript_tokens + b.ledger_tokens + b.overhead_tokens + b.output_tokens;
+        assert!(
+            used <= 2_048,
+            "a 2k window must not be budgeted as though it were larger ({used})"
+        );
+        assert!(
+            b.transcript_tokens > 1_000,
+            "a 2k model still needs a transcript"
+        );
+        assert_eq!(b.vision_frames, 0);
+        // And the guarantee holds for every window at or above the floor.
+        for window in [2_048usize, 3_000, 4_096, 8_000, 1_300_000] {
+            let b = budget(window);
+            let used = b.transcript_tokens + b.ledger_tokens + b.overhead_tokens + b.output_tokens;
+            assert!(
+                used <= window,
+                "budgets ({used}) must fit a {window}-token window"
+            );
+        }
+    }
+
+    /// A 4k model is a real case (llama-2, small quant builds), so its budgets
+    /// must still add up to its own window rather than to a rounded-up one.
+    #[test]
+    fn the_smallest_real_window_is_fully_accounted_for() {
+        let b = budget(4_096);
+        let used = b.transcript_tokens + b.ledger_tokens + b.overhead_tokens + b.output_tokens;
+        assert!(used <= 4_096, "shares must not overshoot a 4k window");
+        // And they must still claim nearly all of it, or a small model would be
+        // treated as smaller than it is.
+        assert!(
+            used * 10 >= 4_096 * 9,
+            "shares should use ~90% of the window"
+        );
+    }
+}
+
+/// End-to-end coverage of the assembled prompt: the same meeting, notes, OCR
+/// and memory sent to models whose windows differ by three orders of magnitude.
+#[cfg(test)]
+mod chat_prompt_fit_tests {
+    use super::{
+        assemble_chat_prompt, bound_block, bound_notes_block, chat_context_budget,
+        ChatContextBudget,
+    };
+
+    /// A meeting of ~120k tokens made of realistically sized segments, which is
+    /// what lets the head/tail compactor keep an opening and a closing stretch.
+    /// Four giant lines would not: no single line fits in half the budget, so
+    /// both sides would come back empty.
+    fn long_meeting() -> Vec<String> {
+        let words = "word ".repeat(160);
+        (0..600)
+            .map(|i| format!("[{i:05}] Speaker {}: {words}", i % 4))
+            .collect()
+    }
+
+    fn notes() -> String {
+        (0..40)
+            .map(|i| format!("- [chat] Q: question {i} (earlier turn — answer omitted)"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Notes mixing the two hand-written, authoritative kinds with the replayed
+    /// chat rows that may be dropped.
+    fn notes_with_corrections() -> String {
+        let mut lines = vec![
+            "- [clarify] The date is 2026-03-04, not March 3.".to_string(),
+            "- [context] Budget was frozen at 2M.".to_string(),
+        ];
+        lines.extend(notes().lines().map(str::to_string));
+        lines.join("\n")
+    }
+
+    fn ocr() -> String {
+        format!(
+            "\n\n=== SLIDES (OCR) ===\n{}",
+            (0..200)
+                .map(|i| format!("slide line {i} with a good deal of recognised text"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+
+    fn memory() -> String {
+        format!(
+            "\n\n=== MEMORY ===\n{}",
+            (0..200)
+                .map(|i| format!("[Q{i}] [00:0{i}] a remembered passage from an old meeting"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+
+    const QUESTION: &str = "What did we agree on the budget, and who said it?";
+
+    fn prompt_for(window: usize) -> String {
+        assemble_chat_prompt(
+            chat_context_budget(window),
+            &long_meeting(),
+            "Speaker legend here.",
+            &notes(),
+            r#"[{"kind":"decision"}]"#,
+            &ocr(),
+            &memory(),
+            QUESTION,
+        )
+        .expect("the prompt fits the window")
+    }
+
+    fn allowance(window: usize) -> usize {
+        let ChatContextBudget {
+            transcript_tokens,
+            ledger_tokens,
+            overhead_tokens,
+            ..
+        } = chat_context_budget(window);
+        transcript_tokens + ledger_tokens + overhead_tokens
+    }
+
+    /// The core guarantee: whatever the window, the prompt *and* the question —
+    /// which share that window — fit inside it. The tolerance is a few tokens of
+    /// rounding, not slack: `assemble_chat_prompt` already refuses to return an
+    /// over-budget prompt, so this checks the budget is not merely enforced but
+    /// actually reachable.
+    #[test]
+    fn the_assembled_prompt_always_fits_the_window() {
+        for window in [
+            2_048usize, 4_096, 8_000, 32_000, 128_000, 256_000, 500_000, 1_000_000, 1_300_000,
+        ] {
+            let size = bea_core::estimate_tokens(&prompt_for(window))
+                + bea_core::estimate_tokens(QUESTION);
+            assert!(
+                size <= allowance(window) + 8,
+                "prompt of {size} tokens exceeds the {window}-token window"
+            );
+        }
+    }
+
+    /// The question is charged to the same window, so a question long enough to
+    /// matter shortens the prompt instead of overflowing the model.
+    #[test]
+    fn a_long_question_is_charged_to_the_window() {
+        let short = prompt_for(8_000);
+        // ~1.2k tokens: big enough to matter against the 960-token overhead
+        // share, small enough that the window can still hold the meeting.
+        let long_question = "context ".repeat(600);
+        let long = assemble_chat_prompt(
+            chat_context_budget(8_000),
+            &long_meeting(),
+            "Speaker legend here.",
+            &notes(),
+            r#"[{"kind":"decision"}]"#,
+            &ocr(),
+            &memory(),
+            &long_question,
+        )
+        .expect("the prompt fits the window");
+        let budget = chat_context_budget(8_000);
+        let allowance = budget.transcript_tokens + budget.ledger_tokens + budget.overhead_tokens;
+        let total = bea_core::estimate_tokens(&long) + bea_core::estimate_tokens(&long_question);
+        assert!(
+            total <= allowance + 8,
+            "long question overflowed the window"
+        );
+        assert!(
+            bea_core::estimate_tokens(&long) < bea_core::estimate_tokens(&short),
+            "a long question must cost transcript content"
+        );
+    }
+
+    /// A question that cannot fit even with an empty transcript is a real limit,
+    /// and saying so is better than a request the provider will reject.
+    #[test]
+    fn an_impossible_question_reports_instead_of_overflowing() {
+        let outcome = assemble_chat_prompt(
+            chat_context_budget(2_048),
+            &long_meeting(),
+            "Speaker legend here.",
+            &notes(),
+            r#"[{"kind":"decision"}]"#,
+            &ocr(),
+            &memory(),
+            &"x".repeat(40_000),
+        );
+        let error = outcome.expect_err("a 10k-token question cannot fit a 2k window");
+        assert!(error.contains("do not fit"), "unhelpful message: {error}");
+    }
+
+    /// The notes replay is a variable block too: a long chat history must be
+    /// bounded on a small window rather than being the thing that overflows it.
+    #[test]
+    fn a_long_chat_history_is_bounded_on_a_small_window() {
+        let small = prompt_for(4_096);
+        assert!(
+            small.contains("older note line(s) omitted"),
+            "the notes replay must be bounded before it can overflow the window"
+        );
+        assert!(bea_core::estimate_tokens(&small) <= allowance(4_096) + 8);
+        // A 32k window has room for the whole replay, so nothing is lost.
+        let mid = prompt_for(32_000);
+        assert!(!mid.contains("older note line(s) omitted"));
+        assert!(mid.contains("question 39"));
+    }
+
+    /// Bounding the notes must never drop what the user typed: `clarify` and
+    /// `context` are authoritative and ride in whole, while the replayed chat
+    /// rows are the ones that go.
+    #[test]
+    fn bounding_notes_keeps_the_authoritative_corrections() {
+        let block = notes_with_corrections();
+        let bounded = bound_notes_block(&block, 60);
+        assert!(bounded.contains("[clarify] The date is 2026-03-04"));
+        assert!(bounded.contains("[context] Budget was frozen at 2M."));
+        assert!(bounded.contains("older note line(s) omitted"));
+        assert!(
+            !bounded.contains("question 39"),
+            "the newest chat rows go first"
+        );
+        assert!(bea_core::estimate_tokens(&bounded) <= 60 + 16);
+        // A block that already fits is returned untouched.
+        assert_eq!(bound_notes_block("short", 1_000), "short");
+        assert_eq!(bound_notes_block("", 1_000), "");
+        // And it survives all the way through prompt assembly.
+        let prompt = assemble_chat_prompt(
+            chat_context_budget(4_096),
+            &long_meeting(),
+            "Speaker legend here.",
+            &notes_with_corrections(),
+            r#"[{"kind":"decision"}]"#,
+            &ocr(),
+            &memory(),
+            QUESTION,
+        )
+        .expect("the prompt fits the window");
+        assert!(prompt.contains("[clarify] The date is 2026-03-04"));
+        assert!(prompt.contains("[context] Budget was frozen at 2M."));
+    }
+
+    /// A 1.3M model must receive the whole meeting; a 32k model must receive a
+    /// compacted one. Same inputs, same meeting — only the window differs.
+    #[test]
+    fn a_huge_model_gets_the_whole_meeting_and_a_small_one_does_not() {
+        let huge = prompt_for(1_300_000);
+        assert!(huge.contains("[00599]"), "the closing line must survive");
+        assert!(!huge.contains("transcript lines omitted"));
+        let small = prompt_for(32_000);
+        assert!(small.contains("transcript lines omitted"));
+        assert!(small.contains("[00000]"), "the opening must survive");
+        assert!(small.contains("[00599]"), "the recent stretch must survive");
+        assert!(!small.contains("[00300]"), "the middle must be elided");
+    }
+
+    /// Switching models mid-meeting must move the prompt in both directions on
+    /// the next question, deterministically, with no stored state.
+    #[test]
+    fn switching_models_transitions_both_ways() {
+        let small_first = prompt_for(32_000);
+        assert!(small_first.contains("transcript lines omitted"));
+        // User switches to a 1.3M model for the next question.
+        let expanded = prompt_for(1_300_000);
+        assert!(!expanded.contains("transcript lines omitted"));
+        assert!(bea_core::estimate_tokens(&expanded) > bea_core::estimate_tokens(&small_first));
+        // And back to the small model: identical to the first prompt.
+        assert_eq!(prompt_for(32_000), small_first);
+        // 256k is large enough for the same meeting, so it keeps it whole too —
+        // the transition is a step at the window where the meeting stops
+        // fitting, not a permanent penalty on smaller models.
+        let mid = prompt_for(256_000);
+        assert!(!mid.contains("transcript lines omitted"));
+        assert!(bea_core::estimate_tokens(&mid) >= bea_core::estimate_tokens(&small_first));
+    }
+
+    /// The variable blocks are trimmed before the transcript, so a big OCR dump
+    /// costs visual detail rather than meeting content.
+    #[test]
+    fn variable_blocks_are_capped_before_the_transcript_is() {
+        let small = prompt_for(8_000);
+        assert!(small.contains("OCR text truncated"));
+        assert!(small.contains("memory truncated"));
+        // The transcript is still the first thing to go once the budget is gone.
+        assert!(small.contains("transcript lines omitted"));
+        let big = prompt_for(1_300_000);
+        assert!(!big.contains("OCR text truncated"));
+        assert!(!big.contains("memory truncated"));
+    }
+
+    /// Bounding drops whole lines from the end and says so, rather than leaving
+    /// the model a half sentence.
+    #[test]
+    fn bounding_a_block_keeps_whole_lines_and_marks_the_cut() {
+        let block = (0..100)
+            .map(|i| format!("line {i} of the block"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bounded = bound_block(&block, 40, "OCR text");
+        assert!(bounded.starts_with("line 0 of the block"));
+        assert!(bounded.ends_with("[... OCR text truncated to fit the context window ...]"));
+        assert!(!bounded.contains("line 99 of the block"));
+        assert!(bea_core::estimate_tokens(&bounded) <= 40 + 8);
+        // A block that already fits is returned untouched.
+        assert_eq!(bound_block("short", 1_000, "OCR text"), "short");
+        assert_eq!(bound_block("", 1_000, "OCR text"), "");
     }
 }
 
@@ -361,7 +1202,9 @@ fn build_memory_block(
             ));
         }
     }
-    block.push_str("If the question references an earlier meeting, use this memory. Otherwise ignore it.");
+    block.push_str(
+        "If the question references an earlier meeting, use this memory. Otherwise ignore it.",
+    );
     Ok(block)
 }
 
@@ -409,11 +1252,9 @@ mod memory_block_tests {
     fn empty_when_no_other_meetings() {
         let database = memory_db();
         insert_meeting(&database, "m1", "Only meeting");
-        assert!(
-            build_memory_block(&database, "m1", "anything")
-                .unwrap()
-                .is_empty()
-        );
+        assert!(build_memory_block(&database, "m1", "anything")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -456,9 +1297,10 @@ mod chat_prompt_tests {
         );
         assert!(prompt.starts_with("You are Bea,"));
         assert!(prompt.contains("CTXPROMPT"));
-        assert!(prompt.contains("=== MEETING NOTES (user-added clarifications/context) ===\nNOTESBLOCK"));
+        assert!(prompt
+            .contains("=== MEETING NOTES (user-added clarifications/context) ===\nNOTESBLOCK"));
         assert!(prompt.contains("=== MEETING LEDGER ===\nLEDGERBLOCK"));
-        assert!(prompt.contains("=== FULL TRANSCRIPT ===\nTRANSCRIPTBODY"));
+        assert!(prompt.contains("=== TRANSCRIPT ===\nTRANSCRIPTBODY"));
         // The cross-meeting memory must ride in the same prompt.
         assert!(prompt.contains("=== MEMORY: OTHER MEETINGS (1 recorded) ==="));
     }
@@ -468,6 +1310,16 @@ mod chat_prompt_tests {
         let prompt = chat_system_prompt("CTX", "NOTES", "LEDGER", "TRANSCRIPT", "", "");
         assert!(!prompt.contains("MEMORY"));
         assert!(prompt.ends_with("TRANSCRIPT"));
+    }
+
+    /// The chat panel renders Markdown, so the prompt has to ask for it —
+    /// otherwise answers arrive as one plain paragraph with no table to export.
+    #[test]
+    fn chat_system_prompt_asks_for_markdown_and_tables() {
+        let prompt = chat_system_prompt("CTX", "NOTES", "LEDGER", "TRANSCRIPT", "", "");
+        assert!(prompt.contains("GitHub-Flavored Markdown"));
+        assert!(prompt.contains("Markdown table"));
+        assert!(prompt.contains("fenced code blocks"));
     }
 
     #[test]
@@ -763,7 +1615,9 @@ fn spawn_recorder(
             let master_config = sources
                 .first()
                 .and_then(|(device, _)| device.default_input_config().ok())
-                .ok_or_else(|| "no usable audio configuration for the selected devices".to_string())?;
+                .ok_or_else(|| {
+                    "no usable audio configuration for the selected devices".to_string()
+                })?;
             let master_rate = master_config.sample_rate().0;
             let master_channels = master_config.channels();
             let mut recorder = SegmentedWavRecorder::new(
@@ -781,10 +1635,9 @@ fn spawn_recorder(
             recorder.start().map_err(command_error)?;
             let recorder = Arc::new(Mutex::new(recorder));
             let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-            let mixer: Arc<Mutex<bea_core::AudioMixer>> = Arc::new(Mutex::new(bea_core::AudioMixer::new(
-                master_rate,
-                master_channels,
-            )));
+            let mixer: Arc<Mutex<bea_core::AudioMixer>> = Arc::new(Mutex::new(
+                bea_core::AudioMixer::new(master_rate, master_channels),
+            ));
             let source_frames: Arc<Mutex<HashMap<&'static str, u64>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let mut streams = Vec::new();
@@ -847,10 +1700,7 @@ fn spawn_recorder(
                         })();
                         // A stream error mid-recording invalidates the audio:
                         // report it instead of handing back partial data.
-                        let stream_error = stream_error
-                            .lock()
-                            .ok()
-                            .and_then(|slot| slot.clone());
+                        let stream_error = stream_error.lock().ok().and_then(|slot| slot.clone());
                         let result = match (result, stream_error) {
                             (Ok(chunks), Some(error)) if chunks.is_empty() => {
                                 Err(format!("audio stream failed: {error}"))
@@ -934,10 +1784,8 @@ fn delete_all_data_command(state: State<'_, AppState>) -> Result<(), String> {
         let _ = std::fs::remove_file(token_path);
     }
     for suffix in ["", "-wal", "-shm"] {
-        let database_path = PathBuf::from(format!(
-            "{}{suffix}",
-            state.database_path.to_string_lossy()
-        ));
+        let database_path =
+            PathBuf::from(format!("{}{suffix}", state.database_path.to_string_lossy()));
         if database_path.exists() {
             std::fs::remove_file(&database_path)
                 .map_err(|error| format!("could not delete the database: {error}"))?;
@@ -1193,10 +2041,7 @@ fn ensure_playable_proxy_command(
             kind: "video".into(),
         });
     }
-    let playback = root
-        .join("derived")
-        .join(&meeting_id)
-        .join("playback.webm");
+    let playback = root.join("derived").join(&meeting_id).join("playback.webm");
     if !playback.exists() {
         let ffmpeg = locate_ffmpeg(&root);
         std::fs::create_dir_all(playback.parent().unwrap_or(&root)).map_err(command_error)?;
@@ -1347,13 +2192,23 @@ async fn test_provider_connection_command(
     let payload: serde_json::Value = serde_json::from_str(&raw).map_err(|_| {
         format!(
             "provider response was not valid JSON; body started with: {:?}",
-            raw.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).take(160).collect::<String>()
+            raw.chars()
+                .map(|c| if c.is_whitespace() { ' ' } else { c })
+                .take(160)
+                .collect::<String>()
         )
     })?;
-    if payload.get("choices").and_then(serde_json::Value::as_array).is_none() {
+    if payload
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .is_none()
+    {
         return Err(format!(
             "provider response had no choices[] — check the model id and endpoint; body: {:?}",
-            raw.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).take(160).collect::<String>()
+            raw.chars()
+                .map(|c| if c.is_whitespace() { ' ' } else { c })
+                .take(160)
+                .collect::<String>()
         ));
     }
     Ok(())
@@ -1475,11 +2330,12 @@ fn load_codex_tokens() -> Option<bea_core::codex_oauth::CodexTokens> {
     }
     // Legacy store: the original Windows Credential Manager entry. One-way
     // migration keeps users who signed in before the switch signed in.
-    let raw = Entry::new("bea-provider", CODEX_KEYRING_ID).ok()?.get_password().ok()?;
+    let raw = Entry::new("bea-provider", CODEX_KEYRING_ID)
+        .ok()?
+        .get_password()
+        .ok()?;
     let tokens: bea_core::codex_oauth::CodexTokens = serde_json::from_str(&raw).ok()?;
-    if let (Ok(path), Ok(serialized)) =
-        (codex_token_path(), serde_json::to_string(&tokens))
-    {
+    if let (Ok(path), Ok(serialized)) = (codex_token_path(), serde_json::to_string(&tokens)) {
         if std::fs::write(&path, serialized).is_ok() {
             if let Ok(entry) = Entry::new("bea-provider", CODEX_KEYRING_ID) {
                 let _ = entry.delete_credential();
@@ -1585,10 +2441,7 @@ async fn fresh_codex_access_token() -> Result<String, String> {
 /// Parses the `code` and `state` query parameters from an OAuth callback
 /// request line. The query string starts at the path's `?` only — the old
 /// `split("code=")` also matched inside path/other params.
-fn parse_oauth_callback(
-    request_line: &str,
-    expected_state: &str,
-) -> Result<String, String> {
+fn parse_oauth_callback(request_line: &str, expected_state: &str) -> Result<String, String> {
     let path = request_line
         .split_whitespace()
         .nth(1)
@@ -1703,8 +2556,8 @@ async fn codex_list_models_command() -> Result<Vec<String>, String> {
     // Mirrors what the Codex CLI sends when it lists models: bearer token,
     // the account header, and a client_version query. Without the account
     // header the backend answers with an empty/generic catalog.
-    let tokens = load_codex_tokens()
-        .ok_or("no ChatGPT sign-in — click Sign in with ChatGPT first")?;
+    let tokens =
+        load_codex_tokens().ok_or("no ChatGPT sign-in — click Sign in with ChatGPT first")?;
     let token = fresh_codex_access_token().await?;
     let mut request = http_client()
         .get(format!(
@@ -1808,7 +2661,12 @@ async fn generate_minutes_command(
                 // returning an empty list.
                 if let Ok(Some(previous)) = bea_core::load_minutes(&database, &meeting_id) {
                     if !previous.agenda.is_empty() {
-                        let prev_headings = previous.agenda.iter().map(|a| format!("- {}", a.heading)).collect::<Vec<_>>().join("\n");
+                        let prev_headings = previous
+                            .agenda
+                            .iter()
+                            .map(|a| format!("- {}", a.heading))
+                            .collect::<Vec<_>>()
+                            .join("\n");
                         meeting_context.push_str(&format!("\n=== PREVIOUS AGENDA (prefill — keep, refine, or extend; do not discard without reason) ===\n{prev_headings}\n"));
                     }
                 }
@@ -1825,20 +2683,15 @@ async fn generate_minutes_command(
                         let duration = meeting.duration_seconds.max(1);
                         let count = duration.clamp(3, 8);
                         let step = duration / count;
-                        let timestamps: Vec<u64> = (0..count)
-                            .map(|index| index * step + step / 2)
-                            .collect();
+                        let timestamps: Vec<u64> =
+                            (0..count).map(|index| index * step + step / 2).collect();
                         let root = state
                             .database_path
                             .parent()
                             .unwrap_or_else(|| std::path::Path::new("."))
                             .to_path_buf();
-                        let (frames, ocr_block) = gather_visual_context(
-                            &root,
-                            &database,
-                            &meeting_id,
-                            &timestamps,
-                        )?;
+                        let (frames, ocr_block) =
+                            gather_visual_context(&root, &database, &meeting_id, &timestamps)?;
                         if meeting_vision_capable(
                             &database,
                             &meeting_id,
@@ -2027,8 +2880,7 @@ async fn modify_minutes_command(
         .map_err(command_error)?
         .ok_or_else(|| "generate minutes first — there is nothing to modify yet".to_string())?;
     let context = list_context_events_payload(&database, &meeting_id)?;
-    let effective_model =
-        effective_meeting_model(&database, &meeting_id, &provider.model);
+    let effective_model = effective_meeting_model(&database, &meeting_id, &provider.model);
     let effective_reasoning =
         effective_meeting_reasoning(&database, &meeting_id, &provider.reasoning_effort);
 
@@ -2058,8 +2910,9 @@ async fn provider_key(provider: &ProviderConfig) -> Result<String, String> {
     if provider.kind == bea_core::ProviderKind::OpenAiOAuth {
         fresh_codex_access_token().await
     } else {
-        keyring_secret(provider)
-            .ok_or_else(|| "provider API key is missing — re-verify the connection in Settings".to_string())
+        keyring_secret(provider).ok_or_else(|| {
+            "provider API key is missing — re-verify the connection in Settings".to_string()
+        })
     }
 }
 
@@ -2236,8 +3089,80 @@ fn chat_system_prompt(
     memory_block: &str,
 ) -> String {
     format!(
-        "You are Bea, an assistant answering questions about one meeting.\n{meeting_context}\nAnswer using ONLY the transcript, notes, memory of other meetings, and any visual context below. Cite speaker names and timestamps. If the answer is not in the material, say so plainly.\n\n=== MEETING NOTES (user-added clarifications/context) ===\n{notes}\n\n=== MEETING LEDGER ===\n{ledger}\n\n=== FULL TRANSCRIPT ===\n{raw_transcript}{ocr_block}{memory_block}"
+        "You are Bea, an assistant answering questions about one meeting.\n{meeting_context}\nAnswer using ONLY the transcript, notes, memory of other meetings, and any visual context below. Cite speaker names and timestamps. If the answer is not in the material, say so plainly.\nFormat with GitHub-Flavored Markdown: short paragraphs, **bold** for names and outcomes, bullet lists for multiple items, and fenced code blocks with a language tag for code. Use a Markdown table whenever the answer compares three or more things across two or more fields (speakers, options, dates, costs, decisions). Never wrap the whole answer in a code fence.\n\n=== MEETING NOTES (user-added clarifications/context) ===\n{notes}\n\n=== MEETING LEDGER ===\n{ledger}\n\n=== TRANSCRIPT ===\n{raw_transcript}{ocr_block}{memory_block}"
     )
+}
+
+/// Assembles the chat system prompt and guarantees it fits the answering
+/// model's window, including the question, which rides in the same window as
+/// the prompt and has no budget of its own.
+///
+/// Order of sacrifice is deliberate: the least load-bearing content goes first.
+/// The question is charged up front because it is the one block that cannot be
+/// shortened without changing what was asked. The variable blocks (OCR text,
+/// the notes replay, cross-meeting memory) are then bounded to what the
+/// question left of the overhead share, the transcript is compacted to its own
+/// share, and only if the prompt is *still* over — because the fixed system
+/// prompt and the speaker legend have no budget at all — is the transcript
+/// compacted again against what is genuinely left. A model with a 1.3M window
+/// therefore gets the whole meeting, while a 4k local server gets the most
+/// recent stretch plus the ledger, and both land inside the same accounting.
+///
+/// Errors only when the question and the fixed prompt alone exceed the window,
+/// which no amount of compaction can fix: a clear message beats shipping a
+/// request the provider is going to reject.
+fn assemble_chat_prompt(
+    budget: ChatContextBudget,
+    transcript_lines: &[String],
+    meeting_context: &str,
+    notes: &str,
+    ledger: &str,
+    ocr_block: &str,
+    memory_block: &str,
+    question: &str,
+) -> Result<String, String> {
+    // The window holds the prompt, the question and the answer. The answer is
+    // bounded separately by max_output_tokens, so what is left here is
+    // `allowance`; the question is charged out of it first, which is what makes
+    // `content_allowance` the prompt's own ceiling. Derived from the budget
+    // rather than from the raw window so it stays consistent when the window was
+    // lifted to the floor.
+    let allowance = budget.transcript_tokens + budget.ledger_tokens + budget.overhead_tokens;
+    let question_tokens = bea_core::estimate_tokens(question);
+    let content_allowance = allowance.saturating_sub(question_tokens);
+    // A long question starves the variable blocks before it ever reaches the
+    // transcript: a lost OCR detail is a detail, a truncated question is a
+    // different question.
+    let overhead_left = budget.overhead_tokens.saturating_sub(question_tokens);
+    let ocr = bound_block(ocr_block, overhead_left / 2, "OCR text");
+    let notes = bound_notes_block(notes, overhead_left / 4);
+    let memory = bound_block(memory_block, overhead_left / 4, "memory");
+    let transcript = compact_transcript_block(transcript_lines, budget.transcript_tokens);
+    let prompt = chat_system_prompt(meeting_context, &notes, ledger, &transcript, &ocr, &memory);
+    if bea_core::estimate_tokens(&prompt) <= content_allowance {
+        return Ok(prompt);
+    }
+    // Charge the blocks the transcript cannot shrink — the fixed prompt, the
+    // speaker legend and the ledger — against what is left, so a huge legend or
+    // an unusually large question shortens the transcript instead of the window.
+    let spent_elsewhere = bea_core::estimate_tokens(&prompt)
+        .saturating_sub(bea_core::estimate_tokens(&transcript))
+        .saturating_add(1);
+    let left = content_allowance
+        .saturating_sub(spent_elsewhere)
+        .min(budget.transcript_tokens);
+    let trimmed = compact_transcript_block(transcript_lines, left);
+    let prompt = chat_system_prompt(meeting_context, &notes, ledger, &trimmed, &ocr, &memory);
+    let size = bea_core::estimate_tokens(&prompt);
+    if size <= content_allowance {
+        return Ok(prompt);
+    }
+    Err(format!(
+        "this question and meeting do not fit the model's context window \
+         (needs about {} tokens, has {allowance}) — shorten the question \
+         or switch to a model with a larger context window",
+        size + question_tokens
+    ))
 }
 
 #[tauri::command]
@@ -2271,11 +3196,19 @@ async fn chat_command(
     let custom_format = None; // chat does not need the format block
     let meeting_context = bea_core::build_meeting_context(&speaker_names, custom_format);
     let events = extract_ledger_events(&transcript);
-    let pack = bea_core::pack_context_mode(&events, 12_000, ContextMode::Balanced);
+    // Budgets follow the model that will actually answer — a per-meeting model
+    // override can differ from the provider default, and the window it accepts
+    // is the one the prompt has to fit. Recomputed on every question, so
+    // switching models mid-meeting takes effect immediately in both directions.
+    let effective_model = effective_meeting_model(&database, &meeting_id, &provider.model);
+    let context_tokens =
+        bea_core::resolve_context_tokens(&database, &effective_model, &provider.kind);
+    let budget = chat_context_budget(context_tokens);
+    let pack = bea_core::pack_context_mode(&events, budget.ledger_tokens, ContextMode::Balanced);
     // Transcript dump with speaker names; overlapping-speech segments show
     // every attached speaker (e.g. "Maria + John").
     let overlaps = bea_core::list_segment_speakers(&database, &meeting_id).unwrap_or_default();
-    let raw_transcript = transcript
+    let transcript_lines: Vec<String> = transcript
         .iter()
         .filter(|segment| segment.text.trim() != "[silence]")
         .map(|segment| {
@@ -2308,8 +3241,7 @@ async fn chat_command(
                 segment.text.trim()
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<Vec<String>>();
     // Visual context: when the meeting has a video, the AI pulls frames itself
     // to strengthen its answer — either as images (vision models) or as OCR
     // text (fallback). Frames dedupe via the disk cache. No manual timestamps.
@@ -2327,37 +3259,49 @@ async fn chat_command(
                 .map(|segment| segment.end_seconds)
                 .unwrap_or(0)
                 .max(1);
-            let count = duration.clamp(3, 8);
-            let step = duration / count;
-            let timestamps: Vec<u64> = (0..count).map(|index| index * step + step / 2).collect();
-            let root = state
-                .database_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .to_path_buf();
-            let (frames, block) =
-                gather_visual_context(&root, &database, &meeting_id, &timestamps)?;
-            let vision_capable = meeting_vision_capable(
-                &database,
-                &meeting_id,
-                &provider.kind,
-                &provider.model,
-            );
-            // Only claim frames/mode when the request actually carries visual
-            // content: vision mode counts the images attached; the OCR fallback
-            // only counts when OCR produced a non-empty block (a missing
-            // tesseract binary must not show a "frames used" chip).
-            if vision_capable && !frames.is_empty() {
-                frames_used = frames.len();
-                mode = "vision".into();
-                vision_images = frames
-                    .iter()
-                    .map(|frame| (std::path::PathBuf::from(&frame.path), String::new()))
-                    .collect();
-            } else if !block.trim().is_empty() {
-                frames_used = frames.len();
-                mode = "ocr".into();
-                ocr_block = block;
+            // Frames cost real tokens, so the count follows the window: a 4k
+            // local model cannot afford any, a 1M model gets the full set.
+            let frame_allowance = budget.vision_frames as u64;
+            let count = if frame_allowance == 0 {
+                0
+            } else {
+                duration.clamp(1, frame_allowance)
+            };
+            if count == 0 {
+                mode = "none".into();
+            } else {
+                let step = duration / count;
+                let timestamps: Vec<u64> =
+                    (0..count).map(|index| index * step + step / 2).collect();
+                let root = state
+                    .database_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf();
+                let (frames, block) =
+                    gather_visual_context(&root, &database, &meeting_id, &timestamps)?;
+                let vision_capable = meeting_vision_capable(
+                    &database,
+                    &meeting_id,
+                    &provider.kind,
+                    &effective_model,
+                );
+                // Only claim frames/mode when the request actually carries visual
+                // content: vision mode counts the images attached; the OCR fallback
+                // only counts when OCR produced a non-empty block (a missing
+                // tesseract binary must not show a "frames used" chip).
+                if vision_capable && !frames.is_empty() {
+                    frames_used = frames.len();
+                    mode = "vision".into();
+                    vision_images = frames
+                        .iter()
+                        .map(|frame| (std::path::PathBuf::from(&frame.path), String::new()))
+                        .collect();
+                } else if !block.trim().is_empty() {
+                    frames_used = frames.len();
+                    mode = "ocr".into();
+                    ocr_block = block;
+                }
             }
         }
     }
@@ -2377,24 +3321,26 @@ async fn chat_command(
             .join(&safe_meeting_id)
             .join("chat-images");
         std::fs::create_dir_all(&dir).map_err(command_error)?;
-        let vision = meeting_vision_capable(
-            &database,
-            &meeting_id,
-            &provider.kind,
-            &provider.model,
-        );
+        let vision =
+            meeting_vision_capable(&database, &meeting_id, &provider.kind, &effective_model);
         let engine = bea_core::TesseractOcrEngine {
             executable: locate_tesseract(&root),
             language: "eng".into(),
         };
         let stamp = chrono::Utc::now().timestamp_millis();
         let mut ocr_parts: Vec<String> = Vec::new();
+        // Images are the most expensive thing Bea can attach, so the window
+        // decides how many go to the model. Anything over the allowance is
+        // still read locally with Tesseract, so no attached content is lost —
+        // it just arrives as text instead of pixels.
+        let mut image_slots = budget.vision_frames.saturating_sub(vision_images.len());
         for (index, data_url) in attachments.iter().enumerate() {
             let bytes = decode_data_url(data_url)?;
             let path = dir.join(format!("attach-{stamp}-{}.png", index + 1));
             std::fs::write(&path, &bytes).map_err(command_error)?;
-            if vision {
+            if vision && image_slots > 0 {
                 vision_images.push((path, String::new()));
+                image_slots -= 1;
             } else {
                 let frame = bea_core::VisualFrame {
                     id: format!("{meeting_id}-chat-{stamp}-{}", index + 1),
@@ -2412,11 +3358,17 @@ async fn chat_command(
                 }
             }
         }
-        if vision {
-            frames_used += attachments.len();
+        frames_used += attachments.len();
+        if vision && !ocr_parts.is_empty() {
+            // A window too small for the images still delivered their text.
+            mode = "vision+ocr".into();
+            ocr_block.push_str(&format!(
+                "\n\n=== ATTACHED IMAGES (OCR text read locally with Tesseract) ===\n{}\n",
+                ocr_parts.join("\n---\n")
+            ));
+        } else if vision {
             mode = "vision".into();
         } else if !ocr_parts.is_empty() {
-            frames_used += attachments.len();
             mode = "ocr".into();
             ocr_block.push_str(&format!(
                 "\n\n=== ATTACHED IMAGES (OCR text read locally with Tesseract) ===\n{}\n",
@@ -2429,24 +3381,34 @@ async fn chat_command(
     let memory_block = build_memory_block(&database, &meeting_id, question.trim())?;
     let notes = list_context_events_payload(&database, &meeting_id)?;
     let ledger = serde_json::to_string(&pack.events).map_err(command_error)?;
-    let system = chat_system_prompt(
+    // The transcript was already compacted to its share above; assembling it
+    // here also charges the question, bounds the OCR, notes and memory blocks
+    // and re-checks the total, so no combination of meeting length, notes and
+    // attachments can push the prompt past the answering model's window.
+    let system = assemble_chat_prompt(
+        budget,
+        &transcript_lines,
         &meeting_context,
         &notes,
         &ledger,
-        &raw_transcript,
         &ocr_block,
         &memory_block,
-    );
+        question.trim(),
+    )?;
     let effective_reasoning =
         effective_meeting_reasoning(&database, &meeting_id, &provider.reasoning_effort);
-    let effective_model = effective_meeting_model(&database, &meeting_id, &provider.model);
+    // Clamped to 2.5k inside chat_context_budget, so the narrowing is exact.
+    let max_output = budget.output_tokens as u32;
     let answer = if vision_images.is_empty() {
         let request = bea_core::LlmRequest {
             model: effective_model,
             system,
             user: question.trim().to_string(),
             json_schema: String::new(),
-            max_output_tokens: 1_500,
+            // Markdown tables are token-hungry, so the target is 2.5k — but the
+            // answer shares the same window as the prompt, so a small model gets
+            // a proportionally smaller allowance.
+            max_output_tokens: max_output,
             reasoning_effort: effective_reasoning,
         };
         bea_core::call_provider_text(&provider, &request, Some(&api_key))
@@ -2459,7 +3421,7 @@ async fn chat_command(
             &system,
             question.trim(),
             &vision_images,
-            1_500,
+            max_output,
             &effective_reasoning,
             Some(&api_key),
             &effective_model,
@@ -2471,7 +3433,12 @@ async fn chat_command(
     let asked = if attachments.is_empty() {
         question.trim().to_string()
     } else {
-        format!("{} [{} image{} attached]", question.trim(), attachments.len(), if attachments.len() == 1 { "" } else { "s" })
+        format!(
+            "{} [{} image{} attached]",
+            question.trim(),
+            attachments.len(),
+            if attachments.len() == 1 { "" } else { "s" }
+        )
     };
     add_context_event_command_inner(
         &database,
@@ -2516,8 +3483,8 @@ async fn resolve_correction_command(
     let provider = load_provider(&database, "primary")
         .map_err(command_error)?
         .filter(|provider| provider.enabled);
-    let provider = provider
-        .ok_or_else(|| "a verified provider is required for corrections".to_string())?;
+    let provider =
+        provider.ok_or_else(|| "a verified provider is required for corrections".to_string())?;
     let api_key = if provider.kind == bea_core::ProviderKind::OpenAiOAuth {
         fresh_codex_access_token().await?
     } else {
@@ -2582,7 +3549,10 @@ async fn resolve_correction_command(
     let parsed: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|error| format!("correction plan was not valid JSON: {error}"))?;
     let mut replacements = Vec::new();
-    if let Some(items) = parsed.get("replacements").and_then(|value| value.as_array()) {
+    if let Some(items) = parsed
+        .get("replacements")
+        .and_then(|value| value.as_array())
+    {
         for item in items {
             let Some(find) = item.get("find").and_then(|value| value.as_str()) else {
                 continue;
@@ -2604,10 +3574,7 @@ async fn resolve_correction_command(
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_string();
-    Ok(CorrectionPlan {
-        replacements,
-        note,
-    })
+    Ok(CorrectionPlan { replacements, note })
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -2977,8 +3944,12 @@ async fn process_imported_media_command(
             let engines = load_transcription_engines(&database, &model_root, &engine_id)?;
             // Resume runs keep every decoded chunk (resume markers) and decode
             // only the rest; fresh runs clear the transcript and start from zero.
-            let (pending, done_count) =
-                partition_for_resume(&database, &worker_meeting_id, &inputs, resume.unwrap_or(false))?;
+            let (pending, done_count) = partition_for_resume(
+                &database,
+                &worker_meeting_id,
+                &inputs,
+                resume.unwrap_or(false),
+            )?;
             let total_chunks = inputs.len();
             let language_hint = language_from_code(&language);
             let mut progress = |segment: &TranscriptSegment, completed: usize, _: usize| {
@@ -2996,11 +3967,7 @@ async fn process_imported_media_command(
                 // Persist the label the moment the chunk lands so an
                 // interrupted run keeps speaker attribution for everything
                 // already decoded (resume relabels the rest).
-                let _ = bea_core::update_segment_speaker(
-                    &database,
-                    &segment.id,
-                    labeled.speaker,
-                );
+                let _ = bea_core::update_segment_speaker(&database, &segment.id, labeled.speaker);
                 let _ = app.emit(
                     "transcription-progress",
                     serde_json::json!({
@@ -3049,11 +4016,8 @@ async fn process_imported_media_command(
                         .iter()
                         .find(|turn| midpoint >= turn.start && midpoint < turn.end)
                         .map(|turn| turn.speaker);
-                    let _ = bea_core::update_segment_speaker(
-                        &database,
-                        &segment.id,
-                        segment.speaker,
-                    );
+                    let _ =
+                        bea_core::update_segment_speaker(&database, &segment.id, segment.speaker);
                     segment
                 })
                 .collect::<Vec<_>>();
@@ -3069,11 +4033,7 @@ async fn process_imported_media_command(
                         .find(|turn| midpoint >= turn.start && midpoint < turn.end)
                         .map(|turn| turn.speaker);
                     if segment.speaker != speaker {
-                        let _ = bea_core::update_segment_speaker(
-                            &database,
-                            &segment.id,
-                            speaker,
-                        );
+                        let _ = bea_core::update_segment_speaker(&database, &segment.id, speaker);
                     }
                 }
             }
@@ -3152,6 +4112,115 @@ fn export_minutes_command(
         std::fs::create_dir_all(parent).map_err(command_error)?;
     }
     std::fs::write(destination_path, bytes).map_err(command_error)
+}
+
+/// Writes a chat/table export after checking the extension matches the
+/// requested format. The UI's save dialog already picks a fresh path, so an
+/// existing file is refused rather than silently overwritten.
+fn write_export_file(destination: &str, expected: &str, bytes: Vec<u8>) -> Result<(), String> {
+    let destination_path = std::path::Path::new(destination);
+    let extension = destination_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    if extension.as_deref() != Some(expected) {
+        return Err(format!(
+            "export destination must have a .{expected} extension"
+        ));
+    }
+    if destination_path.exists() {
+        return Err("export destination already exists; pick a new file name".into());
+    }
+    if let Some(parent) = destination_path.parent() {
+        std::fs::create_dir_all(parent).map_err(command_error)?;
+    }
+    std::fs::write(destination_path, bytes).map_err(command_error)
+}
+
+/// Exports a table Bea rendered in chat. CSV is UTF-8 with a BOM for Excel;
+/// XLSX is a real workbook so dates and numbers stay typed.
+#[tauri::command]
+fn export_table_command(
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    format: String,
+    destination: String,
+) -> Result<(), String> {
+    let (expected, bytes): (&str, Vec<u8>) = match format.as_str() {
+        "csv" => ("csv", export_table_csv(&headers, &rows).into_bytes()),
+        "xlsx" => (
+            "xlsx",
+            export_table_xlsx(&headers, &rows).map_err(command_error)?,
+        ),
+        _ => return Err("format must be csv or xlsx".to_string()),
+    };
+    write_export_file(&destination, expected, bytes)
+}
+
+/// Exports the meeting's chat history. Reads the same `context_events` rows the
+/// UI renders, so the file matches what the user sees on screen.
+#[tauri::command]
+fn export_chat_command(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    format: String,
+    destination: String,
+) -> Result<(), String> {
+    let (expected, document): (&str, String) = match format.as_str() {
+        "markdown" => (
+            "md",
+            build_chat_export(&state.database_path, &meeting_id, true)?,
+        ),
+        "text" => (
+            "txt",
+            build_chat_export(&state.database_path, &meeting_id, false)?,
+        ),
+        _ => return Err("format must be markdown or text".to_string()),
+    };
+    write_export_file(&destination, expected, document.into_bytes())
+}
+
+fn build_chat_export(
+    database_path: &std::path::Path,
+    meeting_id: &str,
+    markdown: bool,
+) -> Result<String, String> {
+    let database = open_database(database_path).map_err(command_error)?;
+    let title: String = database
+        .query_row(
+            "SELECT title FROM meetings WHERE id=?1",
+            rusqlite::params![meeting_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "Meeting".to_string());
+    let mut statement = database
+        .prepare(
+            "SELECT payload, created_at FROM context_events WHERE meeting_id=?1 AND kind='chat' ORDER BY created_at, rowid",
+        )
+        .map_err(command_error)?;
+    let rows = statement
+        .query_map(rusqlite::params![meeting_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(command_error)?;
+    let mut turns = Vec::new();
+    for row in rows {
+        let (payload, created_at) = row.map_err(command_error)?;
+        // Rows that are not Q&A pairs (older or hand-edited notes) are skipped
+        // rather than exported as a one-sided exchange.
+        if let Some((question, answer)) = parse_chat_payload(&payload) {
+            turns.push(ChatTurn {
+                question,
+                answer,
+                created_at,
+            });
+        }
+    }
+    if markdown {
+        Ok(export_chat_markdown(&title, &turns))
+    } else {
+        Ok(export_chat_text(&title, &turns))
+    }
 }
 
 #[tauri::command]
@@ -3344,9 +4413,7 @@ struct OpenRouterModelInfo {
     file_capable: bool,
 }
 
-fn openrouter_input_modalities(
-    model: &serde_json::Value,
-) -> (bool, bool, bool) {
+fn openrouter_input_modalities(model: &serde_json::Value) -> (bool, bool, bool) {
     // (vision, audio, file) — derived from OpenRouter's architecture
     // input_modalities array on each model entry.
     let modalities = model
@@ -3431,10 +4498,14 @@ fn set_meeting_vision_flag_command(
     .map_err(command_error)
 }
 
-/// Decides whether the provider model can see images for this meeting. An
+/// Decides whether the answering model can see images for this meeting. An
 /// explicit per-meeting override wins; otherwise the model id is matched
 /// against a small static list of known vision families. Local servers are
 /// treated as vision-capable only when the model id carries a vision marker.
+///
+/// Callers pass the model that will actually answer — for chat that is the
+/// per-meeting override, not the provider default, so switching to a text-only
+/// model stops Bea spending the frame budget on images it cannot read.
 fn meeting_vision_capable(
     database: &rusqlite::Connection,
     meeting_id: &str,
@@ -3504,6 +4575,57 @@ fn set_meeting_model_command(
     .map_err(command_error)
 }
 
+/// Records a model's context window so chat prompts can be sized to it.
+///
+/// Called when the user picks a model whose catalog entry reports
+/// `context_length` (OpenRouter) and when they type a window by hand for a
+/// local server. Purely additive: prompt assembly falls back to the built-in
+/// model table and then to a conservative default, so chat still works if this
+/// is never called.
+#[tauri::command]
+fn set_model_context_window_command(
+    state: State<'_, AppState>,
+    model: String,
+    context_tokens: u64,
+    source: Option<String>,
+) -> Result<(), String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("a model id is required".into());
+    }
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    bea_core::set_model_context_window(
+        &database,
+        model,
+        context_tokens as usize,
+        source.as_deref().unwrap_or("catalog"),
+    )
+    .map_err(command_error)
+}
+
+/// Returns the recorded context window for a model, or 0 when unknown.
+#[tauri::command]
+fn get_model_context_window_command(
+    state: State<'_, AppState>,
+    model: String,
+) -> Result<u64, String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    bea_core::get_model_context_window(&database, model.trim())
+        .map(|value| value.unwrap_or(0) as u64)
+        .map_err(command_error)
+}
+
+/// Forgets a recorded context window so the model returns to automatic
+/// detection. Backs the "leave it blank" behaviour of the Settings field.
+#[tauri::command]
+fn clear_model_context_window_command(
+    state: State<'_, AppState>,
+    model: String,
+) -> Result<(), String> {
+    let database = open_database(&state.database_path).map_err(command_error)?;
+    bea_core::clear_model_context_window(&database, model.trim()).map_err(command_error)
+}
+
 /// Returns the meeting's model override; empty string means "use the provider
 /// default".
 #[tauri::command]
@@ -3512,12 +4634,11 @@ fn get_meeting_model_command(
     meeting_id: String,
 ) -> Result<String, String> {
     let database = open_database(&state.database_path).map_err(command_error)?;
-    Ok(bea_core::get_app_setting(
-        &database,
-        &format!("meeting_model:{meeting_id}"),
+    Ok(
+        bea_core::get_app_setting(&database, &format!("meeting_model:{meeting_id}"))
+            .map_err(command_error)?
+            .unwrap_or_default(),
     )
-    .map_err(command_error)?
-    .unwrap_or_default())
 }
 
 /// Resolves the reasoning effort a meeting's LLM calls should use: the
@@ -3566,12 +4687,11 @@ fn get_meeting_reasoning_command(
     meeting_id: String,
 ) -> Result<String, String> {
     let database = open_database(&state.database_path).map_err(command_error)?;
-    Ok(bea_core::get_app_setting(
-        &database,
-        &format!("meeting_reasoning:{meeting_id}"),
+    Ok(
+        bea_core::get_app_setting(&database, &format!("meeting_reasoning:{meeting_id}"))
+            .map_err(command_error)?
+            .unwrap_or_default(),
     )
-    .map_err(command_error)?
-    .unwrap_or_default())
 }
 
 #[tauri::command]
@@ -4116,10 +5236,7 @@ fn list_audio_input_devices_command() -> Result<Vec<bea_core::AudioInputDevice>,
 /// Live input level (0.0-1.0) of the meeting's active recorder, for the
 /// recording UI's meter. Errors as "recording not found" when idle.
 #[tauri::command]
-fn recording_level_command(
-    state: State<'_, AppState>,
-    meeting_id: String,
-) -> Result<f32, String> {
+fn recording_level_command(state: State<'_, AppState>, meeting_id: String) -> Result<f32, String> {
     let sender = {
         let recorders = state
             .recorders
@@ -4524,7 +5641,8 @@ fn get_transcription_settings_command(
     // DirectML requests), so "directml" is only reported when the last run
     // REQUESTED the GPU and the process actually ships the DirectML runtime.
     let directml_runtime = bea_core::directml_runtime_available();
-    let active_device = if bea_core::active_asr_device() == AsrDevice::DirectML && directml_runtime {
+    let active_device = if bea_core::active_asr_device() == AsrDevice::DirectML && directml_runtime
+    {
         "directml"
     } else {
         "cpu"
@@ -4555,15 +5673,23 @@ fn set_transcription_parallel_command(
     enabled: bool,
 ) -> Result<(), String> {
     let database = open_database(&state.database_path).map_err(command_error)?;
-    set_app_setting(&database, "asr_parallel_decode", if enabled { "1" } else { "0" })
-        .map_err(command_error)
+    set_app_setting(
+        &database,
+        "asr_parallel_decode",
+        if enabled { "1" } else { "0" },
+    )
+    .map_err(command_error)
 }
 
 #[tauri::command]
 fn set_transcription_gpu_command(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     let database = open_database(&state.database_path).map_err(command_error)?;
-    set_app_setting(&database, "asr_gpu_enabled", if enabled { "1" } else { "0" })
-        .map_err(command_error)
+    set_app_setting(
+        &database,
+        "asr_gpu_enabled",
+        if enabled { "1" } else { "0" },
+    )
+    .map_err(command_error)
 }
 
 /// Completed-chunk count for a meeting: drives the Resume button's visibility
@@ -4630,7 +5756,7 @@ fn main() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-        modify_minutes_command,
+            modify_minutes_command,
             create_meeting_command,
             list_meetings_command,
             rename_meeting_command,
@@ -4670,6 +5796,8 @@ fn main() {
             load_custom_minutes_format_command,
             process_imported_media_command,
             export_minutes_command,
+            export_table_command,
+            export_chat_command,
             inspect_runtime_command,
             setup_status_command,
             set_engine_selection_command,
@@ -4681,6 +5809,9 @@ fn main() {
             set_meeting_vision_flag_command,
             set_meeting_model_command,
             get_meeting_model_command,
+            set_model_context_window_command,
+            get_model_context_window_command,
+            clear_model_context_window_command,
             set_meeting_reasoning_command,
             get_meeting_reasoning_command,
             resolve_correction_command,
@@ -4718,17 +5849,28 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{locate_tesseract, minutes_failure_message, parse_oauth_callback, sanitize_meeting_id, verify_media_source};
+    use super::{
+        locate_tesseract, minutes_failure_message, parse_oauth_callback, sanitize_meeting_id,
+        verify_media_source,
+    };
 
     #[test]
     fn minutes_failure_guidance_never_doubles_the_period() {
         // Provider errors usually end with a sentence period; bolting the
         // guidance sentence on must not render "fallback.. Fix the provider".
-        let message = minutes_failure_message("Your ChatGPT plan's usage limit is reached — it resets in 6 days.");
-        assert!(message.ends_with("local heuristic minutes."), "got: {message}");
+        let message = minutes_failure_message(
+            "Your ChatGPT plan's usage limit is reached — it resets in 6 days.",
+        );
+        assert!(
+            message.ends_with("local heuristic minutes."),
+            "got: {message}"
+        );
         assert!(!message.contains(".."), "got: {message}");
         let bare = minutes_failure_message("no punctuation here");
-        assert!(bare.contains("no punctuation here. Fix the provider"), "got: {bare}");
+        assert!(
+            bare.contains("no punctuation here. Fix the provider"),
+            "got: {bare}"
+        );
     }
 
     #[test]
@@ -4746,10 +5888,7 @@ mod tests {
 
     #[test]
     fn sanitize_meeting_id_accepts_uuid_style_ids() {
-        assert_eq!(
-            sanitize_meeting_id("abc-123_XY.9").unwrap(),
-            "abc-123_XY.9"
-        );
+        assert_eq!(sanitize_meeting_id("abc-123_XY.9").unwrap(), "abc-123_XY.9");
         assert!(sanitize_meeting_id("6f1c2e3a-1b2c-3d4e-5f6a-7b8c9d0e1f2a").is_ok());
     }
 
@@ -4772,21 +5911,15 @@ mod tests {
         assert_eq!(parse_oauth_callback(line, "st-1").unwrap(), "abc123");
         // Wrong or missing state must be rejected (CSRF guard).
         assert!(parse_oauth_callback(line, "st-2").is_err());
-        assert!(
-            parse_oauth_callback("GET /auth/callback?code=abc123 HTTP/1.1", "st-1").is_err()
-        );
+        assert!(parse_oauth_callback("GET /auth/callback?code=abc123 HTTP/1.1", "st-1").is_err());
         // Missing code with valid state errors on the code, not the state.
-        let err = parse_oauth_callback(
-            "GET /auth/callback?state=st-1 HTTP/1.1",
-            "st-1",
-        )
-        .unwrap_err();
+        let err =
+            parse_oauth_callback("GET /auth/callback?state=st-1 HTTP/1.1", "st-1").unwrap_err();
         assert!(err.contains("authorization code"));
         // No query string at all.
         assert!(parse_oauth_callback("GET /auth/callback HTTP/1.1", "st-1").is_err());
         // code-like substrings in other params must not be picked up.
-        let tricky =
-            "GET /auth/callback?notcode=x&code=real&state=st-1 HTTP/1.1";
+        let tricky = "GET /auth/callback?notcode=x&code=real&state=st-1 HTTP/1.1";
         assert_eq!(parse_oauth_callback(tricky, "st-1").unwrap(), "real");
     }
 

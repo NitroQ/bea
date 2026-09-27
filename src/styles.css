@@ -480,7 +480,7 @@ select option { background: #0e151d; color: var(--text); }
   .settings-danger { display: grid; gap: 14px; }
 }
 
-.chat-panel { display: flex; flex-direction: column; min-height: 0; gap: 12px; height: calc(100vh - 150px); overflow: hidden; }
+.chat-panel { position: relative; display: flex; flex-direction: column; min-height: 0; gap: 12px; height: calc(100vh - 150px); overflow: hidden; }
 .chat-log { min-height: 220px; }
 .chat-command-row { position: relative; display: flex; gap: 8px; align-items: center; }
 
@@ -502,18 +502,43 @@ select option { background: #0e151d; color: var(--text); }
 .chat-empty { color: var(--text); opacity: .8; font-size: 13px; }
 .chat-empty ul { margin: 8px 0 0 18px; display: grid; gap: 4px; }
 .chat-empty code { color: #9fb3c8; font-size: 12px; }
-.chat-message { max-width: 72ch; padding: 10px 13px; border-radius: 10px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+/* `white-space: pre-wrap` lives on .chat-plain instead of the bubble: the
+   markdown renderer needs normal block flow for headings, lists and tables,
+   while system/error lines still want their line breaks preserved. */
+.chat-message { max-width: 72ch; padding: 10px 13px; border-radius: 10px; font-size: 13px; line-height: 1.5; word-break: break-word; }
 .chat-message.user { align-self: flex-end; background: var(--accent, #3b82f6); color: #fff; }
 .chat-message.bea { align-self: flex-start; background: var(--surface-3); color: var(--text); border: 1px solid var(--line); }
+/* Assistant answers carry tables, so the 72ch text measure is too narrow. */
+.chat-message.bea:has(.md-table) { max-width: 100%; width: 100%; }
 .chat-message.system { align-self: center; background: transparent; color: #94a3b3; font-size: 12px; }
+.chat-plain { white-space: pre-wrap; }
+.chat-message-body { min-width: 0; }
+.chat-message.user .chat-message-body { max-width: 72ch; }
+.chat-message-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 6px; }
+.chat-message-time { color: var(--quiet); font-size: 10px; }
+.chat-message-actions { display: flex; align-items: center; gap: 4px; margin-left: auto; opacity: 0; transition: opacity .14s ease; }
+.chat-message:hover .chat-message-actions, .chat-message-actions:focus-within { opacity: 1; }
+.chat-message-actions button { display: inline-flex; align-items: center; gap: 5px; padding: 2px 7px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--quiet); font-size: 10.5px; }
+.chat-message-actions button:hover { background: var(--surface); border-color: var(--line); color: var(--text); }
+.chat-jump-latest { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 5; display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface-2); color: var(--text); font-size: 11px; box-shadow: 0 6px 18px #00000066; }
+.chat-jump-latest:hover { background: var(--surface-3); }
+.chat-export-menu { position: relative; }
+.chat-export-menu-list { position: absolute; z-index: 40; bottom: calc(100% + 6px); right: 0; width: 260px; padding: 4px; display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); box-shadow: 0 12px 30px #00000080; }
+.chat-export-menu-list button { display: flex; align-items: center; gap: 10px; width: 100%; padding: 7px 9px; border: 0; border-radius: 6px; background: transparent; color: var(--text); text-align: left; }
+.chat-export-menu-list button:hover { background: var(--surface-3); }
+.chat-export-menu-list svg { flex: none; color: var(--teal); }
+.chat-export-menu-list span { display: grid; gap: 1px; }
+.chat-export-menu-list strong { font-size: 12px; font-weight: 600; }
+.chat-export-menu-list strong small { color: var(--muted); font-weight: 400; }
+.chat-export-menu-list span > small { color: var(--quiet); font-size: 10px; }
 .frame-include { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 8px; padding: 2px 8px; background: var(--surface); }
 .frame-include input { border: none; background: transparent; width: 170px; font-size: 12px; }
 .proxy-notice { color: #94a3b3; font-size: 12px; }
 .chat-message.bea .chat-frame-chip { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 999px; font-size: 11px; background: rgba(120, 120, 255, 0.15); }
 
 .chat-busy { color: #94a3b3; font-style: italic; }
-.chat-input-row { display: flex; gap: 8px; align-items: center; }
-.chat-input-row input { flex: 1; }
+.chat-input-row { display: flex; gap: 8px; align-items: flex-end; }
+.chat-input-row textarea { flex: 1; min-height: 36px; max-height: 180px; padding: 8px 11px; resize: none; overflow-y: auto; line-height: 1.45; }
 .custom-format-overlay { position: fixed; inset: 0; background: #0b1118cc; display: grid; place-items: center; z-index: 40; }
 .custom-format-modal { width: min(640px, 92vw); max-height: 88vh; overflow: auto; padding: 20px; border-radius: var(--radius); background: var(--surface-2); border: 1px solid var(--line); display: grid; gap: 14px; }
 .custom-format-editor { width: 100%; font-family: ui-monospace, monospace; padding: 11px; line-height: 1.5; }
@@ -717,3 +742,48 @@ select option { background: #0e151d; color: var(--text); }
 .select-option.selected { color: var(--teal); }
 .select-option.selected > svg { opacity: 1; }
 .modal-field { display: grid; gap: 7px; color: var(--muted); font-size: 11px; }
+
+/* --- Chat markdown (GFM) --- */
+.md > *:first-child { margin-top: 0; }
+.md > *:last-child { margin-bottom: 0; }
+.md p { margin: 0 0 8px; }
+.md h1, .md h2, .md h3, .md h4 { margin: 14px 0 6px; font-weight: 650; line-height: 1.3; letter-spacing: -.01em; }
+.md h1 { font-size: 17px; }
+.md h2 { font-size: 15px; }
+.md h3 { font-size: 13.5px; }
+.md h4 { font-size: 13px; color: #cbd5df; }
+.md ul, .md ol { margin: 0 0 8px; padding-left: 20px; display: grid; gap: 3px; }
+.md li { margin: 0; }
+.md li::marker { color: var(--quiet); }
+.md li > input[type="checkbox"] { margin-right: 6px; accent-color: var(--teal-strong); }
+.md a { color: var(--teal); text-decoration: none; border-bottom: 1px solid #5bd0ac55; }
+.md a:hover { border-bottom-color: var(--teal); }
+.md strong { font-weight: 650; color: #f2f6fb; }
+.md del { color: var(--quiet); }
+.md hr { margin: 12px 0; border: 0; border-top: 1px solid var(--line); }
+.md blockquote { margin: 0 0 8px; padding: 2px 0 2px 11px; border-left: 3px solid var(--line); color: var(--muted); }
+.md code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .92em; }
+.md p > code, .md li > code, .md td > code { padding: 1px 5px; border-radius: 4px; background: #0d151d; border: 1px solid var(--line-soft); color: var(--teal); }
+
+/* --- Chat tables (with per-table export bar) --- */
+.md-table { margin: 0 0 10px; display: grid; gap: 5px; }
+.md-table-scroll { max-width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.md-table table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.md-table th, .md-table td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--line-soft); white-space: nowrap; }
+.md-table th { position: sticky; top: 0; background: var(--surface-2); color: #cbd5df; font-weight: 600; }
+.md-table tbody tr:last-child td { border-bottom: 0; }
+.md-table tbody tr:hover td { background: #1b2530; }
+.md-table-bar { display: flex; align-items: center; gap: 10px; }
+.md-table-meta { display: inline-flex; align-items: center; gap: 5px; color: var(--quiet); font-size: 10.5px; }
+.md-table-actions { display: flex; align-items: center; gap: 4px; margin-left: auto; }
+.md-table-actions button { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-3); color: var(--muted); font-size: 10.5px; }
+.md-table-actions button:hover { background: #273544; color: var(--text); }
+
+/* --- Chat code blocks --- */
+.md-code { margin: 0 0 10px; display: grid; gap: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: #0d151d; }
+.md-code-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 8px 4px 11px; background: var(--surface-2); border-bottom: 1px solid var(--line); }
+.md-code-lang { color: var(--quiet); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+.md-code-copy { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-3); color: var(--muted); font-size: 10.5px; }
+.md-code-copy:hover { background: #273544; color: var(--text); }
+.md-code pre { margin: 0; padding: 10px 12px; overflow-x: auto; }
+.md-code code { font-size: 12px; line-height: 1.55; color: #d7e2ee; }

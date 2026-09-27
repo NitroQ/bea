@@ -59,3 +59,12 @@ export const minutesHasExportableContent = (minutes: Minutes): boolean =>
 /// rejects a ".markdown" file), pdf/docx pass through.
 export const exportExtension = (format: 'markdown' | 'pdf' | 'docx'): string =>
   format === 'markdown' ? 'md' : format;
+/// File extension per chat export format, used for both the save-dialog default
+/// name and the browser download.
+export const chatExtension = (format: ChatExportFormatName): string => format === 'markdown' ? 'md' : 'txt';
+export type ChatExportFormatName = 'markdown' | 'text';
+/// Table export formats map straight onto their own extensions.
+export const tableExtension = (format: 'csv' | 'xlsx'): string => format;
+/// Filesystem-safe base name for a generated download.
+export const safeFileStem = (value: string, fallback: string): string =>
+  value.replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase() || fallback;

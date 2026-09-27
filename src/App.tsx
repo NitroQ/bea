@@ -10,6 +10,7 @@ import SetupFlow, { type EngineProgress } from './SetupFlow';
 import Library from './Library';
 import MeetingWorkspace from './MeetingWorkspace';
 import ModelSelect from './ModelSelect';
+import { forgetModelContext, rememberModelContext, usableContextTokens } from './modelContext';
 import Select from './Select';
 import Icon from './Icon';
 import BeaAvatar from './BeaAvatar';
@@ -385,6 +386,30 @@ function SettingsScreen({ notice, onDismissNotice, status, provider, apiKey, onB
 
   const modelOptions = provider.kind === 'OpenRouter' ? openRouterModels.map((m) => m.id) : discoveredIds;
 
+  // A local server lists model ids but not the context it was loaded with, so
+  // the window has to come from the user. Stored per model, which is what makes
+  // the chat budget follow a model switch instead of staying at the default.
+  const localModelKind = provider.kind === 'Local' || provider.kind === 'OpenAiCompatible';
+  const [localContextWindow, setLocalContextWindow] = useState('');
+  useEffect(() => {
+    if (!localModelKind || !provider.model.trim()) { setLocalContextWindow(''); return; }
+    invoke<number>('get_model_context_window_command', { model: provider.model })
+      .then((tokens) => setLocalContextWindow(tokens > 0 ? String(tokens) : ''))
+      .catch(() => setLocalContextWindow(''));
+  }, [localModelKind, provider.model]);
+  const saveLocalContextWindow = (model: string) => {
+    if (!model.trim()) return;
+    if (localContextWindow.trim() === '') {
+      // Blank means "detect it", so the stored window has to go — otherwise the
+      // field would keep a value the user just erased.
+      void forgetModelContext(model);
+      return;
+    }
+    const tokens = usableContextTokens(Number(localContextWindow));
+    if (tokens === null) return;
+    invoke('set_model_context_window_command', { model, contextTokens: tokens, source: 'manual' }).catch(() => undefined);
+  };
+
   return (
     <main className="settings-shell">
       <header className="settings-header">
@@ -440,12 +465,28 @@ function SettingsScreen({ notice, onDismissNotice, status, provider, apiKey, onB
             <label>Model
               <ModelSelect
                 value={provider.model}
-                onChange={(model) => onProviderChange({ ...provider, model })}
+                onChange={(model, contextTokens) => { void rememberModelContext(model, contextTokens); onProviderChange({ ...provider, model }); }}
                 models={provider.kind === 'OpenRouter' ? openRouterModels : []}
                 ids={provider.kind === 'OpenRouter' ? openRouterModels.map((m) => m.id) : discoveredIds}
                 ariaLabel="Default AI model"
               />
               <small className="field-help">Default model for minutes and chat. Badges show Visual / Audio / File input support from the provider catalog. A meeting can override it in its Chat tab.</small>
+            </label>
+          )}
+          {localModelKind && provider.model.trim() !== '' && (
+            <label>Context window
+              <input
+                type="number"
+                min={2048}
+                step={1024}
+                value={localContextWindow}
+                onChange={(event) => setLocalContextWindow(event.target.value)}
+                onBlur={() => saveLocalContextWindow(provider.model)}
+                onKeyDown={(event) => { if (event.key === 'Enter') saveLocalContextWindow(provider.model); }}
+                placeholder="e.g. 32768"
+                aria-label="Context window in tokens for this local model"
+              />
+              <small className="field-help">Local servers don’t publish a context window, so Bea uses a conservative default until you state the real one. Chat then packs the transcript, slides, memory and answer into it — a 32k window keeps far more of a long meeting than a small one. Leave empty to fall back to the default.</small>
             </label>
           )}
           {provider.kind !== 'OpenAiOAuth' && provider.kind !== 'ClaudeCompatible' && (

@@ -1,11 +1,11 @@
 {
-  "version": "0.2.0",
-  "notes": "Bea 0.2 - updates verified in the field: cross-meeting AI memory now reaches chat answers (ask about an earlier meeting and Bea cites it with timestamps), minutes/chat run on any provider including OpenRouter with catalog badges, Markdown/PDF/DOCX exports download reliably, update and repair actions now always tell you what happened, styled in-app sign-in pages, and friendlier quota errors. Transcription, recording, and import flows smoke-tested end to end.",
-  "pub_date": "2026-09-10T01:42:41.107Z",
+  "version": "0.3.4",
+  "notes": "Chat answers now render as Markdown with GFM tables, per-table copy and CSV/XLSX export, and full-conversation .md export. Chat context now follows the answering model: budgets scale from 2k to 4M tokens, OpenRouter catalog windows are recorded on selection, local servers can be told their window in Settings, and switching models transitions both ways with no stored state. Note: installs of 0.3.1-0.3.3 cannot auto-update into this release because the updater signing key was rotated — download the installer once.",
+  "pub_date": "2026-09-26T13:22:10.505Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSbGY0dUJocWgrcFJXVktlaXc5bUl5Um03Z2FxbTNqMVNIeEhrNDkwRWJ3OE5wcHgyRDJPaVNQTE5oM2RjT1F1Q21oZXAvdEEvRVVSZGVZMi91akluVHh5K1puQkxRaUFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg5MDA0NTQwCWZpbGU6QmVhXzAuMi4wX3g2NC1zZXR1cC5leGUKZVRCYVg0amtUM2JsWUFIZTBJWGU4TG15U0RuTEVBd2hlbm80TGlhK2swSVJZUTdyYUxxbFRubzJDRUhTaDd3M1NXS3ZhV3p1TWoyaGxKVnlvYURvQ2c9PQo=",
-      "url": "https://github.com/NitroQ/bea/releases/download/v0.2.0/Bea_0.2.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSbGY0dUJocWgrcFJqVjQ0dkFLa1NJcmFuWStwWHRzS2l2bWdnRFhaOVI1eVdFT3RUZmZjbEJhVnpiUE4ySGZyMlpIaUtuWHE4cW9DNGRkYjNmczZ5bHNkQXFDdmMrUXdNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwNDI4OTIzCWZpbGU6QmVhXzAuMy40X3g2NC1zZXR1cC5leGUKY3hieXYwdU80YWlkZ2I0Q09RcFU1Vmo1cmVsWjJqMXBFN01PMmdUeHlJSWI4QmZxS1dPNm9YTDBBMGJFWGhuQkg2MnlVK2FOYmtLTVVrUHhJU2N1QUE9PQo=",
+      "url": "https://github.com/NitroQ/bea/releases/download/v0.3.4/Bea_0.3.4_x64-setup.exe"
     }
   }
 }

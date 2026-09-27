@@ -32,7 +32,11 @@ type Option = { id: string; info?: OpenRouterModelInfo };
 
 type Props = {
   value: string;
-  onChange: (model: string) => void;
+  /// Receives the chosen model id plus the context window the provider catalog
+  /// reports for it, so callers can record it and let prompt budgets follow the
+  /// model. The window is undefined/null for locally discovered models, which
+  /// publish none.
+  onChange: (model: string, contextTokens?: number | null) => void;
   /// Catalog entries for metadata only (capability badges + context length);
   /// option ids come from `ids`/`extraIds` so non-OpenRouter providers never
   /// show OpenRouter catalog entries.
@@ -107,7 +111,7 @@ export default function ModelSelect({ value, onChange, models = [], ids = [], ex
     setActive(Math.max(0, options.findIndex((option) => option.id === value)));
     setOpen(true);
   };
-  const select = (id: string) => { onChange(id); setOpen(false); };
+  const select = (id: string) => { onChange(id, options.find((option) => option.id === id)?.info?.context_length); setOpen(false); };
   const selectedOption = options.find((option) => option.id === value) ?? options[0];
   const selectedBadges = capabilitiesFor(value, selectedOption?.info);
   const selectedContext = contextLabel(selectedOption?.info?.context_length);
