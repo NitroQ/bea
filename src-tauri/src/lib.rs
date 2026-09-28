@@ -15,6 +15,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub mod codex_oauth;
+pub mod report;
+pub mod report_docx;
 pub mod updater;
 pub mod vtt;
 
@@ -6442,135 +6444,19 @@ pub enum ExportFormat {
 pub fn export_minutes(minutes: &Minutes, format: ExportFormat) -> Result<Vec<u8>, BeaError> {
     match format {
         ExportFormat::Markdown => Ok(export_markdown(minutes).into_bytes()),
-        ExportFormat::Pdf => Ok(export_pdf(minutes).into_bytes()),
+        ExportFormat::Pdf => Ok(export_pdf(minutes)),
         ExportFormat::Docx => export_docx(minutes),
     }
 }
 
-fn pdf_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('(', "\\(")
-        .replace(')', "\\)")
+/// Renders the minutes as a branded, paginated PDF. The typographic engine
+/// lives in [`report`]; this keeps the exporter seam in one place.
+pub fn export_pdf(minutes: &Minutes) -> Vec<u8> {
+    report::render_pdf(&report::ReportDoc::from_minutes(minutes))
 }
-pub fn export_pdf(minutes: &Minutes) -> String {
-    // Paginate instead of truncating: 48 lines per page at 14pt leading keeps
-    // every line of the minutes in the document.
-    let lines: Vec<String> = export_markdown(minutes).lines().map(pdf_escape).collect();
-    const LINES_PER_PAGE: usize = 48;
-    let page_count = lines.len().div_ceil(LINES_PER_PAGE).max(1);
-    let mut contents = Vec::with_capacity(page_count);
-    for page in 0..page_count {
-        let start = page * LINES_PER_PAGE;
-        let slice = lines
-            .get(start..(start + LINES_PER_PAGE).min(lines.len()))
-            .unwrap_or_default();
-        let mut content = String::from("BT /F1 10 Tf 48 760 Td ");
-        for (index, line) in slice.iter().enumerate() {
-            if index > 0 {
-                content.push_str(" 0 -14 Td ");
-            }
-            content.push_str(&format!("({line}) Tj"));
-        }
-        content.push_str(" ET");
-        contents.push(content);
-    }
-    // Object layout: catalog, pages tree, then per-page (page + content),
-    // font object last.
-    let font_object_id = 3 + page_count * 2;
-    let mut objects = vec![
-        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
-        format!(
-            "<< /Type /Pages /Kids [{}] /Count {page_count} >>",
-            (0..page_count)
-                .map(|page| format!("{} 0 R", 3 + page * 2))
-                .collect::<Vec<_>>()
-                .join(" ")
-        ),
-    ];
-    for (page, content) in contents.iter().enumerate() {
-        let page_id = 3 + page * 2;
-        objects.push(format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 {font_object_id} 0 R >> >> /Contents {} 0 R >>",
-            page_id + 1
-        ));
-        objects.push(format!(
-            "<< /Length {} >>
-stream
-{}
-endstream",
-            content.len(),
-            content
-        ));
-    }
-    debug_assert_eq!(objects.len() + 1, font_object_id);
-    objects.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
-    let mut pdf = String::from(
-        "%PDF-1.4
-",
-    );
-    let mut offsets = vec![0usize];
-    for (index, object) in objects.iter().enumerate() {
-        offsets.push(pdf.len());
-        pdf.push_str(&format!(
-            "{} 0 obj
-{}
-endobj
-",
-            index + 1,
-            object
-        ));
-    }
-    let xref = pdf.len();
-    pdf.push_str(&format!(
-        "xref
-0 {}
-0000000000 65535 f 
-",
-        objects.len() + 1
-    ));
-    for offset in offsets.iter().skip(1) {
-        pdf.push_str(&format!(
-            "{offset:010} 00000 n 
-"
-        ));
-    }
-    pdf.push_str(&format!(
-        "trailer
-<< /Size {} /Root 1 0 R >>
-startxref
-{xref}
-%%EOF",
-        objects.len() + 1
-    ));
-    pdf
-}
-
+/// Renders the same branded document as an editable Word file.
 pub fn export_docx(minutes: &Minutes) -> Result<Vec<u8>, BeaError> {
-    use std::io::{Cursor, Write};
-    use zip::write::SimpleFileOptions;
-    use zip::ZipWriter;
-    let mut cursor = Cursor::new(Vec::new());
-    let mut zip = ZipWriter::new(&mut cursor);
-    let options = SimpleFileOptions::default();
-    zip.start_file("[Content_Types].xml", options)
-        .map_err(|e| BeaError::InvalidState(e.to_string()))?;
-    zip.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/></Types>").map_err(|e| BeaError::InvalidState(e.to_string()))?;
-    zip.start_file("_rels/.rels", options)
-        .map_err(|e| BeaError::InvalidState(e.to_string()))?;
-    zip.write_all(b"<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/></Relationships>").map_err(|e| BeaError::InvalidState(e.to_string()))?;
-    let body = export_markdown(minutes)
-        .lines()
-        .map(|line| format!("<w:p><w:r><w:t>{}</w:t></w:r></w:p>", xml_escape(line)))
-        .collect::<String>();
-    let document = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>{body}<w:sectPr/></w:body></w:document>");
-    zip.start_file("word/document.xml", options)
-        .map_err(|e| BeaError::InvalidState(e.to_string()))?;
-    zip.write_all(document.as_bytes())
-        .map_err(|e| BeaError::InvalidState(e.to_string()))?;
-    zip.finish()
-        .map_err(|e| BeaError::InvalidState(e.to_string()))?;
-    Ok(cursor.into_inner())
+    report_docx::render_docx(&report::ReportDoc::from_minutes(minutes))
 }
 fn xml_escape(value: &str) -> String {
     value
